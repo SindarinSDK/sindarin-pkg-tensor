@@ -53,6 +53,11 @@ jobs:
           echo "Packaged libraries:"
           ls libs/linux/lib/
 
+      - name: Install ggml to system paths
+        run: |
+          sudo cp -r ggml-install/include/* /usr/local/include/
+          sudo find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} /usr/local/lib/ \;
+
       - name: Setup Prerequisites
         uses: SindarinSDK/sindarin-pipelines/.github/actions/setup-prereqs@main
 
