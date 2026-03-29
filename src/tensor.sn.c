@@ -103,28 +103,36 @@ static void ensure_backend(void)
 /* Context size generous enough for any single-op graph */
 #define GRAPH_CTX_SIZE (16 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
 
+/* Input tensor tracking for upload before compute */
+#define MAX_INPUTS 8
+static struct ggml_tensor *g_inputs[MAX_INPUTS];
+static const float        *g_input_data[MAX_INPUTS];
+static int                 g_input_count = 0;
+
+static void track_input(struct ggml_tensor *t, const float *host_data)
+{
+    if (g_input_count < MAX_INPUTS) {
+        g_inputs[g_input_count]     = t;
+        g_input_data[g_input_count] = host_data;
+        g_input_count++;
+    }
+}
+
 /* Run a graph with the global backend and return */
 static void run_graph(struct ggml_context *ctx, struct ggml_cgraph *graph)
 {
+    (void)ctx;
     ensure_backend();
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
     ggml_gallocr_t alloc = ggml_gallocr_new(buft);
     ggml_gallocr_alloc_graph(alloc, graph);
 
-    /* Upload input data */
-    for (int i = 0; i < graph->n_nodes; i++) {
-        struct ggml_tensor *node = graph->nodes[i];
-        for (int s = 0; s < GGML_MAX_SRC; s++) {
-            struct ggml_tensor *src = node->src[s];
-            if (src && src->op == GGML_OP_NONE && (src->flags & GGML_TENSOR_FLAG_INPUT)) {
-                /* src->data points to our host buffer (set before graph build) */
-                if (src->data) {
-                    ggml_backend_tensor_set(src, src->data, 0, ggml_nbytes(src));
-                }
-            }
-        }
+    /* Upload tracked input data */
+    for (int i = 0; i < g_input_count; i++) {
+        ggml_backend_tensor_set(g_inputs[i], g_input_data[i], 0, ggml_nbytes(g_inputs[i]));
     }
+    g_input_count = 0;
 
     ggml_backend_graph_compute(g_backend, graph);
     ggml_gallocr_free(alloc);
@@ -198,8 +206,8 @@ RtTensor sn_tensor_matmul(RtTensor *a, RtTensor *b)
     struct ggml_tensor *tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, K);
     ggml_set_input(ta);
     ggml_set_input(tb);
-    ta->data = pa->data;
-    tb->data = pb->data;
+    track_input(ta, pa->data);
+    track_input(tb, pb->data);
 
     /* Transpose B so ne0 matches: B^T has ne0=K, ne1=N */
     struct ggml_tensor *bt = ggml_cont(ctx, ggml_transpose(ctx, tb));
@@ -230,8 +238,8 @@ RtTensor sn_tensor_add(RtTensor *a, RtTensor *b)
     struct ggml_tensor *tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pb->ne[0], pb->ne[1]);
     ggml_set_input(ta);
     ggml_set_input(tb);
-    ta->data = pa->data;
-    tb->data = pb->data;
+    track_input(ta, pa->data);
+    track_input(tb, pb->data);
 
     struct ggml_tensor *result = ggml_add(ctx, ta, tb);
     ggml_set_output(result);
@@ -256,7 +264,7 @@ RtTensor sn_tensor_scale(RtTensor *t, double scalar)
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
-    ta->data = pt->data;
+    track_input(ta, pt->data);
 
     struct ggml_tensor *result = ggml_scale(ctx, ta, (float)scalar);
     ggml_set_output(result);
@@ -285,7 +293,7 @@ RtTensor sn_tensor_relu(RtTensor *t)
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
-    ta->data = pt->data;
+    track_input(ta, pt->data);
 
     struct ggml_tensor *result = ggml_relu(ctx, ta);
     ggml_set_output(result);
@@ -311,7 +319,7 @@ RtTensor sn_tensor_softmax(RtTensor *t, long long dim)
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
-    ta->data = pt->data;
+    track_input(ta, pt->data);
 
     struct ggml_tensor *result = ggml_soft_max(ctx, ta);
     ggml_set_output(result);
