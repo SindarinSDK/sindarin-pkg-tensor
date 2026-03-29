@@ -19,6 +19,7 @@
 @link ggml-base
 @link ggml-cpu
 @link stdc++
+@link gomp
 @link m
 @link pthread
 @source "tensor.sn.c"
