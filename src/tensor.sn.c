@@ -81,16 +81,24 @@ static void ensure_backend(void)
 {
     if (g_backend) return;
 
-    /* Try GPU first, fall back to CPU */
-    ggml_backend_load_all();
-    g_backend = ggml_backend_init_best();
-    if (!g_backend) {
-        g_backend = ggml_backend_cpu_init();
-    }
+    /* Start with CPU — always available, no dynamic loading */
+    g_backend = ggml_backend_cpu_init();
 
-    /* Check if we got a non-CPU backend */
-    const char *name = ggml_backend_name(g_backend);
-    g_backend_gpu = (name && strcmp(name, "CPU") != 0) ? 1 : 0;
+    /* Try to upgrade to a better backend (GPU) if available */
+    ggml_backend_load_all();
+    ggml_backend_t best = ggml_backend_init_best();
+    if (best) {
+        const char *name = ggml_backend_name(best);
+        if (name && strcmp(name, "CPU") != 0) {
+            /* Got a GPU backend — use it instead */
+            ggml_backend_free(g_backend);
+            g_backend = best;
+            g_backend_gpu = 1;
+        } else {
+            /* init_best returned CPU — free the duplicate, keep ours */
+            ggml_backend_free(best);
+        }
+    }
 }
 
 /* ======================================================================
