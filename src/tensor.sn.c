@@ -40,7 +40,9 @@ typedef struct {
 static TPool   g_pool[SN_TENSOR_MAX];
 static int     g_pool_count = 0;
 
-typedef struct { long long _handle; } RtTensor;
+/* RtTensor is __sn__Tensor, defined in the compiler-generated sn_types.h
+ * (force-included). It has fields: int __rc__, long long __sn___handle. */
+typedef __sn__Tensor RtTensor;
 
 /* Allocate a new pool slot and return its index */
 static int pool_alloc(int64_t ne0, int64_t ne1, int n_dims)
@@ -61,14 +63,15 @@ static int pool_alloc(int64_t ne0, int64_t ne1, int n_dims)
     return idx;
 }
 
-static RtTensor wrap_pool(int idx)
+static RtTensor *wrap_pool(int idx)
 {
-    RtTensor rt;
-    rt._handle = (long long)idx;
+    RtTensor *rt = (RtTensor *)calloc(1, sizeof(RtTensor));
+    rt->__rc__ = 1;
+    rt->__sn___handle = (long long)idx;
     return rt;
 }
 
-static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->_handle]; }
+static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->__sn___handle]; }
 
 /* ======================================================================
  * ggml backend — initialized lazily on first use
@@ -126,8 +129,10 @@ static void track_input(struct ggml_tensor *t, const float *host_data)
     }
 }
 
-/* Run a graph with the global backend and return */
-static void run_graph(struct ggml_context *ctx, struct ggml_cgraph *graph)
+/* Run a graph with the global backend.
+ * Returns the allocator — caller MUST call ggml_gallocr_free() after
+ * reading results from the graph output tensors. */
+static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *graph)
 {
     (void)ctx;
     ensure_backend();
@@ -143,20 +148,20 @@ static void run_graph(struct ggml_context *ctx, struct ggml_cgraph *graph)
     g_input_count = 0;
 
     ggml_backend_graph_compute(g_backend, graph);
-    ggml_gallocr_free(alloc);
+    return alloc;
 }
 
 /* ======================================================================
  * Creation
  * ====================================================================== */
 
-RtTensor sn_tensor_zeros(long long rows, long long cols)
+RtTensor *sn_tensor_zeros(long long rows, long long cols)
 {
     int idx = pool_alloc(cols, rows, 2);
     return wrap_pool(idx);
 }
 
-RtTensor sn_tensor_from_doubles(SnArray *data, long long rows, long long cols)
+RtTensor *sn_tensor_from_doubles(SnArray *data, long long rows, long long cols)
 {
     int idx = pool_alloc(cols, rows, 2);
     TPool *s = &g_pool[idx];
@@ -194,7 +199,7 @@ SnArray *sn_tensor_shape(RtTensor *rt)
  * Arithmetic — via ggml graphs
  * ====================================================================== */
 
-RtTensor sn_tensor_matmul(RtTensor *a, RtTensor *b)
+RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
@@ -224,17 +229,18 @@ RtTensor sn_tensor_matmul(RtTensor *a, RtTensor *b)
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    run_graph(ctx, graph);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
 
     /* Result: ne0=N, ne1=M -> [M rows, N cols] */
     int idx = pool_alloc(N, M, 2);
     ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)(M * N) * sizeof(float));
 
+    ggml_gallocr_free(ga);
     ggml_free(ctx);
     return wrap_pool(idx);
 }
 
-RtTensor sn_tensor_add(RtTensor *a, RtTensor *b)
+RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
@@ -254,16 +260,17 @@ RtTensor sn_tensor_add(RtTensor *a, RtTensor *b)
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    run_graph(ctx, graph);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
 
     int idx = pool_alloc(pa->ne[0], pa->ne[1], pa->n_dims);
     ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)g_pool[idx].n_elem * sizeof(float));
 
+    ggml_gallocr_free(ga);
     ggml_free(ctx);
     return wrap_pool(idx);
 }
 
-RtTensor sn_tensor_scale(RtTensor *t, double scalar)
+RtTensor *sn_tensor_scale(RtTensor *t, double scalar)
 {
     TPool *pt = unwrap(t);
 
@@ -279,11 +286,12 @@ RtTensor sn_tensor_scale(RtTensor *t, double scalar)
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    run_graph(ctx, graph);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
 
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)g_pool[idx].n_elem * sizeof(float));
 
+    ggml_gallocr_free(ga);
     ggml_free(ctx);
     return wrap_pool(idx);
 }
@@ -292,7 +300,7 @@ RtTensor sn_tensor_scale(RtTensor *t, double scalar)
  * Activations — via ggml graphs
  * ====================================================================== */
 
-RtTensor sn_tensor_relu(RtTensor *t)
+RtTensor *sn_tensor_relu(RtTensor *t)
 {
     TPool *pt = unwrap(t);
 
@@ -308,16 +316,17 @@ RtTensor sn_tensor_relu(RtTensor *t)
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    run_graph(ctx, graph);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
 
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)g_pool[idx].n_elem * sizeof(float));
 
+    ggml_gallocr_free(ga);
     ggml_free(ctx);
     return wrap_pool(idx);
 }
 
-RtTensor sn_tensor_softmax(RtTensor *t, long long dim)
+RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
 {
     TPool *pt = unwrap(t);
     (void)dim; /* ggml_soft_max operates along ne[0] (columns) */
@@ -334,17 +343,18 @@ RtTensor sn_tensor_softmax(RtTensor *t, long long dim)
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, result);
-    run_graph(ctx, graph);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
 
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)g_pool[idx].n_elem * sizeof(float));
 
+    ggml_gallocr_free(ga);
     ggml_free(ctx);
     return wrap_pool(idx);
 }
 
 /* Dropout: implemented directly (random mask * scale) */
-RtTensor sn_tensor_dropout(RtTensor *t, double rate, int training)
+RtTensor *sn_tensor_dropout(RtTensor *t, double rate, int training)
 {
     TPool *pt = unwrap(t);
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
@@ -367,7 +377,7 @@ RtTensor sn_tensor_dropout(RtTensor *t, double rate, int training)
  * Normalization — implemented directly
  * ====================================================================== */
 
-RtTensor sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
+RtTensor *sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
                                RtTensor *running_mean, RtTensor *running_var,
                                int training)
 {
@@ -433,7 +443,7 @@ RtTensor sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
  * Reduction & aggregation — implemented directly for GNN ops
  * ====================================================================== */
 
-RtTensor sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
+RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
 {
     TPool *px = unwrap(node_embeddings);
     TPool *pb = unwrap(batch_index);
@@ -489,7 +499,7 @@ long long sn_tensor_argmax(RtTensor *t, long long dim)
     return best_idx;
 }
 
-RtTensor sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
+RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
                                      RtTensor *edge_weight, char *mode)
 {
     TPool *px  = unwrap(features);
@@ -552,7 +562,7 @@ RtTensor sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
     return wrap_pool(idx);
 }
 
-RtTensor sn_tensor_attention_aggregate(RtTensor *features, RtTensor *edge_index,
+RtTensor *sn_tensor_attention_aggregate(RtTensor *features, RtTensor *edge_index,
                                         RtTensor *edge_weight, RtTensor *att_weight)
 {
     TPool *px  = unwrap(features);
@@ -619,7 +629,7 @@ RtTensor sn_tensor_attention_aggregate(RtTensor *features, RtTensor *edge_index,
  * Loss
  * ====================================================================== */
 
-RtTensor sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
+RtTensor *sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
 {
     TPool *pp = unwrap(probs);
     TPool *pt = unwrap(targets);
@@ -648,7 +658,7 @@ RtTensor sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
  * Initialization
  * ====================================================================== */
 
-RtTensor sn_tensor_init_kaiming(RtTensor *t)
+RtTensor *sn_tensor_init_kaiming(RtTensor *t)
 {
     TPool *pt = unwrap(t);
     static int seeded = 0;
@@ -663,9 +673,7 @@ RtTensor sn_tensor_init_kaiming(RtTensor *t)
         pt->data[i] = (2.0f * u - 1.0f) * bound;
     }
 
-    RtTensor dummy;
-    dummy._handle = 0;
-    return dummy;
+    return t;
 }
 
 /* ======================================================================
@@ -678,12 +686,12 @@ int sn_gpu_available(void)
     return g_backend_gpu;
 }
 
-RtTensor sn_tensor_to_device(RtTensor *t, char *device)
+RtTensor *sn_tensor_to_device(RtTensor *t, char *device)
 {
     (void)device;
     /* Backend handles device dispatch transparently.
      * Return the same tensor — data stays in the host pool. */
-    return *t;
+    return t;
 }
 
 /* ======================================================================
@@ -743,8 +751,8 @@ SnArray *sn_model_load(char *path)
         g_pool[idx].ne[3] = ne[3];
         fread(g_pool[idx].data, sizeof(float), (size_t)g_pool[idx].n_elem, f);
 
-        RtTensor rt = wrap_pool(idx);
-        sn_array_push(arr, &rt);
+        RtTensor *rt = wrap_pool(idx);
+        sn_array_push(arr, rt);
     }
 
     fclose(f);

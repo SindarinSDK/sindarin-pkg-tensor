@@ -72,8 +72,13 @@ test: hooks $(TEST_BINS)
 $(BIN_DIR):
 	@$(MKDIR) $(BIN_DIR)
 
+GGML_INCLUDE := $(wildcard libs/$(PLATFORM)/include)
+GGML_LIB     := $(wildcard libs/$(PLATFORM)/lib)
+
 $(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
-	@$(SN) $< -o $@ -l 1
+	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
+	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
+	 $(SN) $< -o $@ -l 1
 
 build-libs:
 	@echo "Building ggml from source for $(PLATFORM)..."

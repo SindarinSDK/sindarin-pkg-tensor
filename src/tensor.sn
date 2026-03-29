@@ -3,13 +3,13 @@
 # ==============================================================================
 #
 # Usage:
-#   import "sindarin-pkg-tensor/src/tensor"
+# import "sindarin-pkg-tensor/src/tensor"
 #
-#   var a: Tensor = Tensor.zeros(3, 4)
-#   var b: Tensor = Tensor.zeros(4, 2)
-#   var c: Tensor = tensorMatmul(a, b)         # [3, 2]
-#   var d: Tensor = tensorRelu(c)
-#   var data: double[] = d.toDoubles()
+# var a: Tensor = Tensor.zeros(3, 4)
+# var b: Tensor = Tensor.zeros(4, 2)
+# var c: Tensor = sn_tensor_matmul(a, b)     # [3, 2]
+# var d: Tensor = sn_tensor_relu(c)
+# var data: double[] = d.toDoubles()
 #
 # Phase 1: inference operations only (no autograd / optimizer).
 # GPU acceleration via ggml backend (auto-selects best available device).
@@ -45,7 +45,7 @@ native struct Tensor as ref =>
     return sn_tensor_shape(self)
 
   fn dispose(): void =>
-    tensorFree(self)
+    sn_tensor_free(self)
 
 # ---------------------------------------------------------------------------
 # Tensor creation
@@ -60,88 +60,61 @@ native fn sn_tensor_shape(t: Tensor): int[]
 # Arithmetic
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_matmul"
-native fn tensorMatmul(a: Tensor, b: Tensor): Tensor
-
-@alias "sn_tensor_add"
-native fn tensorAdd(a: Tensor, b: Tensor): Tensor
-
-@alias "sn_tensor_scale"
-native fn tensorScale(t: Tensor, scalar: double): Tensor
+native fn sn_tensor_matmul(a: Tensor, b: Tensor): Tensor
+native fn sn_tensor_add(a: Tensor, b: Tensor): Tensor
+native fn sn_tensor_scale(t: Tensor, scalar: double): Tensor
 
 # ---------------------------------------------------------------------------
 # Activations
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_relu"
-native fn tensorRelu(t: Tensor): Tensor
-
-@alias "sn_tensor_softmax"
-native fn tensorSoftmax(t: Tensor, dim: int): Tensor
-
-@alias "sn_tensor_dropout"
-native fn tensorDropout(t: Tensor, rate: double, training: bool): Tensor
+native fn sn_tensor_relu(t: Tensor): Tensor
+native fn sn_tensor_softmax(t: Tensor, dim: int): Tensor
+native fn sn_tensor_dropout(t: Tensor, rate: double, training: bool): Tensor
 
 # ---------------------------------------------------------------------------
 # Normalization
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_batch_norm"
-native fn tensorBatchNorm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
+native fn sn_tensor_batch_norm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
 
 # ---------------------------------------------------------------------------
 # Reduction & aggregation
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_mean_pool"
-native fn tensorMeanPool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
-
-@alias "sn_tensor_argmax"
-native fn tensorArgmax(t: Tensor, dim: int): int
-
-@alias "sn_tensor_sparse_aggregate"
-native fn tensorSparseAggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor
-
-@alias "sn_tensor_attention_aggregate"
-native fn tensorAttentionAggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor
+native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
+native fn sn_tensor_argmax(t: Tensor, dim: int): int
+native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor
+native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor
 
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_cross_entropy"
-native fn tensorCrossEntropy(probs: Tensor, targets: Tensor): Tensor
+native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
 
 # ---------------------------------------------------------------------------
 # Initialization
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_init_kaiming"
-native fn tensorInitKaiming(t: Tensor): void
+native fn sn_tensor_init_kaiming(t: Tensor): void
 
 # ---------------------------------------------------------------------------
 # Device
 # ---------------------------------------------------------------------------
 
-@alias "sn_gpu_available"
-native fn gpuAvailable(): bool
-
-@alias "sn_tensor_to_device"
-native fn tensorToDevice(t: Tensor, device: str): Tensor
+native fn sn_gpu_available(): bool
+native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
 
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
-@alias "sn_model_save"
-native fn modelSave(params: Tensor[], path: str): void
-
-@alias "sn_model_load"
-native fn modelLoad(path: str): Tensor[]
+native fn sn_model_save(params: Tensor[], path: str): void
+native fn sn_model_load(path: str): Tensor[]
 
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
-@alias "sn_tensor_free"
-native fn tensorFree(t: Tensor): void
+native fn sn_tensor_free(t: Tensor): void
