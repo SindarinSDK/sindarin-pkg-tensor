@@ -1,0 +1,74 @@
+name: Tensor
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Cache ggml build
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-main-linux-x64-cpu-v1
+
+      - name: Build ggml
+        run: |
+          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
+            echo "Using cached ggml build"
+          else
+            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
+            cmake -S ggml-src -B ggml-build \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DGGML_STATIC=ON \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            cmake --build ggml-build -j$(nproc)
+            cmake --install ggml-build
+          fi
+
+      - name: Package libs
+        run: |
+          mkdir -p libs/linux/lib libs/linux/include
+          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
+          cp -r ggml-install/include/* libs/linux/include/
+          echo "linux" > libs/linux/PLATFORM
+          echo "Packaged libraries:"
+          ls libs/linux/lib/
+
+      - name: Setup Prerequisites
+        uses: SindarinSDK/sindarin-pipelines/.github/actions/setup-prereqs@main
+
+      - name: Install Sindarin
+        uses: SindarinSDK/sindarin-pipelines/.github/actions/install-sindarin@main
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Install dependencies
+        uses: SindarinSDK/sindarin-pipelines/.github/actions/install-deps@main
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Run tests
+        run: make test
+
+      - name: Diagnose compile errors
+        if: failure()
+        uses: SindarinSDK/sindarin-pipelines/.github/actions/diagnose-pkg@main

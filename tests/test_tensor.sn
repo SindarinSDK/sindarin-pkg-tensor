@@ -1,0 +1,97 @@
+import "sindarin-pkg-test/src/test"
+import "../src/tensor"
+
+fn testZeros(): void =>
+  var t: Tensor = Tensor.zeros(2, 3)
+  var shape: int[] = t.shape()
+  Test.expect(len(shape)).toBe(2)
+  Test.expect(shape[0]).toBe(3)
+  Test.expect(shape[1]).toBe(2)
+
+  var data: double[] = t.toDoubles()
+  Test.expect(len(data)).toBe(6)
+  for var i: int = 0; i < len(data); i++ =>
+    Test.expect(data[i]).toBe(0.0)
+
+fn testFromDoubles(): void =>
+  var input: double[] = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0}
+  var t: Tensor = Tensor.fromDoubles(input, 2, 3)
+  var data: double[] = t.toDoubles()
+  Test.expect(len(data)).toBe(6)
+  Test.expect(data[0]).toBe(1.0)
+  Test.expect(data[5]).toBe(6.0)
+
+fn testAdd(): void =>
+  var a: Tensor = Tensor.fromDoubles({1.0, 2.0, 3.0, 4.0}, 2, 2)
+  var b: Tensor = Tensor.fromDoubles({10.0, 20.0, 30.0, 40.0}, 2, 2)
+  var c: Tensor = tensorAdd(a, b)
+  var data: double[] = c.toDoubles()
+  Test.expect(data[0]).toBe(11.0)
+  Test.expect(data[1]).toBe(22.0)
+  Test.expect(data[2]).toBe(33.0)
+  Test.expect(data[3]).toBe(44.0)
+
+fn testScale(): void =>
+  var a: Tensor = Tensor.fromDoubles({2.0, 4.0, 6.0}, 1, 3)
+  var b: Tensor = tensorScale(a, 0.5)
+  var data: double[] = b.toDoubles()
+  Test.expect(data[0]).toBe(1.0)
+  Test.expect(data[1]).toBe(2.0)
+  Test.expect(data[2]).toBe(3.0)
+
+fn testRelu(): void =>
+  var a: Tensor = Tensor.fromDoubles({-1.0, 0.0, 1.0, -5.0, 3.0, 0.0}, 2, 3)
+  var b: Tensor = tensorRelu(a)
+  var data: double[] = b.toDoubles()
+  Test.expect(data[0]).toBe(0.0)
+  Test.expect(data[1]).toBe(0.0)
+  Test.expect(data[2]).toBe(1.0)
+  Test.expect(data[3]).toBe(0.0)
+  Test.expect(data[4]).toBe(3.0)
+  Test.expect(data[5]).toBe(0.0)
+
+fn testMatmul(): void =>
+  # A = [[1,2],[3,4]] (2x2), B = [[5,6],[7,8]] (2x2)
+  # C = A*B = [[19,22],[43,50]]
+  var a: Tensor = Tensor.fromDoubles({1.0, 2.0, 3.0, 4.0}, 2, 2)
+  var b: Tensor = Tensor.fromDoubles({5.0, 6.0, 7.0, 8.0}, 2, 2)
+  var c: Tensor = tensorMatmul(a, b)
+  var data: double[] = c.toDoubles()
+  var shape: int[] = c.shape()
+  Test.expect(shape[0]).toBe(2)
+  Test.expect(shape[1]).toBe(2)
+  Test.expect(data[0]).toBe(19.0)
+  Test.expect(data[1]).toBe(22.0)
+  Test.expect(data[2]).toBe(43.0)
+  Test.expect(data[3]).toBe(50.0)
+
+fn testArgmax(): void =>
+  var a: Tensor = Tensor.fromDoubles({0.1, 0.7, 0.2}, 1, 3)
+  var idx: int = tensorArgmax(a, 0)
+  Test.expect(idx).toBe(1)
+
+fn testDropoutNoTraining(): void =>
+  var a: Tensor = Tensor.fromDoubles({1.0, 2.0, 3.0, 4.0}, 1, 4)
+  var b: Tensor = tensorDropout(a, 0.5, false)
+  var data: double[] = b.toDoubles()
+  Test.expect(data[0]).toBe(1.0)
+  Test.expect(data[1]).toBe(2.0)
+  Test.expect(data[2]).toBe(3.0)
+  Test.expect(data[3]).toBe(4.0)
+
+fn testGpuAvailable(): void =>
+  var avail: bool = gpuAvailable()
+  # Just verify it doesn't crash — result depends on hardware
+  Test.expect(true).toBe(true)
+
+fn main(): void =>
+  Test.describe("Tensor - zeros", testZeros)
+  Test.describe("Tensor - fromDoubles", testFromDoubles)
+  Test.describe("Tensor - add", testAdd)
+  Test.describe("Tensor - scale", testScale)
+  Test.describe("Tensor - relu", testRelu)
+  Test.describe("Tensor - matmul", testMatmul)
+  Test.describe("Tensor - argmax", testArgmax)
+  Test.describe("Tensor - dropout (no training)", testDropoutNoTraining)
+  Test.describe("Tensor - gpuAvailable", testGpuAvailable)
+  Test.report()

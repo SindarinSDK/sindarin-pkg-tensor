@@ -1,0 +1,24 @@
+#!/bin/bash
+# Pre-commit hook: auto-format staged .sn files with sn --format
+
+if ! command -v sn &>/dev/null; then
+  exit 0
+fi
+
+# Get list of staged .sn files
+staged=$(git diff --cached --name-only --diff-filter=ACM -- '*.sn')
+if [ -z "$staged" ]; then
+  exit 0
+fi
+
+# Format each staged file individually
+for file in $staged; do
+  if [ -f "$file" ]; then
+    tmpdir=$(mktemp -d)
+    cp "$file" "$tmpdir/$(basename "$file")"
+    (cd "$tmpdir" && sn --format) >/dev/null 2>&1
+    cp "$tmpdir/$(basename "$file")" "$file"
+    rm -rf "$tmpdir"
+    git add "$file"
+  fi
+done

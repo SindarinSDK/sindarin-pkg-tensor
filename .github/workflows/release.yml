@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        type: string
+
+env:
+  VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+jobs:
+  build-linux:
+    name: Build Linux Libraries (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+            platform: linux
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Cache ggml build
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-main-linux-${{ matrix.arch }}-cpu-v1
+
+      - name: Build ggml
+        run: |
+          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
+            echo "Using cached ggml build"
+          else
+            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
+            cmake -S ggml-src -B ggml-build \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DGGML_STATIC=ON \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            cmake --build ggml-build -j$(nproc)
+            cmake --install ggml-build
+          fi
+
+      - name: Package libraries
+        run: |
+          mkdir -p libs/linux/lib libs/linux/include
+          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
+          cp -r ggml-install/include/* libs/linux/include/
+          echo "${{ env.VERSION }}" > libs/linux/VERSION
+          echo "linux" > libs/linux/PLATFORM
+          ls libs/linux/lib/*.a
+          echo "Total libraries: $(ls libs/linux/lib/*.a | wc -l)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libs-linux-${{ matrix.arch }}
+          path: libs/linux/
+          retention-days: 7
+
+  build-darwin:
+    name: Build Darwin Libraries (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15
+          - arch: arm64
+            runner: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew install cmake ninja
+
+      - name: Cache ggml build
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-main-darwin-${{ matrix.arch }}-cpu-v1
+
+      - name: Build ggml
+        run: |
+          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
+            echo "Using cached ggml build"
+          else
+            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
+            cmake -S ggml-src -B ggml-build \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DGGML_STATIC=ON \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DGGML_METAL=ON
+            cmake --build ggml-build -j$(sysctl -n hw.logicalcpu)
+            cmake --install ggml-build
+          fi
+
+      - name: Package libraries
+        run: |
+          mkdir -p libs/darwin/lib libs/darwin/include
+          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/darwin/lib/ \;
+          cp -r ggml-install/include/* libs/darwin/include/
+          echo "${{ env.VERSION }}" > libs/darwin/VERSION
+          echo "darwin" > libs/darwin/PLATFORM
+          ls libs/darwin/lib/*.a
+          echo "Total libraries: $(ls libs/darwin/lib/*.a | wc -l)"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libs-darwin-${{ matrix.arch }}
+          path: libs/darwin/
+          retention-days: 7
+
+  build-windows:
+    name: Build Windows Libraries
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Remove system LLVM (conflicts with MinGW)
+        run: |
+          if (Test-Path "C:\Program Files\LLVM") {
+            Remove-Item -Recurse -Force "C:\Program Files\LLVM"
+          }
+        shell: pwsh
+
+      - name: Cache LLVM-MinGW
+        id: cache-llvm-mingw
+        uses: actions/cache@v4
+        with:
+          path: C:\llvm-mingw
+          key: llvm-mingw-20241217
+
+      - name: Install LLVM-MinGW
+        if: steps.cache-llvm-mingw.outputs.cache-hit != 'true'
+        run: |
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20241217/llvm-mingw-20241217-ucrt-x86_64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "llvm-mingw.zip"
+          Expand-Archive -Path "llvm-mingw.zip" -DestinationPath "C:\"
+          Rename-Item "C:\llvm-mingw-20241217-ucrt-x86_64" "C:\llvm-mingw"
+        shell: pwsh
+
+      - name: Add LLVM-MinGW to PATH
+        run: echo "C:\llvm-mingw\bin" >> $env:GITHUB_PATH
+        shell: pwsh
+
+      - name: Install build tools
+        run: choco install ninja -y
+
+      - name: Cache ggml build
+        uses: actions/cache@v4
+        with:
+          path: ggml-install
+          key: ggml-main-windows-x64-cpu-v1
+
+      - name: Build ggml
+        run: |
+          if ((Test-Path "ggml-install/lib") -and (Test-Path "ggml-install/include")) {
+            Write-Host "Using cached ggml build"
+          } else {
+            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
+            cmake -S ggml-src -B ggml-build `
+              -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_INSTALL_PREFIX="$(Get-Location)/ggml-install" `
+              -DBUILD_SHARED_LIBS=OFF `
+              -DGGML_STATIC=ON `
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+            cmake --build ggml-build -j
+            cmake --install ggml-build
+          }
+        shell: pwsh
+
+      - name: Package libraries
+        run: |
+          New-Item -ItemType Directory -Force -Path libs/windows/lib, libs/windows/include | Out-Null
+          Get-ChildItem ggml-install/lib -Filter "*.a" | Copy-Item -Destination libs/windows/lib/
+          Copy-Item -Recurse ggml-install/include/* -Destination libs/windows/include -Force
+          "${{ env.VERSION }}" | Out-File libs/windows/VERSION -NoNewline
+          "windows" | Out-File libs/windows/PLATFORM -NoNewline
+          Get-ChildItem libs/windows/lib/*.a
+          Write-Host "Total libraries: $((Get-ChildItem libs/windows/lib/*.a).Count)"
+        shell: pwsh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libs-windows
+          path: libs/windows/
+          retention-days: 7
+
+  create-release:
+    name: Create Release
+    needs: [build-linux, build-darwin, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Linux x64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libs-linux-x64
+          path: libs-linux-x64/
+
+      - name: Download Linux arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libs-linux-arm64
+          path: libs-linux-arm64/
+
+      - name: Download Darwin x64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libs-darwin-x64
+          path: libs-darwin-x64/
+
+      - name: Download Darwin arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libs-darwin-arm64
+          path: libs-darwin-arm64/
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: libs-windows
+          path: libs-windows/
+
+      - name: Create archives
+        run: |
+          tar -czvf "sindarin-tensor-${{ env.VERSION }}-linux-x64.tar.gz" -C libs-linux-x64 .
+          tar -czvf "sindarin-tensor-${{ env.VERSION }}-linux-arm64.tar.gz" -C libs-linux-arm64 .
+          tar -czvf "sindarin-tensor-${{ env.VERSION }}-darwin-x64.tar.gz" -C libs-darwin-x64 .
+          tar -czvf "sindarin-tensor-${{ env.VERSION }}-darwin-arm64.tar.gz" -C libs-darwin-arm64 .
+          cd libs-windows && zip -r "../sindarin-tensor-${{ env.VERSION }}-windows-x64.zip" . && cd ..
+          echo "Created archives:"
+          ls -la *.tar.gz *.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Sindarin Tensor ${{ env.VERSION }}
+          tag_name: ${{ env.VERSION }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            sindarin-tensor-*.tar.gz
+            sindarin-tensor-*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
