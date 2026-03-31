@@ -189,19 +189,25 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
  * Graph recording API
  * ====================================================================== */
 
-static int g_pool_count_before_record = 0;  /* for restoring after record mode */
+static int g_pool_count_before_record = 0;
+static void *g_param_buf   = NULL;  /* calloc'd buffer for param context */
+static void *g_compute_buf = NULL;  /* calloc'd buffer for compute context */
 
 void sn_graph_begin(void) {
     ensure_backend();
-    /* Save pool count so we can reclaim recording slots on end */
     g_pool_count_before_record = g_pool_count;
 
-    /* no_alloc=true: ggml_opt_fit allocates backend buffers itself.
-     * We upload data after ggml_opt allocates via the static graph path. */
-    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
+    /* Pre-zero context buffers with calloc to ensure all tensor fields
+     * (including buffer pointers) start as NULL. Using posix_memalign
+     * (ggml's default when mem_buffer=NULL) does NOT zero memory, so
+     * stale heap data from prior ggml contexts can leave buffer != NULL
+     * in tensor structs, causing ggml_backend_alloc_ctx_tensors to assert. */
+    g_param_buf = calloc(1, GRAPH_PARAM_CTX_SIZE);
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, g_param_buf, true };
     g_param_ctx = ggml_init(p_params);
 
-    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
+    g_compute_buf = calloc(1, GRAPH_COMPUTE_CTX_SIZE);
+    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, g_compute_buf, true };
     g_compute_ctx = ggml_init(c_params);
 
     g_record_ctx = g_compute_ctx;
@@ -212,13 +218,14 @@ void sn_graph_begin(void) {
 void sn_graph_end(void) {
     if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
     if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }
+    /* Free the calloc'd buffers after ggml_free (ggml doesn't free user-provided buffers) */
+    if (g_compute_buf) { free(g_compute_buf); g_compute_buf = NULL; }
+    if (g_param_buf)   { free(g_param_buf);   g_param_buf = NULL; }
     g_record_ctx = NULL;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = false;
 
-    /* Reclaim pool slots allocated during recording.
-     * These hold stale shape metadata and no valid data.
-     * Freeing them prevents execute-mode ops from colliding with ghost slots. */
+    /* Reclaim pool slots allocated during recording */
     for (int i = g_pool_count_before_record; i < g_pool_count; i++) {
         if (g_pool[i].data) { free(g_pool[i].data); g_pool[i].data = NULL; }
     }
