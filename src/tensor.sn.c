@@ -188,7 +188,8 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
 
 void sn_graph_begin(void) {
     ensure_backend();
-    struct ggml_init_params params = { GRAPH_RECORD_CTX_SIZE, NULL, true };
+    /* no_alloc = false: tensors need data buffers for ggml_opt static graphs */
+    struct ggml_init_params params = { GRAPH_RECORD_CTX_SIZE, NULL, false };
     g_record_ctx = ggml_init(params);
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = true;
