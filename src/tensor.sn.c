@@ -85,8 +85,8 @@ static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->__sn___handle]; }
  * Parameters (model weights) have their pool data uploaded to ggml.
  * ====================================================================== */
 
-#define GRAPH_PARAM_CTX_SIZE   (64 * 1024 * 1024)   /* params + inputs */
-#define GRAPH_COMPUTE_CTX_SIZE (256 * 1024 * 1024)  /* intermediate ops */
+#define GRAPH_PARAM_CTX_SIZE   (4 * 1024 * 1024)    /* params + inputs (4MB) */
+#define GRAPH_COMPUTE_CTX_SIZE (16 * 1024 * 1024)   /* intermediate ops (16MB) */
 
 static bool                 g_record_mode  = false;
 static struct ggml_context *g_param_ctx    = NULL;   /* static: params + inputs */
