@@ -280,8 +280,20 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
+    /* Allocate backend buffers for param context tensors.
+     * ggml_opt needs backend-allocated tensors, not just host memory. */
+    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+    /* Upload parameter data to backend buffers */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && gt->buffer && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0, (size_t)g_pool[i].n_elem * sizeof(float));
+        }
+    }
+
     /* g_compute_ctx is no_alloc — ggml_opt manages its allocations.
-     * inputs/outputs are in g_param_ctx (statically allocated). */
+     * inputs/outputs are in g_param_ctx (backend-allocated). */
     ggml_opt_fit(sched, g_compute_ctx, inputs, outputs,
                  dataset, loss_type, opt_type,
                  ggml_opt_get_default_optimizer_params,
