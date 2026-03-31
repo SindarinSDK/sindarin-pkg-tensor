@@ -7,12 +7,12 @@
 #
 # var a: Tensor = Tensor.zeros(3, 4)
 # var b: Tensor = Tensor.zeros(4, 2)
-# var c: Tensor = sn_tensor_matmul(a, b)     # [3, 2]
-# var d: Tensor = sn_tensor_relu(c)
+# var c: Tensor = a.matmul(b)
+# var d: Tensor = c.relu()
 # var data: double[] = d.toDoubles()
 #
-# Phase 1: inference operations only (no autograd / optimizer).
 # GPU acceleration via ggml backend (auto-selects best available device).
+# Training via ggml-opt (AdamW, SGD with backpropagation).
 # ==============================================================================
 
 @link ggml
@@ -25,18 +25,22 @@
 @source "tensor.sn.c"
 
 # ---------------------------------------------------------------------------
-# Opaque tensor handle. All operations go through native functions.
+# Opaque tensor handle
 # ---------------------------------------------------------------------------
 
 @alias "RtTensor"
 native struct Tensor as ref =>
   _handle: long
 
+  # --- Creation ---
+
   static fn zeros(rows: int, cols: int): Tensor =>
     return sn_tensor_zeros(rows, cols)
 
   static fn fromDoubles(data: double[], rows: int, cols: int): Tensor =>
     return sn_tensor_from_doubles(data, rows, cols)
+
+  # --- Data access ---
 
   fn toDoubles(): double[] =>
     return sn_tensor_to_doubles(self)
@@ -47,74 +51,131 @@ native struct Tensor as ref =>
   fn dispose(): void =>
     sn_tensor_free(self)
 
+  # --- Arithmetic (chainable) ---
+
+  fn matmul(other: Tensor): Tensor =>
+    return sn_tensor_matmul(self, other)
+
+  fn add(other: Tensor): Tensor =>
+    return sn_tensor_add(self, other)
+
+  fn scale(s: double): Tensor =>
+    return sn_tensor_scale(self, s)
+
+  # --- Activations (chainable) ---
+
+  fn relu(): Tensor =>
+    return sn_tensor_relu(self)
+
+  fn softmax(dim: int): Tensor =>
+    return sn_tensor_softmax(self, dim)
+
+  fn dropout(rate: double, training: bool): Tensor =>
+    return sn_tensor_dropout(self, rate, training)
+
+  # --- Normalization ---
+
+  fn batchNorm(weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor =>
+    return sn_tensor_batch_norm(self, weight, bias, runningMean, runningVar, training)
+
+  # --- GNN aggregation ---
+
+  fn aggregate(edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor =>
+    return sn_tensor_sparse_aggregate(self, edgeIndex, edgeWeight, mode)
+
+  fn attentionAggregate(edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor =>
+    return sn_tensor_attention_aggregate(self, edgeIndex, edgeWeight, attWeight)
+
+  fn meanPool(batchIndex: Tensor): Tensor =>
+    return sn_tensor_mean_pool(self, batchIndex)
+
+  # --- Reduction ---
+
+  fn argmax(dim: int): int =>
+    return sn_tensor_argmax(self, dim)
+
+  fn crossEntropy(targets: Tensor): Tensor =>
+    return sn_tensor_cross_entropy(self, targets)
+
+  # --- Initialization ---
+
+  fn initKaiming(): void =>
+    sn_tensor_init_kaiming(self)
+
 # ---------------------------------------------------------------------------
-# Tensor creation
+# Native function declarations
 # ---------------------------------------------------------------------------
 
 native fn sn_tensor_zeros(rows: int, cols: int): Tensor
 native fn sn_tensor_from_doubles(data: double[], rows: int, cols: int): Tensor
 native fn sn_tensor_to_doubles(t: Tensor): double[]
 native fn sn_tensor_shape(t: Tensor): int[]
-
-# ---------------------------------------------------------------------------
-# Arithmetic
-# ---------------------------------------------------------------------------
-
+native fn sn_tensor_free(t: Tensor): void
 native fn sn_tensor_matmul(a: Tensor, b: Tensor): Tensor
 native fn sn_tensor_add(a: Tensor, b: Tensor): Tensor
 native fn sn_tensor_scale(t: Tensor, scalar: double): Tensor
-
-# ---------------------------------------------------------------------------
-# Activations
-# ---------------------------------------------------------------------------
-
 native fn sn_tensor_relu(t: Tensor): Tensor
 native fn sn_tensor_softmax(t: Tensor, dim: int): Tensor
 native fn sn_tensor_dropout(t: Tensor, rate: double, training: bool): Tensor
-
-# ---------------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------------
-
 native fn sn_tensor_batch_norm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
-
-# ---------------------------------------------------------------------------
-# Reduction & aggregation
-# ---------------------------------------------------------------------------
-
 native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
 native fn sn_tensor_argmax(t: Tensor, dim: int): int
 native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor
 native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
 native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
-
-# ---------------------------------------------------------------------------
-# Initialization
-# ---------------------------------------------------------------------------
-
 native fn sn_tensor_init_kaiming(t: Tensor): void
-
-# ---------------------------------------------------------------------------
-# Device
-# ---------------------------------------------------------------------------
-
 native fn sn_gpu_available(): bool
 native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
 native fn sn_model_save(params: Tensor[], path: str): void
 native fn sn_model_load(path: str): Tensor[]
 
 # ---------------------------------------------------------------------------
-# Lifecycle
+# Optimizer configuration
 # ---------------------------------------------------------------------------
 
-native fn sn_tensor_free(t: Tensor): void
+struct Optimizer =>
+  kind: str
+  learningRate: double
+  weightDecay: double
+  beta1: double
+  beta2: double
+
+  static fn adamw(lr: double, wd: double): Optimizer =>
+    return Optimizer {
+      kind: "adamw",
+      learningRate: lr,
+      weightDecay: wd,
+      beta1: 0.9,
+      beta2: 0.999
+    }
+
+  static fn sgd(lr: double): Optimizer =>
+    return Optimizer {
+      kind: "sgd",
+      learningRate: lr,
+      weightDecay: 0.0,
+      beta1: 0.0,
+      beta2: 0.0
+    }
+
+# ---------------------------------------------------------------------------
+# Training result
+# ---------------------------------------------------------------------------
+
+struct TrainResult =>
+  loss: double
+  accuracy: double
+  epochs: int
+
+# ---------------------------------------------------------------------------
+# Graph-to-tensor conversion (for GNN input)
+# ---------------------------------------------------------------------------
+
+struct GraphTensors =>
+  nodeFeatures: Tensor
+  edgeIndex: Tensor
+  edgeWeight: Tensor
+  batchIndex: Tensor
+  numNodes: int
+  numEdges: int
+  featureDim: int

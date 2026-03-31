@@ -1,0 +1,184 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/gnn.sn — Graph Neural Network (ggml backend)
+# ==============================================================================
+#
+# Provides configurable GNN architectures (GCN, GraphSAGE, GAT) with
+# message-passing layers, graph readout, and classification head.
+#
+# Usage:
+# import "sindarin-pkg-tensor/src/gnn"
+#
+# var model: Gnn = Gnn.create(GnnConfig { inputDim: 5, hiddenDim: 64,
+# numActions: 3, numLayers: 2, arch: "gat", dropoutRate: 0.1 })
+# var output: GnnOutput = model.forward(graphTensors, false)
+# var params: Tensor[] = model.parameters()
+# ==============================================================================
+
+import "./tensor"
+
+# ---------------------------------------------------------------------------
+# GNN configuration
+# ---------------------------------------------------------------------------
+
+struct GnnConfig =>
+  inputDim: int
+  hiddenDim: int
+  numActions: int
+  numLayers: int
+  arch: str
+  dropoutRate: double
+
+  static fn defaults(inputDim: int, numActions: int): GnnConfig =>
+    return GnnConfig {
+      inputDim: inputDim,
+      hiddenDim: 128,
+      numActions: numActions,
+      numLayers: 3,
+      arch: "gat",
+      dropoutRate: 0.1
+    }
+
+# ---------------------------------------------------------------------------
+# GNN forward pass output
+# ---------------------------------------------------------------------------
+
+struct GnnOutput =>
+  probs: Tensor
+  embedding: Tensor
+
+# ---------------------------------------------------------------------------
+# Single message-passing layer
+# ---------------------------------------------------------------------------
+
+struct GnnLayer =>
+  weight: Tensor
+  bias: Tensor
+  bnWeight: Tensor
+  bnBias: Tensor
+  bnMean: Tensor
+  bnVar: Tensor
+  attWeight: Tensor
+  inputDim: int
+  outputDim: int
+  arch: str
+  dropoutRate: double
+
+  static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
+    var layer: GnnLayer = GnnLayer {
+      weight: Tensor.zeros(inputDim, outputDim),
+      bias: Tensor.zeros(1, outputDim),
+      bnWeight: Tensor.zeros(1, outputDim),
+      bnBias: Tensor.zeros(1, outputDim),
+      bnMean: Tensor.zeros(1, outputDim),
+      bnVar: Tensor.zeros(1, outputDim),
+      attWeight: Tensor.zeros(1, 2 * outputDim),
+      inputDim: inputDim,
+      outputDim: outputDim,
+      arch: arch,
+      dropoutRate: dropoutRate
+    }
+    layer.weight.initKaiming()
+    return layer
+
+  fn forward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    if self.arch == "gcn" =>
+      return self.gcnForward(x, edgeIndex, edgeWeight, training)
+    if self.arch == "sage" =>
+      return self.sageForward(x, edgeIndex, edgeWeight, training)
+    if self.arch == "gat" =>
+      return self.gatForward(x, edgeIndex, edgeWeight, training)
+    return x
+
+  fn gcnForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var h: Tensor = x.matmul(self.weight).add(self.bias)
+    h = h.aggregate(edgeIndex, edgeWeight, "sum_normalized")
+    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
+    return h.relu().dropout(self.dropoutRate, training)
+
+  fn sageForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var agg: Tensor = x.aggregate(edgeIndex, edgeWeight, "mean")
+    var h: Tensor = agg.matmul(self.weight).add(self.bias)
+    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
+    return h.relu().dropout(self.dropoutRate, training)
+
+  fn gatForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var h: Tensor = x.matmul(self.weight).add(self.bias)
+    h = h.attentionAggregate(edgeIndex, edgeWeight, self.attWeight)
+    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
+    return h.relu().dropout(self.dropoutRate, training)
+
+  fn parameters(): Tensor[] =>
+    if self.arch == "gat" =>
+      return {self.weight, self.bias, self.bnWeight, self.bnBias, self.attWeight}
+    return {self.weight, self.bias, self.bnWeight, self.bnBias}
+
+# ---------------------------------------------------------------------------
+# Full GNN model: message-passing layers + readout + classification head
+# ---------------------------------------------------------------------------
+
+struct Gnn =>
+  layers: GnnLayer[]
+  classifierW1: Tensor
+  classifierB1: Tensor
+  classifierW2: Tensor
+  classifierB2: Tensor
+  config: GnnConfig
+
+  static fn create(config: GnnConfig): Gnn =>
+    var gnnLayers: GnnLayer[] = {}
+    gnnLayers.push(GnnLayer.create(config.arch, config.inputDim, config.hiddenDim, config.dropoutRate))
+    for var i: int = 1; i < config.numLayers; i++ =>
+      gnnLayers.push(GnnLayer.create(config.arch, config.hiddenDim, config.hiddenDim, config.dropoutRate))
+
+    var hd: int = config.hiddenDim
+    var na: int = config.numActions
+
+    var w1: Tensor = Tensor.zeros(hd, hd)
+    var w2: Tensor = Tensor.zeros(hd, na)
+    w1.initKaiming()
+    w2.initKaiming()
+    var b1: Tensor = Tensor.zeros(1, hd)
+    var b2: Tensor = Tensor.zeros(1, na)
+
+    return Gnn {
+      layers: gnnLayers,
+      classifierW1: w1,
+      classifierB1: b1,
+      classifierW2: w2,
+      classifierB2: b2,
+      config: config
+    }
+
+  fn forward(graph: GraphTensors, training: bool): GnnOutput =>
+    var h: Tensor = graph.nodeFeatures
+    for var i: int = 0; i < len(self.layers); i++ =>
+      h = self.layers[i].forward(h, graph.edgeIndex, graph.edgeWeight, training)
+
+    # Graph-level readout via mean pooling
+    var embedding: Tensor = h.meanPool(graph.batchIndex)
+
+    # Classification head
+    var c: Tensor = embedding.matmul(self.classifierW1).add(self.classifierB1).relu()
+    c = c.dropout(self.config.dropoutRate, training)
+    c = c.matmul(self.classifierW2).add(self.classifierB2)
+    var probs: Tensor = c.softmax(1)
+
+    return GnnOutput {
+      probs: probs,
+      embedding: embedding
+    }
+
+  fn parameters(): Tensor[] =>
+    var params: Tensor[] = {}
+    for var i: int = 0; i < len(self.layers); i++ =>
+      var layerParams: Tensor[] = self.layers[i].parameters()
+      for var j: int = 0; j < len(layerParams); j++ =>
+        params.push(layerParams[j])
+    params.push(self.classifierW1)
+    params.push(self.classifierB1)
+    params.push(self.classifierW2)
+    params.push(self.classifierB2)
+    return params
+
+  fn save(path: str): void =>
+    sn_model_save(self.parameters(), path)
