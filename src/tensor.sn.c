@@ -196,9 +196,9 @@ void sn_graph_begin(void) {
     /* Save pool count so we can reclaim recording slots on end */
     g_pool_count_before_record = g_pool_count;
 
-    /* no_alloc=false: param tensors get host-side data buffers.
-     * ggml_opt_fit handles backend allocation internally. */
-    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, false };
+    /* no_alloc=true: ggml_opt_fit allocates backend buffers itself.
+     * We upload data after ggml_opt allocates via the static graph path. */
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
     g_param_ctx = ggml_init(p_params);
 
     struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
@@ -289,14 +289,27 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Upload pool data into param context tensors (host memory from no_alloc=false init).
-     * Then ggml_opt_fit will handle backend allocation internally. */
+    /* Allocate backend buffers for param context.
+     * Force-clear any buffer pointers first (ggml_set_param may set them). */
+    {
+        struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx);
+        while (t) {
+            if (t->buffer) {
+                fprintf(stderr, "GRAPH_TRAIN: clearing stale buffer on '%s' [%lld,%lld]\n",
+                        t->name ? t->name : "?", (long long)t->ne[0], (long long)t->ne[1]);
+            }
+            t->buffer = NULL;
+            t = ggml_get_next_tensor(g_param_ctx, t);
+        }
+    }
+    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+    /* Upload pool data to backend buffers */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->data && g_pool[i].data) {
-            size_t sz = ggml_nbytes(gt);
-            size_t pool_sz = (size_t)g_pool[i].n_elem * sizeof(float);
-            memcpy(gt->data, g_pool[i].data, sz < pool_sz ? sz : pool_sz);
+        if (gt && gt->buffer && g_pool[i].data) {
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0,
+                (size_t)g_pool[i].n_elem * sizeof(float));
         }
     }
 
