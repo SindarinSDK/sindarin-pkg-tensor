@@ -145,6 +145,27 @@ static void ensure_backend(void)
 /* Context size generous enough for any single-op graph */
 #define GRAPH_CTX_SIZE (16 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
 
+/* Pre-allocated zero'd buffer for micro-graph contexts.
+ * Newer ggml versions assert tensor->buffer == NULL before allocation.
+ * posix_memalign (ggml's default) doesn't zero memory, so stale
+ * buffer pointers from prior ggml contexts can trigger the assertion.
+ * Using a pre-zero'd buffer avoids this. */
+static void *g_micro_ctx_buf = NULL;
+static size_t g_micro_ctx_size = 0;
+
+static struct ggml_context *micro_ctx_init(void) {
+    size_t needed = GRAPH_CTX_SIZE;
+    if (!g_micro_ctx_buf || g_micro_ctx_size < needed) {
+        if (g_micro_ctx_buf) free(g_micro_ctx_buf);
+        g_micro_ctx_size = needed;
+        g_micro_ctx_buf = malloc(g_micro_ctx_size);
+    }
+    /* Zero the buffer to ensure all tensor fields (including buffer) start NULL */
+    memset(g_micro_ctx_buf, 0, g_micro_ctx_size);
+    struct ggml_init_params params = { g_micro_ctx_size, g_micro_ctx_buf, true };
+    return ggml_init(params);
+}
+
 /* Input tensor tracking for upload before compute */
 #define MAX_INPUTS 8
 static struct ggml_tensor *g_inputs[MAX_INPUTS];
@@ -401,8 +422,7 @@ RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
     int64_t K = pa->ne[0];
     int64_t N = pb->ne[0];
 
-    struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
-    struct ggml_context *ctx = ggml_init(params);
+    struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
     struct ggml_tensor *tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, K);
@@ -435,8 +455,7 @@ RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
     TPool *pb = unwrap(b);
     if (g_record_mode) return rec_wrap(ggml_add(g_record_ctx, rec_tensor(a), rec_tensor(b)), pa->ne[0], pa->ne[1]);
 
-    struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
-    struct ggml_context *ctx = ggml_init(params);
+    struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pa->ne[0], pa->ne[1]);
     struct ggml_tensor *tb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pb->ne[0], pb->ne[1]);
@@ -465,8 +484,7 @@ RtTensor *sn_tensor_scale(RtTensor *t, double scalar)
     TPool *pt = unwrap(t);
     if (g_record_mode) return rec_wrap(ggml_scale(g_record_ctx, rec_tensor(t), (float)scalar), pt->ne[0], pt->ne[1]);
 
-    struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
-    struct ggml_context *ctx = ggml_init(params);
+    struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
@@ -496,8 +514,7 @@ RtTensor *sn_tensor_relu(RtTensor *t)
     TPool *pt = unwrap(t);
     if (g_record_mode) return rec_wrap(ggml_relu(g_record_ctx, rec_tensor(t)), pt->ne[0], pt->ne[1]);
 
-    struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
-    struct ggml_context *ctx = ggml_init(params);
+    struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
@@ -524,8 +541,7 @@ RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
     (void)dim;
     if (g_record_mode) return rec_wrap(ggml_soft_max(g_record_ctx, rec_tensor(t)), pt->ne[0], pt->ne[1]);
 
-    struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
-    struct ggml_context *ctx = ggml_init(params);
+    struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *ta = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, pt->ne[0], pt->ne[1]);
     ggml_set_input(ta);
