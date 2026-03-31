@@ -84,70 +84,37 @@ fn main(): void =>
 
 Opaque handle to a tensor in the ggml computation pool.
 
-**Creation:**
-
-| Method                                 | Description                      |
-|----------------------------------------|----------------------------------|
-| `Tensor.zeros(rows, cols)`             | Create a zero-initialized tensor |
-| `Tensor.fromDoubles(data, rows, cols)` | Create from a double array       |
-
-**Arithmetic (chainable):**
-
-| Method           | Description           |
-|------------------|-----------------------|
+| Method | Description |
+|---|---|
+| **Creation** | |
+| `Tensor.zeros(rows, cols)` | Create a zero-initialized tensor |
+| `Tensor.fromDoubles(data, rows, cols)` | Create from a double array |
+| **Arithmetic (chainable)** | |
 | `t.matmul(other)` | Matrix multiplication |
-| `t.add(other)`   | Element-wise addition |
-| `t.scale(s)`     | Scalar multiplication |
-
-**Activations (chainable):**
-
-| Method                      | Description             |
-|-----------------------------|-------------------------|
-| `t.relu()`                  | ReLU activation         |
-| `t.softmax(dim)`            | Softmax along dimension |
-| `t.dropout(rate, training)` | Dropout regularisation  |
-
-**Normalization:**
-
-| Method                                            | Description         |
-|---------------------------------------------------|---------------------|
+| `t.add(other)` | Element-wise addition |
+| `t.scale(s)` | Scalar multiplication |
+| **Activations (chainable)** | |
+| `t.relu()` | ReLU activation |
+| `t.softmax(dim)` | Softmax along dimension |
+| `t.dropout(rate, training)` | Dropout regularisation |
+| **Normalization** | |
 | `t.batchNorm(weight, bias, mean, var, training)` | Batch normalization |
-
-**GNN Aggregation:**
-
-| Method                                                     | Description                                                    |
-|------------------------------------------------------------|----------------------------------------------------------------|
-| `t.aggregate(edgeIndex, edgeWeight, mode)`                 | Sparse message passing (`"sum"`, `"mean"`, `"sum_normalized"`) |
-| `t.attentionAggregate(edgeIndex, edgeWeight, attWeight)` | Attention-based aggregation (GAT)                              |
-| `t.meanPool(batchIndex)`                                   | Mean pooling over graph batch                                  |
-
-**Reduction:**
-
-| Method                     | Description            |
-|----------------------------|------------------------|
-| `t.argmax(dim)`            | Index of maximum value |
-| `t.crossEntropy(targets)` | Cross-entropy loss     |
-
-**Data access:**
-
-| Method         | Description             |
-|----------------|-------------------------|
+| **GNN Aggregation** | |
+| `t.aggregate(edgeIndex, edgeWeight, mode)` | Sparse message passing (`"sum"`, `"mean"`, `"sum_normalized"`) |
+| `t.attentionAggregate(edgeIndex, edgeWeight, attWeight)` | Attention-based aggregation (GAT) |
+| `t.meanPool(batchIndex)` | Mean pooling over graph batch |
+| **Reduction** | |
+| `t.argmax(dim)` | Index of maximum value |
+| `t.crossEntropy(targets)` | Cross-entropy loss |
+| **Data access** | |
 | `t.toDoubles()` | Convert to double array |
-| `t.shape()`    | Get shape as int array  |
-| `t.dispose()`  | Free tensor memory      |
-
-**Initialization:**
-
-| Method             | Description                     |
-|--------------------|---------------------------------|
+| `t.shape()` | Get shape as int array |
+| `t.dispose()` | Free tensor memory |
+| **Initialization** | |
 | `t.initKaiming()` | Kaiming uniform initialization |
-
-**Persistence:**
-
-| Function                      | Description                        |
-|-------------------------------|------------------------------------|
-| `sn_model_save(params, path)` | Save tensor array to binary file   |
-| `sn_model_load(path)`         | Load tensor array from binary file |
+| **Persistence** | |
+| `sn_model_save(params, path)` | Save tensor array to binary file |
+| `sn_model_load(path)` | Load tensor array from binary file |
 
 ### Optimizer
 
