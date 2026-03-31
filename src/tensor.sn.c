@@ -191,9 +191,9 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
 
 void sn_graph_begin(void) {
     ensure_backend();
-    /* Param context: no_alloc=false — params/inputs need host data buffers.
-     * These are allocated statically and persist across ggml_opt iterations. */
-    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, false };
+    /* Param context: no_alloc=true — backend buffers allocated later via
+     * ggml_backend_alloc_ctx_tensors. Data uploaded with ggml_backend_tensor_set. */
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
     g_param_ctx = ggml_init(p_params);
 
     /* Compute context: no_alloc=true — intermediate tensors are allocated
@@ -228,13 +228,12 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     if (!g_record_mode || !rt) return rt;
     TPool *s = unwrap(rt);
     int idx = (int)rt->__sn___handle;
-    /* Parameters go in the param context (statically allocated) */
+    /* Parameters go in the param context (backend-allocated later) */
     struct ggml_tensor *gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, s->ne[0], s->ne[1]);
     ggml_set_name(gt, "param");
     ggml_set_input(gt);
     ggml_set_param(gt);
-    /* Copy pool data into the param context tensor */
-    memcpy(gt->data, s->data, (size_t)s->n_elem * sizeof(float));
+    /* Data uploaded after ggml_backend_alloc_ctx_tensors in sn_graph_train */
     g_record_map[idx] = gt;
     return rt;
 }
@@ -280,15 +279,18 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Allocate backend buffers for param context tensors.
-     * ggml_opt needs backend-allocated tensors, not just host memory. */
+    /* Allocate backend buffers for all tensors in param context */
     ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
 
-    /* Upload parameter data to backend buffers */
+    /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->buffer && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
-            ggml_backend_tensor_set(gt, g_pool[i].data, 0, (size_t)g_pool[i].n_elem * sizeof(float));
+        if (gt && gt->buffer && g_pool[i].data) {
+            /* Check if this tensor is in the param context (has a buffer) */
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0,
+                                    ggml_nbytes(gt) < (size_t)g_pool[i].n_elem * sizeof(float)
+                                    ? ggml_nbytes(gt)
+                                    : (size_t)g_pool[i].n_elem * sizeof(float));
         }
     }
 
@@ -675,7 +677,7 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
         struct ggml_tensor *gmean = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, feat_dim, 1);
         ggml_set_name(gmean, "mean_pool");
         ggml_set_input(gmean);
-        memcpy(gmean->data, pmean->data, (size_t)feat_dim * sizeof(float));
+        /* Data uploaded after ggml_backend_alloc_ctx_tensors */
         g_record_map[mean_idx] = gmean;
         return rec_wrap(gmean, feat_dim, 1);
     }
@@ -766,7 +768,7 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
         struct ggml_tensor *gadj = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
         ggml_set_name(gadj, "adj");
         ggml_set_input(gadj);
-        memcpy(gadj->data, adj->data, (size_t)(num_nodes * num_nodes) * sizeof(float));
+        /* Data uploaded after ggml_backend_alloc_ctx_tensors */
         g_record_map[adj_idx] = gadj;
         /* result = adj × features: ggml_mul_mat(a,b) = b @ a^T
          * Transpose features so ne[0] matches adj's ne[0] (num_nodes) */
