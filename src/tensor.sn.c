@@ -179,6 +179,9 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
     return alloc;
 }
 
+/* Forward declarations */
+RtTensor *sn_tensor_zeros(long long rows, long long cols);
+
 /* ======================================================================
  * Graph recording API
  * ====================================================================== */
@@ -212,7 +215,7 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     struct ggml_tensor *gt = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, s->ne[0], s->ne[1]);
     ggml_set_name(gt, "param");
     ggml_set_input(gt);
-    ggml_set_param(g_record_ctx, gt);
+    ggml_set_param(gt);
     gt->data = s->data;
     g_record_map[idx] = gt;
     return rt;
@@ -256,18 +259,12 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     enum ggml_opt_optimizer_type opt_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
 
-    struct ggml_opt_optimizer_params opt_params = ggml_opt_get_default_optimizer_params(NULL);
-    opt_params.adamw.alpha = (float)lr;
-    opt_params.adamw.wd    = (float)wd;
-    opt_params.sgd.alpha   = (float)lr;
-    opt_params.sgd.wd      = (float)wd;
-
     ggml_backend_t backends[] = { g_backend };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
     ggml_opt_fit(sched, g_record_ctx, inputs, outputs,
                  dataset, loss_type, opt_type,
-                 ggml_opt_get_constant_optimizer_params, &opt_params,
+                 ggml_opt_get_default_optimizer_params,
                  nepochs, nbatch, (float)val_split, false);
 
     /* Read back trained parameters to pool */
