@@ -538,7 +538,7 @@ RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
 RtTensor *sn_tensor_dropout(RtTensor *t, double rate, int training)
 {
     TPool *pt = unwrap(t);
-    if (g_record_mode) return t; /* identity in graph mode */
+    if (g_record_mode) { t->__rc__++; return t; } /* identity in graph mode — retain for caller ownership */
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     TPool *out = &g_pool[idx];
 
@@ -563,7 +563,7 @@ RtTensor *sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
                                RtTensor *running_mean, RtTensor *running_var,
                                int training)
 {
-    if (g_record_mode) return t; /* identity in graph mode — affine captured by matmul+add */
+    if (g_record_mode) { t->__rc__++; return t; } /* identity in graph mode — retain for caller ownership */
     TPool *pt   = unwrap(t);
     TPool *pw   = unwrap(weight);
     TPool *pb   = unwrap(bias);
