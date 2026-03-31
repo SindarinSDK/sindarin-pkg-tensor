@@ -289,19 +289,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Allocate backend buffers for param context.
-     * Force-clear any buffer pointers first (ggml_set_param may set them). */
-    {
-        struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx);
-        while (t) {
-            if (t->buffer) {
-                fprintf(stderr, "GRAPH_TRAIN: clearing stale buffer on '%s' [%lld,%lld]\n",
-                        t->name ? t->name : "?", (long long)t->ne[0], (long long)t->ne[1]);
-            }
-            t->buffer = NULL;
-            t = ggml_get_next_tensor(g_param_ctx, t);
-        }
-    }
+    /* Allocate backend buffers for param context tensors */
     ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
 
     /* Upload pool data to backend buffers */
