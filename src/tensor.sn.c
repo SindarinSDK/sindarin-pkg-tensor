@@ -510,13 +510,15 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
     int64_t feat_dim  = px->ne[0];
     int64_t num_edges = pei->ne[0] > pei->ne[1] ? pei->ne[1] : pei->ne[0];
 
-    /* edge_index: [2, num_edges], row 0 = src, row 1 = dst */
+    /* edge_index: [2, num_edges] — created via fromDoubles(data, rows=2, cols=num_edges)
+     * pool layout: ne[0]=cols=num_edges, ne[1]=rows=2
+     * data[i] = src[i], data[ne[0]+i] = dst[i] */
     if (pei->ne[1] == 2) {
-        /* Stored as [num_edges, 2] — ne0=2, ne1=num_edges */
-        num_edges = pei->ne[1];
-    } else {
-        /* Stored as [2, num_edges] — ne0=num_edges, ne1=2 */
+        /* Standard: [2 rows, num_edges cols] — ne[0]=num_edges, ne[1]=2 */
         num_edges = pei->ne[0];
+    } else {
+        /* Transposed: [num_edges rows, 2 cols] — ne[0]=2, ne[1]=num_edges */
+        num_edges = pei->ne[1];
     }
 
     int idx = pool_alloc(feat_dim, num_nodes, 2);
@@ -525,12 +527,13 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
     for (int64_t i = 0; i < num_edges; i++) {
         int64_t s, d;
         if (pei->ne[1] == 2) {
-            /* [2, num_edges]: row 0 at offset 0, row 1 at offset num_edges */
+            /* Standard: row 0 at offset 0, row 1 at offset num_edges */
             s = (int64_t)pei->data[i];
             d = (int64_t)pei->data[num_edges + i];
         } else {
-            s = (int64_t)pei->data[i];
-            d = (int64_t)pei->data[num_edges + i];
+            /* Transposed: each row is (src, dst) pair */
+            s = (int64_t)pei->data[i * 2];
+            d = (int64_t)pei->data[i * 2 + 1];
         }
         float w = pew->data[i];
         for (int64_t f = 0; f < feat_dim; f++) {
@@ -546,7 +549,7 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
             if (pei->ne[1] == 2) {
                 d = (int64_t)pei->data[num_edges + i];
             } else {
-                d = (int64_t)pei->data[num_edges + i];
+                d = (int64_t)pei->data[i * 2 + 1];
             }
             count[d] += 1.0f;
         }
