@@ -301,15 +301,12 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                  ggml_opt_get_default_optimizer_params,
                  nepochs, nbatch, (float)val_split, false);
 
-    /* Read back trained parameters to pool.
-     * Parameters are in g_param_ctx with statically allocated data. */
+    /* Read back trained parameters from backend to pool */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+        if (gt && gt->buffer && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
             TPool *s = &g_pool[i];
-            if (gt->data) {
-                memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
-            }
+            ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
         }
     }
 
