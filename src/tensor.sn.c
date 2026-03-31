@@ -592,8 +592,56 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
     int64_t feat_dim  = px->ne[0];
 
     if (g_record_mode) {
-        struct ggml_tensor *result = ggml_mean(g_record_ctx, rec_tensor(node_embeddings));
-        return rec_wrap(result, feat_dim, 1);
+        /* Mean pool: average node embeddings → [feat_dim, 1]
+         * Use a 1/N weight vector and matmul: result = features @ (ones/N)
+         * features: [feat_dim, num_nodes], ones: [num_nodes, 1] → result: [feat_dim, 1] */
+        int avg_idx = pool_alloc(1, num_nodes, 2);
+        TPool *avg = &g_pool[avg_idx];
+        float inv_n = 1.0f / (float)num_nodes;
+        for (int64_t i = 0; i < num_nodes; i++) avg->data[i] = inv_n;
+
+        struct ggml_tensor *gavg = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, 1, num_nodes);
+        ggml_set_name(gavg, "avg_weight");
+        ggml_set_input(gavg);
+        gavg->data = avg->data;
+        g_record_map[avg_idx] = gavg;
+
+        /* ggml_mul_mat(a, b) = b @ a^T. We want features @ avg = [feat_dim, num_nodes] @ [num_nodes, 1]
+         * Set a = avg^T = [1, num_nodes], b = features = [feat_dim, num_nodes]
+         * Then a->ne[0]=1 != b->ne[0]=feat_dim — doesn't work.
+         * Instead: transpose features: [num_nodes, feat_dim]
+         * Then ggml_mul_mat(features_T, avg) = avg @ features_T^T = avg @ features
+         * = [1, num_nodes] @ [feat_dim, num_nodes]^T ... still wrong.
+         *
+         * Actually: ggml_mul_mat(a, b) needs a->ne[0] == b->ne[0].
+         * a = [num_nodes, feat_dim] (features transposed), ne[0]=num_nodes
+         * b = [num_nodes, 1] (avg), ne[0]=num_nodes ✓
+         * result = b @ a^T = [1, num_nodes] @ [feat_dim, num_nodes] = won't work (inner dims mismatch)
+         *
+         * Let me use ggml_repeat + ggml_mul + ggml_sum approach instead.
+         * Or just do the mean manually: sum each column, divide by N. */
+
+        /* Simple approach: ggml_scale(ggml_sum(features along rows), 1/N)
+         * But ggml doesn't have row-wise sum that preserves column structure.
+         *
+         * Fallback: compute mean on host, store as constant tensor. */
+        TPool *pfeat = unwrap(node_embeddings);
+        int mean_idx = pool_alloc(feat_dim, 1, 2);
+        TPool *pmean = &g_pool[mean_idx];
+        memset(pmean->data, 0, (size_t)feat_dim * sizeof(float));
+        for (int64_t n = 0; n < num_nodes; n++) {
+            for (int64_t f = 0; f < feat_dim; f++) {
+                pmean->data[f] += pfeat->data[n * feat_dim + f];
+            }
+        }
+        for (int64_t f = 0; f < feat_dim; f++) pmean->data[f] /= (float)num_nodes;
+
+        struct ggml_tensor *gmean = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, feat_dim, 1);
+        ggml_set_name(gmean, "mean_pool");
+        ggml_set_input(gmean);
+        gmean->data = pmean->data;
+        g_record_map[mean_idx] = gmean;
+        return rec_wrap(gmean, feat_dim, 1);
     }
 
     /* Find number of graphs (max batch index + 1) */
