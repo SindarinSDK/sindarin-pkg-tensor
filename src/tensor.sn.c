@@ -296,20 +296,26 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Debug: check for stale buffers before allocation */
+    /* Debug: check BOTH contexts for stale buffers */
     {
-        struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx);
-        int ti = 0;
+        struct ggml_tensor *t;
+        int ti;
+
+        t = ggml_get_first_tensor(g_param_ctx);
+        ti = 0;
         while (t) {
-            if (t->buffer) {
-                fprintf(stderr, "STALE_BUF: param_ctx tensor[%d] '%s' [%lld,%lld] buffer=%p\n",
-                        ti, t->name ? t->name : "?",
-                        (long long)t->ne[0], (long long)t->ne[1], (void*)t->buffer);
-            }
-            ti++;
-            t = ggml_get_next_tensor(g_param_ctx, t);
+            if (t->buffer) fprintf(stderr, "STALE: param[%d] '%s' buf=%p\n", ti, t->name?t->name:"?", (void*)t->buffer);
+            ti++; t = ggml_get_next_tensor(g_param_ctx, t);
         }
-        fprintf(stderr, "PARAM_CTX: %d tensors checked\n", ti);
+        fprintf(stderr, "PARAM_CTX: %d tensors\n", ti);
+
+        t = ggml_get_first_tensor(g_compute_ctx);
+        ti = 0;
+        while (t) {
+            if (t->buffer) fprintf(stderr, "STALE: compute[%d] '%s' buf=%p\n", ti, t->name?t->name:"?", (void*)t->buffer);
+            ti++; t = ggml_get_next_tensor(g_compute_ctx, t);
+        }
+        fprintf(stderr, "COMPUTE_CTX: %d tensors\n", ti);
     }
     /* Allocate backend buffers for param context tensors */
     ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
