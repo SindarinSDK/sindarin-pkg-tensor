@@ -375,12 +375,9 @@ RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
-    if (!g_record_mode) {
-        fprintf(stderr, "MATMUL: a_h=%lld[%lld,%lld] b_h=%lld[%lld,%lld] pool=%d\n",
-                a->__sn___handle, pa->ne[0], pa->ne[1],
-                b->__sn___handle, pb->ne[0], pb->ne[1], g_pool_count);
-    }
-    TPool *pb = unwrap(b);
+    fprintf(stderr, "MATMUL: a_h=%lld[%lld,%lld] b_h=%lld[%lld,%lld] rec=%d pool=%d\n",
+            a->__sn___handle, pa->ne[0], pa->ne[1],
+            b->__sn___handle, pb->ne[0], pb->ne[1], g_record_mode, g_pool_count);
     if (g_record_mode) {
         int64_t N = pb->ne[0], M = pa->ne[1];
         struct ggml_tensor *bt = ggml_cont(g_record_ctx, ggml_transpose(g_record_ctx, rec_tensor(b)));
