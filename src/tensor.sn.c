@@ -196,7 +196,9 @@ void sn_graph_begin(void) {
     /* Save pool count so we can reclaim recording slots on end */
     g_pool_count_before_record = g_pool_count;
 
-    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
+    /* no_alloc=false: param tensors get host-side data buffers.
+     * ggml_opt_fit handles backend allocation internally. */
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, false };
     g_param_ctx = ggml_init(p_params);
 
     struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
@@ -287,27 +289,14 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Allocate backend buffers for param context tensors.
-     * Clear any stale buffer pointers first (can happen if ggml_set_param
-     * or other ops assigned buffers during graph construction). */
-    {
-        struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx);
-        while (t) {
-            t->buffer = NULL;
-            t = ggml_get_next_tensor(g_param_ctx, t);
-        }
-    }
-    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
-
-    /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
+    /* Upload pool data into param context tensors (host memory from no_alloc=false init).
+     * Then ggml_opt_fit will handle backend allocation internally. */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->buffer && g_pool[i].data) {
-            /* Check if this tensor is in the param context (has a buffer) */
-            ggml_backend_tensor_set(gt, g_pool[i].data, 0,
-                                    ggml_nbytes(gt) < (size_t)g_pool[i].n_elem * sizeof(float)
-                                    ? ggml_nbytes(gt)
-                                    : (size_t)g_pool[i].n_elem * sizeof(float));
+        if (gt && gt->data && g_pool[i].data) {
+            size_t sz = ggml_nbytes(gt);
+            size_t pool_sz = (size_t)g_pool[i].n_elem * sizeof(float);
+            memcpy(gt->data, g_pool[i].data, sz < pool_sz ? sz : pool_sz);
         }
     }
 
@@ -318,12 +307,18 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                  ggml_opt_get_default_optimizer_params,
                  nepochs, nbatch, (float)val_split, false);
 
-    /* Read back trained parameters from backend to pool */
+    /* Read back trained parameters to pool.
+     * After ggml_opt_fit, parameter data is in backend buffers.
+     * Use ggml_backend_tensor_get if buffer exists, else memcpy from host. */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->buffer && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
             TPool *s = &g_pool[i];
-            ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
+            if (gt->buffer) {
+                ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
+            } else if (gt->data) {
+                memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
+            }
         }
     }
 
