@@ -211,28 +211,15 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
  * ====================================================================== */
 
 static int g_pool_count_before_record = 0;
-static void *g_param_buf   = NULL;  /* calloc'd buffer for param context */
-static void *g_compute_buf = NULL;  /* calloc'd buffer for compute context */
 
 void sn_graph_begin(void) {
     ensure_backend();
     g_pool_count_before_record = g_pool_count;
 
-    /* Pre-zero context buffers with calloc to ensure all tensor fields
-     * (including buffer pointers) start as NULL. Using posix_memalign
-     * (ggml's default when mem_buffer=NULL) does NOT zero memory, so
-     * stale heap data from prior ggml contexts can leave buffer != NULL
-     * in tensor structs, causing ggml_backend_alloc_ctx_tensors to assert. */
-    /* no_alloc=false: tensors get host memory from the calloc'd buffer.
-     * ggml_opt_fit allocates backend buffers on top of this. */
-    g_param_buf = calloc(1, GRAPH_PARAM_CTX_SIZE);
-    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, g_param_buf, false };
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
     g_param_ctx = ggml_init(p_params);
 
-    /* no_alloc=false for compute context too — ggml_opt_fit's newer versions
-     * may set buffer pointers during graph construction before allocation. */
-    g_compute_buf = calloc(1, GRAPH_COMPUTE_CTX_SIZE);
-    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, g_compute_buf, false };
+    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
     g_compute_ctx = ggml_init(c_params);
 
     g_record_ctx = g_compute_ctx;
@@ -243,9 +230,6 @@ void sn_graph_begin(void) {
 void sn_graph_end(void) {
     if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
     if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }
-    /* Free the calloc'd buffers after ggml_free (ggml doesn't free user-provided buffers) */
-    if (g_compute_buf) { free(g_compute_buf); g_compute_buf = NULL; }
-    if (g_param_buf)   { free(g_param_buf);   g_param_buf = NULL; }
     g_record_ctx = NULL;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = false;
@@ -319,16 +303,22 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
 
     ggml_backend_t backends[] = { g_backend };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
+    /* Use a reasonable graph size upper bound instead of SN_TENSOR_MAX.
+     * SN_TENSOR_MAX (65536) caused scheduler pre-allocation to exhaust ggml
+     * backend memory after prior tensor operations fragmented the heap. */
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, 4096, false, false);
 
-    /* Copy pool data into param context tensors' host memory.
-     * Param context uses calloc'd buffer (no_alloc=false equivalent via manual buffer),
-     * so tensors have host data pointers. ggml_opt_fit handles backend allocation. */
+    /* Allocate backend buffers for all tensors in param context */
+    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+    /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->data && g_pool[i].data) {
-            memcpy(gt->data, g_pool[i].data,
-                   (size_t)g_pool[i].n_elem * sizeof(float));
+        if (gt && gt->buffer && g_pool[i].data) {
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0,
+                                    ggml_nbytes(gt) < (size_t)g_pool[i].n_elem * sizeof(float)
+                                    ? ggml_nbytes(gt)
+                                    : (size_t)g_pool[i].n_elem * sizeof(float));
         }
     }
 
