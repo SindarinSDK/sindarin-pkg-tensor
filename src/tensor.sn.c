@@ -711,7 +711,7 @@ void sn_model_save(SnArray *params, char *path)
     fwrite(&count, sizeof(count), 1, f);
 
     for (long long i = 0; i < count; i++) {
-        RtTensor *rt = (RtTensor *)sn_array_get(params, i);
+        RtTensor *rt = *(RtTensor **)sn_array_get(params, i);
         TPool *s = unwrap(rt);
         fwrite(&s->n_dims, sizeof(s->n_dims), 1, f);
         fwrite(s->ne, sizeof(int64_t), 4, f);
@@ -726,7 +726,7 @@ SnArray *sn_model_load(char *path)
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "model_load: cannot open %s\n", path);
-        return sn_array_new(sizeof(RtTensor), 0);
+        return sn_array_new(sizeof(RtTensor *), 0);
     }
 
     uint32_t magic;
@@ -735,11 +735,11 @@ SnArray *sn_model_load(char *path)
     if (magic != SN_TENSOR_MAGIC) {
         fprintf(stderr, "model_load: invalid file format\n");
         fclose(f);
-        return sn_array_new(sizeof(RtTensor), 0);
+        return sn_array_new(sizeof(RtTensor *), 0);
     }
     fread(&count, sizeof(count), 1, f);
 
-    SnArray *arr = sn_array_new(sizeof(RtTensor), (int)count);
+    SnArray *arr = sn_array_new(sizeof(RtTensor *), (int)count);
     for (long long i = 0; i < count; i++) {
         int n_dims;
         int64_t ne[4];
@@ -752,7 +752,7 @@ SnArray *sn_model_load(char *path)
         fread(g_pool[idx].data, sizeof(float), (size_t)g_pool[idx].n_elem, f);
 
         RtTensor *rt = wrap_pool(idx);
-        sn_array_push(arr, rt);
+        sn_array_push(arr, &rt);
     }
 
     fclose(f);
