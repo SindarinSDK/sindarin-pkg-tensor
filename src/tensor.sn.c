@@ -415,6 +415,10 @@ RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
     TPool *pb = unwrap(b);
     if (g_record_mode) return rec_wrap(ggml_add(g_record_ctx, rec_tensor(a), rec_tensor(b)), pa->ne[0], pa->ne[1]);
 
+    fprintf(stderr, "TENSOR_ADD: a=[%lld,%lld] handle=%lld b=[%lld,%lld] handle=%lld\n",
+            pa->ne[0], pa->ne[1], a->__sn___handle,
+            pb->ne[0], pb->ne[1], b->__sn___handle);
+
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
 
