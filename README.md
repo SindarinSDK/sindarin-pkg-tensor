@@ -73,10 +73,10 @@ fn main(): void =>
 
 ## Modules
 
-| Module | Import | Description |
-|--------|--------|-------------|
+| Module | Import                                    | Description                                        |
+|--------|-------------------------------------------|----------------------------------------------------|
 | Tensor | `import "sindarin-pkg-tensor/src/tensor"` | Tensor operations, optimizer config, graph tensors |
-| GNN | `import "sindarin-pkg-tensor/src/gnn"` | Graph neural network layers and models |
+| GNN    | `import "sindarin-pkg-tensor/src/gnn"`    | Graph neural network layers and models             |
 
 ## API Reference
 
@@ -86,68 +86,68 @@ Opaque handle to a tensor in the ggml computation pool.
 
 **Creation:**
 
-| Method | Description |
-|--------|-------------|
-| `Tensor.zeros(rows, cols)` | Create a zero-initialized tensor |
-| `Tensor.fromDoubles(data, rows, cols)` | Create from a double array |
+| Method                                 | Description                      |
+|----------------------------------------|----------------------------------|
+| `Tensor.zeros(rows, cols)`             | Create a zero-initialized tensor |
+| `Tensor.fromDoubles(data, rows, cols)` | Create from a double array       |
 
 **Arithmetic (chainable):**
 
-| Method | Description |
-|--------|-------------|
+| Method           | Description           |
+|------------------|-----------------------|
 | `t.matmul(other)` | Matrix multiplication |
-| `t.add(other)` | Element-wise addition |
-| `t.scale(s)` | Scalar multiplication |
+| `t.add(other)`   | Element-wise addition |
+| `t.scale(s)`     | Scalar multiplication |
 
 **Activations (chainable):**
 
-| Method | Description |
-|--------|-------------|
-| `t.relu()` | ReLU activation |
-| `t.softmax(dim)` | Softmax along dimension |
-| `t.dropout(rate, training)` | Dropout regularisation |
+| Method                      | Description             |
+|-----------------------------|-------------------------|
+| `t.relu()`                  | ReLU activation         |
+| `t.softmax(dim)`            | Softmax along dimension |
+| `t.dropout(rate, training)` | Dropout regularisation  |
 
 **Normalization:**
 
-| Method | Description |
-|--------|-------------|
+| Method                                            | Description         |
+|---------------------------------------------------|---------------------|
 | `t.batchNorm(weight, bias, mean, var, training)` | Batch normalization |
 
 **GNN Aggregation:**
 
-| Method | Description |
-|--------|-------------|
-| `t.aggregate(edgeIndex, edgeWeight, mode)` | Sparse message passing (`"sum"`, `"mean"`, `"sum_normalized"`) |
-| `t.attentionAggregate(edgeIndex, edgeWeight, attWeight)` | Attention-based aggregation (GAT) |
-| `t.meanPool(batchIndex)` | Mean pooling over graph batch |
+| Method                                                     | Description                                                    |
+|------------------------------------------------------------|----------------------------------------------------------------|
+| `t.aggregate(edgeIndex, edgeWeight, mode)`                 | Sparse message passing (`"sum"`, `"mean"`, `"sum_normalized"`) |
+| `t.attentionAggregate(edgeIndex, edgeWeight, attWeight)` | Attention-based aggregation (GAT)                              |
+| `t.meanPool(batchIndex)`                                   | Mean pooling over graph batch                                  |
 
 **Reduction:**
 
-| Method | Description |
-|--------|-------------|
-| `t.argmax(dim)` | Index of maximum value |
-| `t.crossEntropy(targets)` | Cross-entropy loss |
+| Method                     | Description            |
+|----------------------------|------------------------|
+| `t.argmax(dim)`            | Index of maximum value |
+| `t.crossEntropy(targets)` | Cross-entropy loss     |
 
 **Data access:**
 
-| Method | Description |
-|--------|-------------|
+| Method         | Description             |
+|----------------|-------------------------|
 | `t.toDoubles()` | Convert to double array |
-| `t.shape()` | Get shape as int array |
-| `t.dispose()` | Free tensor memory |
+| `t.shape()`    | Get shape as int array  |
+| `t.dispose()`  | Free tensor memory      |
 
 **Initialization:**
 
-| Method | Description |
-|--------|-------------|
+| Method             | Description                     |
+|--------------------|---------------------------------|
 | `t.initKaiming()` | Kaiming uniform initialization |
 
 **Persistence:**
 
-| Function | Description |
-|----------|-------------|
-| `sn_model_save(params, path)` | Save tensor array to binary file |
-| `sn_model_load(path)` | Load tensor array from binary file |
+| Function                      | Description                        |
+|-------------------------------|------------------------------------|
+| `sn_model_save(params, path)` | Save tensor array to binary file   |
+| `sn_model_load(path)`         | Load tensor array from binary file |
 
 ### Optimizer
 
@@ -162,14 +162,14 @@ var sgd: Optimizer = Optimizer.sgd(0.01)             # lr
 
 Configuration for GNN model architecture.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `inputDim` | int | Number of input features per node |
-| `hiddenDim` | int | Hidden layer dimension |
-| `numActions` | int | Number of output classes/actions |
-| `numLayers` | int | Number of message-passing layers |
-| `arch` | str | Architecture: `"gcn"`, `"sage"`, or `"gat"` |
-| `dropoutRate` | double | Dropout probability (0.0 to 1.0) |
+| Field         | Type   | Description                                  |
+|---------------|--------|----------------------------------------------|
+| `inputDim`    | int    | Number of input features per node            |
+| `hiddenDim`   | int    | Hidden layer dimension                       |
+| `numActions`  | int    | Number of output classes/actions              |
+| `numLayers`   | int    | Number of message-passing layers             |
+| `arch`        | str    | Architecture: `"gcn"`, `"sage"`, or `"gat"` |
+| `dropoutRate` | double | Dropout probability (0.0 to 1.0)             |
 
 ### GnnLayer
 
@@ -183,12 +183,12 @@ Single message-passing layer supporting three architectures:
 
 Full GNN model: message-passing layers + mean-pool readout + 2-layer classification head.
 
-| Method | Description |
-|--------|-------------|
-| `Gnn.create(config)` | Create a new model with random weights |
+| Method                           | Description                                             |
+|----------------------------------|---------------------------------------------------------|
+| `Gnn.create(config)`            | Create a new model with random weights                  |
 | `model.forward(graph, training)` | Run inference, returns `GnnOutput` (probs + embedding) |
-| `model.parameters()` | Collect all trainable tensors |
-| `model.save(path)` | Save model weights to disk |
+| `model.parameters()`            | Collect all trainable tensors                           |
+| `model.save(path)`              | Save model weights to disk                              |
 
 ## Backend
 

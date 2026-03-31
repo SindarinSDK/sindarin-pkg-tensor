@@ -1,0 +1,5 @@
+.sn/
+build/
+libs/
+bin/
+*.exe
