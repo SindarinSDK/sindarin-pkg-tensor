@@ -684,7 +684,11 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
         ggml_set_input(gadj);
         gadj->data = adj->data;
         g_record_map[adj_idx] = gadj;
-        return rec_wrap(ggml_mul_mat(g_record_ctx, rec_tensor(features), gadj), feat_dim, num_nodes);
+        /* result = adj × features: ggml_mul_mat(a,b) = b @ a^T
+         * Transpose features so ne[0] matches adj's ne[0] (num_nodes) */
+        struct ggml_tensor *gfeat_t = ggml_cont(g_record_ctx, ggml_transpose(g_record_ctx, rec_tensor(features)));
+        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, gfeat_t, gadj);
+        return rec_wrap(result, feat_dim, num_nodes);
     }
 
     int64_t num_edges = pei->ne[0] > pei->ne[1] ? pei->ne[1] : pei->ne[0];
