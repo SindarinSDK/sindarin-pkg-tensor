@@ -229,8 +229,10 @@ void sn_graph_begin(void) {
     struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, g_param_buf, false };
     g_param_ctx = ggml_init(p_params);
 
+    /* no_alloc=false for compute context too — ggml_opt_fit's newer versions
+     * may set buffer pointers during graph construction before allocation. */
     g_compute_buf = calloc(1, GRAPH_COMPUTE_CTX_SIZE);
-    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, g_compute_buf, true };
+    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, g_compute_buf, false };
     g_compute_ctx = ggml_init(c_params);
 
     g_record_ctx = g_compute_ctx;
