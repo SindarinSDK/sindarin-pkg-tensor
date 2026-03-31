@@ -85,10 +85,13 @@ static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->__sn___handle]; }
  * Parameters (model weights) have their pool data uploaded to ggml.
  * ====================================================================== */
 
-#define GRAPH_RECORD_CTX_SIZE (512 * 1024 * 1024)
+#define GRAPH_PARAM_CTX_SIZE   (64 * 1024 * 1024)   /* params + inputs */
+#define GRAPH_COMPUTE_CTX_SIZE (256 * 1024 * 1024)  /* intermediate ops */
 
-static bool                 g_record_mode = false;
-static struct ggml_context *g_record_ctx  = NULL;
+static bool                 g_record_mode  = false;
+static struct ggml_context *g_param_ctx    = NULL;   /* static: params + inputs */
+static struct ggml_context *g_compute_ctx  = NULL;   /* no_alloc: intermediate ops */
+static struct ggml_context *g_record_ctx   = NULL;   /* points to g_compute_ctx for ops */
 static struct ggml_tensor  *g_record_map[SN_TENSOR_MAX];
 
 static struct ggml_tensor *rec_tensor(RtTensor *rt) {
@@ -188,22 +191,34 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
 
 void sn_graph_begin(void) {
     ensure_backend();
-    /* no_alloc = false: tensors need data buffers for ggml_opt static graphs */
-    struct ggml_init_params params = { GRAPH_RECORD_CTX_SIZE, NULL, false };
-    g_record_ctx = ggml_init(params);
+    /* Param context: no_alloc=false — params/inputs need host data buffers.
+     * These are allocated statically and persist across ggml_opt iterations. */
+    struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, false };
+    g_param_ctx = ggml_init(p_params);
+
+    /* Compute context: no_alloc=true — intermediate tensors are allocated
+     * by ggml_opt's backend scheduler each iteration. */
+    struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
+    g_compute_ctx = ggml_init(c_params);
+
+    /* Default record context is compute (for intermediate ops) */
+    g_record_ctx = g_compute_ctx;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = true;
 }
 
 void sn_graph_end(void) {
-    if (g_record_ctx) { ggml_free(g_record_ctx); g_record_ctx = NULL; }
+    if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
+    if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }
+    g_record_ctx = NULL;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = false;
 }
 
 RtTensor *sn_graph_input(long long rows, long long cols) {
     if (!g_record_mode) return sn_tensor_zeros(rows, cols);
-    struct ggml_tensor *gt = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, cols, rows);
+    /* Inputs go in the param context (statically allocated) */
+    struct ggml_tensor *gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, cols, rows);
     ggml_set_name(gt, "input");
     ggml_set_input(gt);
     return rec_wrap(gt, cols, rows);
@@ -213,11 +228,13 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     if (!g_record_mode || !rt) return rt;
     TPool *s = unwrap(rt);
     int idx = (int)rt->__sn___handle;
-    struct ggml_tensor *gt = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, s->ne[0], s->ne[1]);
+    /* Parameters go in the param context (statically allocated) */
+    struct ggml_tensor *gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, s->ne[0], s->ne[1]);
     ggml_set_name(gt, "param");
     ggml_set_input(gt);
     ggml_set_param(gt);
-    gt->data = s->data;
+    /* Copy pool data into the param context tensor */
+    memcpy(gt->data, s->data, (size_t)s->n_elem * sizeof(float));
     g_record_map[idx] = gt;
     return rt;
 }
@@ -263,16 +280,22 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    ggml_opt_fit(sched, g_record_ctx, inputs, outputs,
+    /* g_compute_ctx is no_alloc — ggml_opt manages its allocations.
+     * inputs/outputs are in g_param_ctx (statically allocated). */
+    ggml_opt_fit(sched, g_compute_ctx, inputs, outputs,
                  dataset, loss_type, opt_type,
                  ggml_opt_get_default_optimizer_params,
                  nepochs, nbatch, (float)val_split, false);
 
-    /* Read back trained parameters to pool */
+    /* Read back trained parameters to pool.
+     * Parameters are in g_param_ctx with statically allocated data. */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->data && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
-            memcpy(g_pool[i].data, gt->data, (size_t)g_pool[i].n_elem * sizeof(float));
+        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+            TPool *s = &g_pool[i];
+            if (gt->data) {
+                memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
+            }
         }
     }
 
@@ -637,10 +660,10 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
         }
         for (int64_t f = 0; f < feat_dim; f++) pmean->data[f] /= (float)num_nodes;
 
-        struct ggml_tensor *gmean = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, feat_dim, 1);
+        struct ggml_tensor *gmean = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, feat_dim, 1);
         ggml_set_name(gmean, "mean_pool");
         ggml_set_input(gmean);
-        gmean->data = pmean->data;
+        memcpy(gmean->data, pmean->data, (size_t)feat_dim * sizeof(float));
         g_record_map[mean_idx] = gmean;
         return rec_wrap(gmean, feat_dim, 1);
     }
@@ -728,10 +751,10 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
             }
             free(cnt);
         }
-        struct ggml_tensor *gadj = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
+        struct ggml_tensor *gadj = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
         ggml_set_name(gadj, "adj");
         ggml_set_input(gadj);
-        gadj->data = adj->data;
+        memcpy(gadj->data, adj->data, (size_t)(num_nodes * num_nodes) * sizeof(float));
         g_record_map[adj_idx] = gadj;
         /* result = adj × features: ggml_mul_mat(a,b) = b @ a^T
          * Transpose features so ne[0] matches adj's ne[0] (num_nodes) */
