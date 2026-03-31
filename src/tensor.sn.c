@@ -189,19 +189,19 @@ RtTensor *sn_tensor_zeros(long long rows, long long cols);
  * Graph recording API
  * ====================================================================== */
 
+static int g_pool_count_before_record = 0;  /* for restoring after record mode */
+
 void sn_graph_begin(void) {
     ensure_backend();
-    /* Param context: no_alloc=true — backend buffers allocated later via
-     * ggml_backend_alloc_ctx_tensors. Data uploaded with ggml_backend_tensor_set. */
+    /* Save pool count so we can reclaim recording slots on end */
+    g_pool_count_before_record = g_pool_count;
+
     struct ggml_init_params p_params = { GRAPH_PARAM_CTX_SIZE, NULL, true };
     g_param_ctx = ggml_init(p_params);
 
-    /* Compute context: no_alloc=true — intermediate tensors are allocated
-     * by ggml_opt's backend scheduler each iteration. */
     struct ggml_init_params c_params = { GRAPH_COMPUTE_CTX_SIZE, NULL, true };
     g_compute_ctx = ggml_init(c_params);
 
-    /* Default record context is compute (for intermediate ops) */
     g_record_ctx = g_compute_ctx;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = true;
@@ -213,6 +213,14 @@ void sn_graph_end(void) {
     g_record_ctx = NULL;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = false;
+
+    /* Reclaim pool slots allocated during recording.
+     * These hold stale shape metadata and no valid data.
+     * Freeing them prevents execute-mode ops from colliding with ghost slots. */
+    for (int i = g_pool_count_before_record; i < g_pool_count; i++) {
+        if (g_pool[i].data) { free(g_pool[i].data); g_pool[i].data = NULL; }
+    }
+    g_pool_count = g_pool_count_before_record;
 }
 
 RtTensor *sn_graph_input(long long rows, long long cols) {
@@ -414,10 +422,6 @@ RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
     if (g_record_mode) return rec_wrap(ggml_add(g_record_ctx, rec_tensor(a), rec_tensor(b)), pa->ne[0], pa->ne[1]);
-
-    fprintf(stderr, "TENSOR_ADD: a=[%lld,%lld] handle=%lld b=[%lld,%lld] handle=%lld\n",
-            pa->ne[0], pa->ne[1], a->__sn___handle,
-            pb->ne[0], pb->ne[1], b->__sn___handle);
 
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
