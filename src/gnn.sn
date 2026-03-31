@@ -182,3 +182,39 @@ struct Gnn =>
 
   fn save(path: str): void =>
     sn_model_save(self.parameters(), path)
+
+  fn train(data: double[], labels: double[], numSamples: int, batchSize: int, graph: GraphTensors, optimizer: Optimizer, epochs: int, valSplit: double): TrainResult =>
+    # Enter graph recording mode — all tensor ops record to ggml graph
+    sn_graph_begin()
+
+    # Register all model parameters as trainable
+    var params: Tensor[] = self.parameters()
+    for var i: int = 0; i < len(params); i++ =>
+      sn_graph_param(params[i])
+
+    # Create graph-mode input placeholder
+    var input: Tensor = sn_graph_input(batchSize, graph.featureDim)
+
+    # Build the forward computation graph using the same forward() method
+    var recordGraph: GraphTensors = {
+      nodeFeatures: input,
+      edgeIndex: graph.edgeIndex,
+      edgeWeight: graph.edgeWeight,
+      batchIndex: graph.batchIndex,
+      numNodes: graph.numNodes,
+      numEdges: graph.numEdges,
+      featureDim: graph.featureDim
+    }
+    var output: GnnOutput = self.forward(recordGraph, true)
+
+    # Run ggml_opt_fit on the captured graph
+    var loss: double = sn_graph_train(output.probs, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
+
+    # Exit graph mode — parameters updated in pool
+    sn_graph_end()
+
+    return TrainResult {
+      loss: loss,
+      accuracy: 0.0,
+      epochs: epochs
+    }

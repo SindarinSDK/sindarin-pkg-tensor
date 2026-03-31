@@ -130,6 +130,16 @@ native fn sn_model_save(params: Tensor[], path: str): void
 native fn sn_model_load(path: str): Tensor[]
 
 # ---------------------------------------------------------------------------
+# Graph recording mode (for training)
+# ---------------------------------------------------------------------------
+
+native fn sn_graph_begin(): void
+native fn sn_graph_end(): void
+native fn sn_graph_input(rows: int, cols: int): Tensor
+native fn sn_graph_param(t: Tensor): Tensor
+native fn sn_graph_train(output: Tensor, input: Tensor, data: double[], labels: double[], nsamples: int, epochs: int, batchSize: int, valSplit: double, lossType: str, optimizer: str, lr: double, wd: double): double
+
+# ---------------------------------------------------------------------------
 # Optimizer configuration
 # ---------------------------------------------------------------------------
 

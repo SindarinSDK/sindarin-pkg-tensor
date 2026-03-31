@@ -23,6 +23,7 @@
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
+#include <ggml-opt.h>
 
 /* ======================================================================
  * Tensor pool — maps integer handles to host-side float arrays
@@ -72,6 +73,33 @@ static RtTensor *wrap_pool(int idx)
 }
 
 static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->__sn___handle]; }
+
+/* ======================================================================
+ * Graph recording mode — for training with ggml_opt
+ *
+ * In record mode, tensor ops create ggml_tensor nodes in a persistent
+ * context instead of computing immediately. The resulting graph is then
+ * used by ggml_opt for forward + backward + optimizer steps.
+ *
+ * Each pool handle maps to a ggml_tensor* in the record context.
+ * Parameters (model weights) have their pool data uploaded to ggml.
+ * ====================================================================== */
+
+#define GRAPH_RECORD_CTX_SIZE (512 * 1024 * 1024)
+
+static bool                 g_record_mode = false;
+static struct ggml_context *g_record_ctx  = NULL;
+static struct ggml_tensor  *g_record_map[SN_TENSOR_MAX];
+
+static struct ggml_tensor *rec_tensor(RtTensor *rt) {
+    return g_record_map[rt->__sn___handle];
+}
+
+static RtTensor *rec_wrap(struct ggml_tensor *gt, int64_t ne0, int64_t ne1) {
+    int idx = pool_alloc(ne0, ne1, 2);
+    g_record_map[idx] = gt;
+    return wrap_pool(idx);
+}
 
 /* ======================================================================
  * ggml backend — initialized lazily on first use
@@ -152,6 +180,110 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
 }
 
 /* ======================================================================
+ * Graph recording API
+ * ====================================================================== */
+
+void sn_graph_begin(void) {
+    ensure_backend();
+    struct ggml_init_params params = { GRAPH_RECORD_CTX_SIZE, NULL, true };
+    g_record_ctx = ggml_init(params);
+    memset(g_record_map, 0, sizeof(g_record_map));
+    g_record_mode = true;
+}
+
+void sn_graph_end(void) {
+    if (g_record_ctx) { ggml_free(g_record_ctx); g_record_ctx = NULL; }
+    memset(g_record_map, 0, sizeof(g_record_map));
+    g_record_mode = false;
+}
+
+RtTensor *sn_graph_input(long long rows, long long cols) {
+    if (!g_record_mode) return sn_tensor_zeros(rows, cols);
+    struct ggml_tensor *gt = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, cols, rows);
+    ggml_set_name(gt, "input");
+    ggml_set_input(gt);
+    return rec_wrap(gt, cols, rows);
+}
+
+RtTensor *sn_graph_param(RtTensor *rt) {
+    if (!g_record_mode || !rt) return rt;
+    TPool *s = unwrap(rt);
+    int idx = (int)rt->__sn___handle;
+    struct ggml_tensor *gt = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, s->ne[0], s->ne[1]);
+    ggml_set_name(gt, "param");
+    ggml_set_input(gt);
+    ggml_set_param(g_record_ctx, gt);
+    gt->data = s->data;
+    g_record_map[idx] = gt;
+    return rt;
+}
+
+double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
+                      SnArray *data_arr, SnArray *label_arr,
+                      long long nsamples, long long nepochs,
+                      long long nbatch, double val_split,
+                      char *loss_type_str, char *optimizer_str,
+                      double lr, double wd)
+{
+    if (!g_record_mode || !g_record_ctx) return -1.0;
+    struct ggml_tensor *outputs = rec_tensor(output_rt);
+    struct ggml_tensor *inputs  = rec_tensor(input_rt);
+    if (!outputs || !inputs) return -1.0;
+    ggml_set_output(outputs);
+
+    int64_t ne_datapoint = inputs->ne[0] * inputs->ne[1];
+    int64_t ne_label     = outputs->ne[0];
+
+    ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
+        GGML_TYPE_F32, GGML_TYPE_F32, ne_datapoint, ne_label, nsamples, 1);
+
+    struct ggml_tensor *dd = ggml_opt_dataset_data(dataset);
+    struct ggml_tensor *dl = ggml_opt_dataset_labels(dataset);
+    long long dlen = sn_array_length(data_arr);
+    long long llen = sn_array_length(label_arr);
+    for (long long i = 0; i < dlen && i < ne_datapoint * nsamples; i++) {
+        double *v = (double *)sn_array_get(data_arr, i);
+        ((float *)dd->data)[i] = (float)(*v);
+    }
+    for (long long i = 0; i < llen && i < ne_label * nsamples; i++) {
+        double *v = (double *)sn_array_get(label_arr, i);
+        ((float *)dl->data)[i] = (float)(*v);
+    }
+
+    enum ggml_opt_loss_type loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
+    if (strcmp(loss_type_str, "mse") == 0) loss_type = GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR;
+
+    enum ggml_opt_optimizer_type opt_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+    if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+
+    struct ggml_opt_optimizer_params opt_params = ggml_opt_get_default_optimizer_params(NULL);
+    opt_params.adamw.alpha = (float)lr;
+    opt_params.adamw.wd    = (float)wd;
+    opt_params.sgd.alpha   = (float)lr;
+    opt_params.sgd.wd      = (float)wd;
+
+    ggml_backend_t backends[] = { g_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false);
+
+    ggml_opt_fit(sched, g_record_ctx, inputs, outputs,
+                 dataset, loss_type, opt_type,
+                 ggml_opt_get_constant_optimizer_params, &opt_params,
+                 nepochs, nbatch, (float)val_split, false);
+
+    /* Read back trained parameters to pool */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && gt->data && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+            memcpy(g_pool[i].data, gt->data, (size_t)g_pool[i].n_elem * sizeof(float));
+        }
+    }
+
+    ggml_backend_sched_free(sched);
+    ggml_opt_dataset_free(dataset);
+    return 0.0;
+}
+
+/* ======================================================================
  * Creation
  * ====================================================================== */
 
@@ -203,6 +335,11 @@ RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
+    if (g_record_mode) {
+        int64_t N = pb->ne[0], M = pa->ne[1];
+        struct ggml_tensor *bt = ggml_cont(g_record_ctx, ggml_transpose(g_record_ctx, rec_tensor(b)));
+        return rec_wrap(ggml_mul_mat(g_record_ctx, bt, rec_tensor(a)), N, M);
+    }
 
     /* A is [M, K] (ne0=K, ne1=M), B is [K, N] (ne0=N, ne1=K)
      * ggml_mul_mat(x, y) computes y * x^T, needs ne0_x == ne0_y.
@@ -244,6 +381,7 @@ RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
+    if (g_record_mode) return rec_wrap(ggml_add(g_record_ctx, rec_tensor(a), rec_tensor(b)), pa->ne[0], pa->ne[1]);
 
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
@@ -273,6 +411,7 @@ RtTensor *sn_tensor_add(RtTensor *a, RtTensor *b)
 RtTensor *sn_tensor_scale(RtTensor *t, double scalar)
 {
     TPool *pt = unwrap(t);
+    if (g_record_mode) return rec_wrap(ggml_scale(g_record_ctx, rec_tensor(t), (float)scalar), pt->ne[0], pt->ne[1]);
 
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
@@ -303,6 +442,7 @@ RtTensor *sn_tensor_scale(RtTensor *t, double scalar)
 RtTensor *sn_tensor_relu(RtTensor *t)
 {
     TPool *pt = unwrap(t);
+    if (g_record_mode) return rec_wrap(ggml_relu(g_record_ctx, rec_tensor(t)), pt->ne[0], pt->ne[1]);
 
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
@@ -329,7 +469,8 @@ RtTensor *sn_tensor_relu(RtTensor *t)
 RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
 {
     TPool *pt = unwrap(t);
-    (void)dim; /* ggml_soft_max operates along ne[0] (columns) */
+    (void)dim;
+    if (g_record_mode) return rec_wrap(ggml_soft_max(g_record_ctx, rec_tensor(t)), pt->ne[0], pt->ne[1]);
 
     struct ggml_init_params params = { GRAPH_CTX_SIZE, NULL, true };
     struct ggml_context *ctx = ggml_init(params);
@@ -357,6 +498,7 @@ RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
 RtTensor *sn_tensor_dropout(RtTensor *t, double rate, int training)
 {
     TPool *pt = unwrap(t);
+    if (g_record_mode) return t; /* identity in graph mode */
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     TPool *out = &g_pool[idx];
 
@@ -381,6 +523,7 @@ RtTensor *sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
                                RtTensor *running_mean, RtTensor *running_var,
                                int training)
 {
+    if (g_record_mode) return t; /* identity in graph mode — affine captured by matmul+add */
     TPool *pt   = unwrap(t);
     TPool *pw   = unwrap(weight);
     TPool *pb   = unwrap(bias);
@@ -451,6 +594,11 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
     int64_t num_nodes = px->ne[1];
     int64_t feat_dim  = px->ne[0];
 
+    if (g_record_mode) {
+        struct ggml_tensor *result = ggml_mean(g_record_ctx, rec_tensor(node_embeddings));
+        return rec_wrap(result, feat_dim, 1);
+    }
+
     /* Find number of graphs (max batch index + 1) */
     int64_t num_graphs = 1;
     for (int64_t i = 0; i < pb->n_elem; i++) {
@@ -508,6 +656,40 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
 
     int64_t num_nodes = px->ne[1];
     int64_t feat_dim  = px->ne[0];
+
+    /* In record mode, build dense adjacency matrix for differentiable aggregation */
+    if (g_record_mode) {
+        int64_t ne = (pei->ne[1] == 2) ? pei->ne[0] : pei->ne[1];
+        int adj_idx = pool_alloc(num_nodes, num_nodes, 2);
+        TPool *adj = &g_pool[adj_idx];
+        memset(adj->data, 0, (size_t)(num_nodes * num_nodes) * sizeof(float));
+        float *cnt = NULL;
+        if (strcmp(mode, "mean") == 0 || strcmp(mode, "sum_normalized") == 0)
+            cnt = (float *)calloc((size_t)num_nodes, sizeof(float));
+        for (int64_t i = 0; i < ne; i++) {
+            int64_t s, d;
+            if (pei->ne[1] == 2) { s = (int64_t)pei->data[i]; d = (int64_t)pei->data[ne + i]; }
+            else { s = (int64_t)pei->data[i*2]; d = (int64_t)pei->data[i*2+1]; }
+            if (s < num_nodes && d < num_nodes) {
+                adj->data[d * num_nodes + s] += pew->data[i];
+                if (cnt) cnt[d] += 1.0f;
+            }
+        }
+        if (cnt) {
+            for (int64_t n = 0; n < num_nodes; n++) {
+                float c = cnt[n] > 0 ? cnt[n] : 1.0f;
+                for (int64_t s = 0; s < num_nodes; s++) adj->data[n*num_nodes+s] /= c;
+            }
+            free(cnt);
+        }
+        struct ggml_tensor *gadj = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
+        ggml_set_name(gadj, "adj");
+        ggml_set_input(gadj);
+        gadj->data = adj->data;
+        g_record_map[adj_idx] = gadj;
+        return rec_wrap(ggml_mul_mat(g_record_ctx, rec_tensor(features), gadj), feat_dim, num_nodes);
+    }
+
     int64_t num_edges = pei->ne[0] > pei->ne[1] ? pei->ne[1] : pei->ne[0];
 
     /* edge_index: [2, num_edges] — created via fromDoubles(data, rows=2, cols=num_edges)
@@ -575,6 +757,8 @@ RtTensor *sn_tensor_attention_aggregate(RtTensor *features, RtTensor *edge_index
     int64_t num_nodes = px->ne[1];
     int64_t feat_dim  = px->ne[0];
     int64_t num_edges = pei->ne[0];
+
+    if (g_record_mode) return sn_tensor_sparse_aggregate(features, edge_index, edge_weight, "sum");
     int64_t att_dim   = paw->n_elem;
 
     int idx = pool_alloc(feat_dim, num_nodes, 2);
