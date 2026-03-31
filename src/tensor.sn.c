@@ -85,8 +85,8 @@ static TPool *unwrap(RtTensor *rt) { return &g_pool[rt->__sn___handle]; }
  * Parameters (model weights) have their pool data uploaded to ggml.
  * ====================================================================== */
 
-#define GRAPH_PARAM_CTX_SIZE   (64 * 1024 * 1024)   /* params + inputs (64MB) */
-#define GRAPH_COMPUTE_CTX_SIZE (256 * 1024 * 1024)  /* intermediate ops (256MB) */
+#define GRAPH_PARAM_CTX_SIZE   (32 * 1024 * 1024)   /* params + inputs (32MB) */
+#define GRAPH_COMPUTE_CTX_SIZE (128 * 1024 * 1024)  /* intermediate ops (128MB) */
 
 static bool                 g_record_mode  = false;
 static struct ggml_context *g_param_ctx    = NULL;   /* static: params + inputs */
@@ -296,27 +296,6 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_t backends[] = { g_backend };
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, SN_TENSOR_MAX, false, false);
 
-    /* Debug: check BOTH contexts for stale buffers */
-    {
-        struct ggml_tensor *t;
-        int ti;
-
-        t = ggml_get_first_tensor(g_param_ctx);
-        ti = 0;
-        while (t) {
-            if (t->buffer) fprintf(stderr, "STALE: param[%d] '%s' buf=%p\n", ti, t->name?t->name:"?", (void*)t->buffer);
-            ti++; t = ggml_get_next_tensor(g_param_ctx, t);
-        }
-        fprintf(stderr, "PARAM_CTX: %d tensors\n", ti);
-
-        t = ggml_get_first_tensor(g_compute_ctx);
-        ti = 0;
-        while (t) {
-            if (t->buffer) fprintf(stderr, "STALE: compute[%d] '%s' buf=%p\n", ti, t->name?t->name:"?", (void*)t->buffer);
-            ti++; t = ggml_get_next_tensor(g_compute_ctx, t);
-        }
-        fprintf(stderr, "COMPUTE_CTX: %d tensors\n", ti);
-    }
     /* Allocate backend buffers for param context tensors */
     ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
 
