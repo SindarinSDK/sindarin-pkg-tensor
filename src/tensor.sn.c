@@ -203,6 +203,7 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
                 i, t->name, t->data, (void*)t->buffer, (void*)t->view_src,
                 (long long)t->ne[0], (long long)t->ne[1], (int)t->op);
     }
+    fflush(stderr);
 
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
     ggml_gallocr_t alloc = ggml_gallocr_new(buft);
