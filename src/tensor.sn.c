@@ -337,8 +337,27 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
         }
     }
 
+    /* Snapshot first param before training for change detection */
+    float pre_train_val = 0.0f;
+    int diag_param_idx = -1;
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM) && g_pool[i].n_elem > 0) {
+            pre_train_val = g_pool[i].data[0];
+            diag_param_idx = i;
+            break;
+        }
+    }
+
     /* g_compute_ctx is no_alloc — ggml_opt manages its allocations.
      * inputs/outputs are in g_param_ctx (backend-allocated). */
+    fprintf(stderr, "[DIAG-TRAIN] lr=%.6f wd=%.6f nsamples=%lld nepochs=%lld nbatch=%lld ne_dp=%lld ne_label=%lld\n",
+            lr, wd, nsamples, nepochs, nbatch, ne_datapoint, ne_label);
+    fprintf(stderr, "[DIAG-TRAIN] inputs ne=[%lld,%lld] outputs ne=[%lld,%lld]\n",
+            (long long)inputs->ne[0], (long long)inputs->ne[1],
+            (long long)outputs->ne[0], (long long)outputs->ne[1]);
+    fflush(stderr);
+
     ggml_opt_fit(sched, g_compute_ctx, inputs, outputs,
                  dataset, loss_type, opt_type,
                  sn_get_opt_params,
@@ -357,6 +376,15 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                 memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
             }
         }
+    }
+
+    /* Check if params changed */
+    if (diag_param_idx >= 0) {
+        float post_train_val = g_pool[diag_param_idx].data[0];
+        fprintf(stderr, "[DIAG-TRAIN] param[%d] before=%.8f after=%.8f changed=%s\n",
+                diag_param_idx, pre_train_val, post_train_val,
+                (pre_train_val != post_train_val) ? "YES" : "NO");
+        fflush(stderr);
     }
 
     ggml_backend_sched_free(sched);
