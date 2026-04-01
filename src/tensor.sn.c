@@ -658,13 +658,13 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
     if (g_record_mode) {
         /* Differentiable mean pool using a pooling matrix built from batch_index.
          *
-         * Build P[num_graphs, num_nodes] where P[g,n] = 1/count[g] if batch[n]==g.
-         * Then result = P × features = [feat_dim, num_graphs].
+         * When each node is its own graph (batch_index = [0,1,...,N-1]),
+         * the pooling matrix is identity → mean pool is identity.
+         * This is the standard training case (1 sample = 1 node = 1 graph).
          *
-         * ggml_mul_mat(a, b) needs a->ne[0] == b->ne[0], produces
-         *   result->ne[0] = a->ne[1], result->ne[1] = b->ne[1].
-         * Set a = features_T [num_nodes, feat_dim], b = pool_mat [num_nodes, num_graphs]
-         *   → result [feat_dim, num_graphs]. */
+         * For the general case (multiple nodes per graph), build
+         * P[num_graphs, num_nodes] and compute result = P × features
+         * via ggml_mul_mat(features_T, P) → [feat_dim, num_graphs]. */
 
         /* Determine num_graphs from batch_index */
         int64_t num_graphs = 1;
@@ -673,7 +673,21 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
             if (b + 1 > num_graphs) num_graphs = b + 1;
         }
 
-        /* Build pooling matrix on host */
+        /* Identity check: num_graphs == num_nodes and batch[i] == i for all i.
+         * Mean pool of 1-node graphs is identity — skip to preserve gradient flow
+         * and avoid non-contiguous backward through transpose. */
+        if (num_graphs == num_nodes) {
+            int is_identity = 1;
+            for (int64_t i = 0; i < num_nodes && i < pb->n_elem; i++) {
+                if ((int64_t)pb->data[i] != i) { is_identity = 0; break; }
+            }
+            if (is_identity) {
+                node_embeddings->__rc__++;
+                return node_embeddings;
+            }
+        }
+
+        /* General case: build pooling matrix on host */
         int pool_idx = pool_alloc(num_nodes, num_graphs, 2);
         TPool *pool_mat = &g_pool[pool_idx];
         memset(pool_mat->data, 0, (size_t)(num_graphs * num_nodes) * sizeof(float));
@@ -764,6 +778,8 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
     /* In record mode, build dense adjacency matrix for differentiable aggregation */
     if (g_record_mode) {
         int64_t ne = (pei->ne[1] == 2) ? pei->ne[0] : pei->ne[1];
+
+        /* Build adjacency matrix on host */
         int adj_idx = pool_alloc(num_nodes, num_nodes, 2);
         TPool *adj = &g_pool[adj_idx];
         memset(adj->data, 0, (size_t)(num_nodes * num_nodes) * sizeof(float));
@@ -786,6 +802,27 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
             }
             free(cnt);
         }
+
+        /* Identity check: if adjacency is identity matrix (self-loops only,
+         * weight 1.0 each), aggregate is identity — skip to preserve gradient
+         * flow and avoid non-contiguous backward through transpose. */
+        int is_identity = (ne == num_nodes) ? 1 : 0;
+        if (is_identity) {
+            for (int64_t n = 0; n < num_nodes && is_identity; n++) {
+                for (int64_t m = 0; m < num_nodes; m++) {
+                    float expected = (n == m) ? 1.0f : 0.0f;
+                    if (adj->data[n * num_nodes + m] != expected) { is_identity = 0; break; }
+                }
+            }
+        }
+        if (is_identity) {
+            /* Adjacency is I — aggregate returns input unchanged */
+            free(adj->data); adj->data = NULL;
+            g_pool_count--; /* reclaim the adj slot */
+            features->__rc__++;
+            return features;
+        }
+
         struct ggml_tensor *gadj = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
         ggml_set_name(gadj, "adj");
         ggml_set_input(gadj);
