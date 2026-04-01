@@ -264,6 +264,14 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     return rt;
 }
 
+/* Custom optimizer params callback — returns user-configured lr/wd */
+static struct ggml_opt_optimizer_params g_opt_params;
+
+static struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata) {
+    (void)userdata;
+    return g_opt_params;
+}
+
 double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                       SnArray *data_arr, SnArray *label_arr,
                       long long nsamples, long long nepochs,
@@ -302,6 +310,13 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     enum ggml_opt_optimizer_type opt_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
 
+    /* Configure optimizer params from user-provided lr/wd */
+    g_opt_params = ggml_opt_get_default_optimizer_params(NULL);
+    g_opt_params.adamw.alpha = (float)lr;
+    g_opt_params.adamw.wd    = (float)wd;
+    g_opt_params.sgd.alpha   = (float)lr;
+    g_opt_params.sgd.wd      = (float)wd;
+
     ggml_backend_t backends[] = { g_backend };
     /* Use a reasonable graph size upper bound instead of SN_TENSOR_MAX.
      * SN_TENSOR_MAX (65536) caused scheduler pre-allocation to exhaust ggml
@@ -326,7 +341,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
      * inputs/outputs are in g_param_ctx (backend-allocated). */
     ggml_opt_fit(sched, g_compute_ctx, inputs, outputs,
                  dataset, loss_type, opt_type,
-                 ggml_opt_get_default_optimizer_params,
+                 sn_get_opt_params,
                  nepochs, nbatch, (float)val_split, false);
 
     /* Read back trained parameters to pool.
