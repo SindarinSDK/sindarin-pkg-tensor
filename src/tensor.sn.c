@@ -189,6 +189,21 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
     (void)ctx;
     ensure_backend();
 
+    /* DIAGNOSTIC: dump all tensors in graph before allocation */
+    fprintf(stderr, "[DIAG-RG] run_graph: nodes=%d leafs=%d\n", graph->n_nodes, graph->n_leafs);
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor *t = graph->leafs[i];
+        fprintf(stderr, "[DIAG-RG] leaf[%d] name=%-20s data=%p buffer=%p view_src=%p ne=[%lld,%lld]\n",
+                i, t->name, t->data, (void*)t->buffer, (void*)t->view_src,
+                (long long)t->ne[0], (long long)t->ne[1]);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor *t = graph->nodes[i];
+        fprintf(stderr, "[DIAG-RG] node[%d] name=%-20s data=%p buffer=%p view_src=%p ne=[%lld,%lld] op=%d\n",
+                i, t->name, t->data, (void*)t->buffer, (void*)t->view_src,
+                (long long)t->ne[0], (long long)t->ne[1], (int)t->op);
+    }
+
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
     ggml_gallocr_t alloc = ggml_gallocr_new(buft);
     ggml_gallocr_alloc_graph(alloc, graph);
