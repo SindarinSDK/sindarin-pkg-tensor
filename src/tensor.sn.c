@@ -308,8 +308,31 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
      * backend memory after prior tensor operations fragmented the heap. */
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, 4096, false, false);
 
+    /* --- DIAGNOSTIC: dump param-ctx tensor states before allocation --- */
+    fprintf(stderr, "[DIAG] sn_graph_train: g_param_ctx=%p, g_compute_ctx=%p, g_backend=%p\n",
+            (void*)g_param_ctx, (void*)g_compute_ctx, (void*)g_backend);
+    {
+        int tcount = 0;
+        for (struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx); t; t = ggml_get_next_tensor(g_param_ctx, t)) {
+            fprintf(stderr, "[DIAG] param_ctx tensor[%d] name=%-20s data=%p buffer=%p ne=[%lld,%lld] flags=0x%x\n",
+                    tcount, t->name, t->data, (void*)t->buffer,
+                    (long long)t->ne[0], (long long)t->ne[1], t->flags);
+            tcount++;
+        }
+        fprintf(stderr, "[DIAG] param_ctx total tensors: %d\n", tcount);
+    }
+    {
+        int tcount = 0;
+        for (struct ggml_tensor *t = ggml_get_first_tensor(g_compute_ctx); t; t = ggml_get_next_tensor(g_compute_ctx, t)) {
+            tcount++;
+        }
+        fprintf(stderr, "[DIAG] compute_ctx total tensors: %d\n", tcount);
+    }
+
     /* Allocate backend buffers for all tensors in param context */
+    fprintf(stderr, "[DIAG] calling ggml_backend_alloc_ctx_tensors(g_param_ctx)...\n");
     ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+    fprintf(stderr, "[DIAG] ggml_backend_alloc_ctx_tensors returned OK\n");
 
     /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
     for (int i = 0; i < g_pool_count; i++) {
@@ -321,6 +344,18 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                                     : (size_t)g_pool[i].n_elem * sizeof(float));
         }
     }
+    fprintf(stderr, "[DIAG] data upload complete, pool_count=%d\n", g_pool_count);
+
+    /* --- DIAGNOSTIC: dump param-ctx tensor states after allocation --- */
+    {
+        for (struct ggml_tensor *t = ggml_get_first_tensor(g_param_ctx); t; t = ggml_get_next_tensor(g_param_ctx, t)) {
+            fprintf(stderr, "[DIAG] post-alloc param tensor name=%-20s data=%p buffer=%p\n",
+                    t->name, t->data, (void*)t->buffer);
+        }
+    }
+
+    fprintf(stderr, "[DIAG] calling ggml_opt_fit (nsamples=%lld, nepochs=%lld, nbatch=%lld)...\n",
+            (long long)nsamples, (long long)nepochs, (long long)nbatch);
 
     /* g_compute_ctx is no_alloc — ggml_opt manages its allocations.
      * inputs/outputs are in g_param_ctx (backend-allocated). */
@@ -328,6 +363,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
                  dataset, loss_type, opt_type,
                  ggml_opt_get_default_optimizer_params,
                  nepochs, nbatch, (float)val_split, false);
+    fprintf(stderr, "[DIAG] ggml_opt_fit returned OK\n");
 
     /* Read back trained parameters to pool.
      * After ggml_opt_fit, parameter data is in backend buffers.
