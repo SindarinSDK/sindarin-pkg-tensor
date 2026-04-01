@@ -277,7 +277,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     if (!outputs || !inputs) return -1.0;
     ggml_set_output(outputs);
 
-    int64_t ne_datapoint = inputs->ne[0] * inputs->ne[1];
+    int64_t ne_datapoint = inputs->ne[0];
     int64_t ne_label     = outputs->ne[0];
 
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
