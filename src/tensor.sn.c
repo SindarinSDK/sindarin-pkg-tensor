@@ -656,56 +656,51 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
     int64_t feat_dim  = px->ne[0];
 
     if (g_record_mode) {
-        /* Mean pool: average node embeddings → [feat_dim, 1]
-         * Use a 1/N weight vector and matmul: result = features @ (ones/N)
-         * features: [feat_dim, num_nodes], ones: [num_nodes, 1] → result: [feat_dim, 1] */
-        int avg_idx = pool_alloc(1, num_nodes, 2);
-        TPool *avg = &g_pool[avg_idx];
-        float inv_n = 1.0f / (float)num_nodes;
-        for (int64_t i = 0; i < num_nodes; i++) avg->data[i] = inv_n;
-
-        struct ggml_tensor *gavg = ggml_new_tensor_2d(g_record_ctx, GGML_TYPE_F32, 1, num_nodes);
-        ggml_set_name(gavg, "avg_weight");
-        ggml_set_input(gavg);
-        gavg->data = avg->data;
-        g_record_map[avg_idx] = gavg;
-
-        /* ggml_mul_mat(a, b) = b @ a^T. We want features @ avg = [feat_dim, num_nodes] @ [num_nodes, 1]
-         * Set a = avg^T = [1, num_nodes], b = features = [feat_dim, num_nodes]
-         * Then a->ne[0]=1 != b->ne[0]=feat_dim — doesn't work.
-         * Instead: transpose features: [num_nodes, feat_dim]
-         * Then ggml_mul_mat(features_T, avg) = avg @ features_T^T = avg @ features
-         * = [1, num_nodes] @ [feat_dim, num_nodes]^T ... still wrong.
+        /* Differentiable mean pool using a pooling matrix built from batch_index.
          *
-         * Actually: ggml_mul_mat(a, b) needs a->ne[0] == b->ne[0].
-         * a = [num_nodes, feat_dim] (features transposed), ne[0]=num_nodes
-         * b = [num_nodes, 1] (avg), ne[0]=num_nodes ✓
-         * result = b @ a^T = [1, num_nodes] @ [feat_dim, num_nodes] = won't work (inner dims mismatch)
+         * Build P[num_graphs, num_nodes] where P[g,n] = 1/count[g] if batch[n]==g.
+         * Then result = P × features = [feat_dim, num_graphs].
          *
-         * Let me use ggml_repeat + ggml_mul + ggml_sum approach instead.
-         * Or just do the mean manually: sum each column, divide by N. */
+         * ggml_mul_mat(a, b) needs a->ne[0] == b->ne[0], produces
+         *   result->ne[0] = a->ne[1], result->ne[1] = b->ne[1].
+         * Set a = features_T [num_nodes, feat_dim], b = pool_mat [num_nodes, num_graphs]
+         *   → result [feat_dim, num_graphs]. */
 
-        /* Simple approach: ggml_scale(ggml_sum(features along rows), 1/N)
-         * But ggml doesn't have row-wise sum that preserves column structure.
-         *
-         * Fallback: compute mean on host, store as constant tensor. */
-        TPool *pfeat = unwrap(node_embeddings);
-        int mean_idx = pool_alloc(feat_dim, 1, 2);
-        TPool *pmean = &g_pool[mean_idx];
-        memset(pmean->data, 0, (size_t)feat_dim * sizeof(float));
-        for (int64_t n = 0; n < num_nodes; n++) {
-            for (int64_t f = 0; f < feat_dim; f++) {
-                pmean->data[f] += pfeat->data[n * feat_dim + f];
-            }
+        /* Determine num_graphs from batch_index */
+        int64_t num_graphs = 1;
+        for (int64_t i = 0; i < pb->n_elem; i++) {
+            int64_t b = (int64_t)pb->data[i];
+            if (b + 1 > num_graphs) num_graphs = b + 1;
         }
-        for (int64_t f = 0; f < feat_dim; f++) pmean->data[f] /= (float)num_nodes;
 
-        struct ggml_tensor *gmean = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, feat_dim, 1);
-        ggml_set_name(gmean, "mean_pool");
-        ggml_set_input(gmean);
-        /* Data uploaded after ggml_backend_alloc_ctx_tensors */
-        g_record_map[mean_idx] = gmean;
-        return rec_wrap(gmean, feat_dim, 1);
+        /* Build pooling matrix on host */
+        int pool_idx = pool_alloc(num_nodes, num_graphs, 2);
+        TPool *pool_mat = &g_pool[pool_idx];
+        memset(pool_mat->data, 0, (size_t)(num_graphs * num_nodes) * sizeof(float));
+
+        float *count = (float *)calloc((size_t)num_graphs, sizeof(float));
+        for (int64_t n = 0; n < num_nodes && n < pb->n_elem; n++)
+            count[(int64_t)pb->data[n]] += 1.0f;
+        for (int64_t n = 0; n < num_nodes && n < pb->n_elem; n++) {
+            int64_t g = (int64_t)pb->data[n];
+            float c = count[g] > 0.0f ? count[g] : 1.0f;
+            pool_mat->data[g * num_nodes + n] = 1.0f / c;
+        }
+        free(count);
+
+        /* Create ggml tensor for pooling matrix in param context */
+        struct ggml_tensor *gpool = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_graphs);
+        ggml_set_name(gpool, "pool_mat");
+        ggml_set_input(gpool);
+        g_record_map[pool_idx] = gpool;
+
+        /* Transpose features: [feat_dim, num_nodes] → [num_nodes, feat_dim] */
+        struct ggml_tensor *feat_t = ggml_cont(g_record_ctx,
+            ggml_transpose(g_record_ctx, rec_tensor(node_embeddings)));
+
+        /* result = ggml_mul_mat(feat_t, gpool) → [feat_dim, num_graphs] */
+        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, feat_t, gpool);
+        return rec_wrap(result, feat_dim, num_graphs);
     }
 
     /* Find number of graphs (max batch index + 1) */
