@@ -183,6 +183,40 @@ struct Gnn =>
   fn save(path: str): void =>
     sn_model_save(self.parameters(), path)
 
+  fn load(path: str): void =>
+    var loaded: Tensor[] = sn_model_load(path)
+    # Assign loaded tensors directly into model structure.
+    # Parameter order matches parameters(): layer weights in order, then classifier.
+    var idx: int = 0
+    for var i: int = 0; i < len(self.layers); i++ =>
+      if idx < len(loaded) =>
+        self.layers[i].weight = loaded[idx]
+        idx = idx + 1
+      if idx < len(loaded) =>
+        self.layers[i].bias = loaded[idx]
+        idx = idx + 1
+      if idx < len(loaded) =>
+        self.layers[i].bnWeight = loaded[idx]
+        idx = idx + 1
+      if idx < len(loaded) =>
+        self.layers[i].bnBias = loaded[idx]
+        idx = idx + 1
+      if self.layers[i].arch == "gat" =>
+        if idx < len(loaded) =>
+          self.layers[i].attWeight = loaded[idx]
+          idx = idx + 1
+    if idx < len(loaded) =>
+      self.classifierW1 = loaded[idx]
+      idx = idx + 1
+    if idx < len(loaded) =>
+      self.classifierB1 = loaded[idx]
+      idx = idx + 1
+    if idx < len(loaded) =>
+      self.classifierW2 = loaded[idx]
+      idx = idx + 1
+    if idx < len(loaded) =>
+      self.classifierB2 = loaded[idx]
+
   fn train(data: double[], labels: double[], numSamples: int, batchSize: int, graph: GraphTensors, optimizer: Optimizer, epochs: int, valSplit: double): TrainResult =>
     # Enter graph recording mode — all tensor ops record to ggml graph
     sn_graph_begin()
