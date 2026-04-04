@@ -44,6 +44,7 @@ struct GnnConfig =>
 
 struct GnnOutput =>
   probs: Tensor
+  logits: Tensor
   embedding: Tensor
 
 # ---------------------------------------------------------------------------
@@ -160,11 +161,12 @@ struct Gnn =>
     # Classification head
     var c: Tensor = embedding.matmul(self.classifierW1).add(self.classifierB1).relu()
     c = c.dropout(self.config.dropoutRate, training)
-    c = c.matmul(self.classifierW2).add(self.classifierB2)
-    var probs: Tensor = c.softmax(1)
+    var logits: Tensor = c.matmul(self.classifierW2).add(self.classifierB2)
+    var probs: Tensor = logits.softmax(1)
 
     return GnnOutput {
       probs: probs,
+      logits: logits,
       embedding: embedding
     }
 
@@ -241,8 +243,9 @@ struct Gnn =>
     }
     var output: GnnOutput = self.forward(recordGraph, true)
 
-    # Run ggml_opt_fit on the captured graph
-    var loss: double = sn_graph_train(output.probs, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
+    # Run ggml_opt_fit on the captured graph — pass logits (pre-softmax),
+    # NOT probs, because ggml cross_entropy_loss applies softmax internally
+    var loss: double = sn_graph_train(output.logits, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
 
     # Exit graph mode — parameters updated in pool
     sn_graph_end()
