@@ -205,6 +205,7 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
 
 /* Forward declarations */
 RtTensor *sn_tensor_zeros(long long rows, long long cols);
+static void train_register_param(int pool_idx);
 
 /* ======================================================================
  * Graph recording API
@@ -261,6 +262,8 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     ggml_set_param(gt);
     /* Data uploaded after ggml_backend_alloc_ctx_tensors in sn_graph_train */
     g_record_map[idx] = gt;
+    /* Register for persistent AdamW state if training mode active */
+    train_register_param(idx);
     return rt;
 }
 
@@ -1104,6 +1107,344 @@ SnArray *sn_model_load(char *path)
 
     fclose(f);
     return arr;
+}
+
+/* ======================================================================
+ * Graph-aware training — manual forward+backward+AdamW per batch
+ *
+ * ggml_opt_fit cannot train variable-topology graphs because it requires
+ * a 1:1 mapping between data rows and label rows.  With graph batching
+ * the input has totalNodes rows but only numGraphs labels.
+ *
+ * Instead we use the lower-level ggml primitives:
+ *   1. Record the forward pass (aggregate + meanPool + classifier → logits)
+ *   2. Append per-sample weighted cross-entropy loss nodes
+ *   3. ggml_set_loss + ggml_build_backward_expand → gradient computation
+ *   4. ggml_opt_step_adamw per parameter → parameter updates (as graph nodes)
+ *   5. Compute the full graph in one pass
+ *   6. Read updated params + m/v back to the pool
+ *
+ * Persistent AdamW state (first/second moments) lives in host arrays
+ * that survive sn_graph_begin / sn_graph_end cycles.
+ * ====================================================================== */
+
+#define TRAIN_MAX_PARAMS 256
+
+typedef struct {
+    float   *m;          /* first moment  */
+    float   *v;          /* second moment */
+    int64_t  n_elem;
+    int      pool_idx;   /* which pool slot this param is */
+} TrainParam;
+
+static TrainParam g_tp[TRAIN_MAX_PARAMS];
+static int        g_tp_count = 0;
+static int        g_tp_step  = 0;
+static float      g_tp_lr    = 0.001f;
+static float      g_tp_wd    = 0.0001f;
+static float      g_tp_beta1 = 0.9f;
+static float      g_tp_beta2 = 0.999f;
+static float      g_tp_eps   = 1e-8f;
+static int        g_tp_active = 0;
+
+void sn_train_init(double lr, double wd)
+{
+    /* Clean up any prior session */
+    for (int i = 0; i < g_tp_count; i++) {
+        if (g_tp[i].m) { free(g_tp[i].m); g_tp[i].m = NULL; }
+        if (g_tp[i].v) { free(g_tp[i].v); g_tp[i].v = NULL; }
+    }
+    g_tp_count = 0;
+    g_tp_step  = 0;
+    g_tp_lr    = (float)lr;
+    g_tp_wd    = (float)wd;
+    g_tp_active = 1;
+}
+
+/* Register a pool slot as a trainable parameter (called from sn_graph_param
+ * when training mode is active).  Allocates m/v on first encounter. */
+static void train_register_param(int pool_idx)
+{
+    if (!g_tp_active) return;
+
+    /* Already registered? */
+    for (int i = 0; i < g_tp_count; i++) {
+        if (g_tp[i].pool_idx == pool_idx) return;
+    }
+    if (g_tp_count >= TRAIN_MAX_PARAMS) {
+        fprintf(stderr, "train: too many parameters (max %d)\n", TRAIN_MAX_PARAMS);
+        return;
+    }
+    int64_t n = g_pool[pool_idx].n_elem;
+    int idx = g_tp_count++;
+    g_tp[idx].pool_idx = pool_idx;
+    g_tp[idx].n_elem   = n;
+    g_tp[idx].m        = (float *)calloc((size_t)n, sizeof(float));
+    g_tp[idx].v        = (float *)calloc((size_t)n, sizeof(float));
+}
+
+/* Run one training step on the already-recorded forward graph.
+ *
+ * The Sindarin layer has already called:
+ *   sn_graph_begin()
+ *   sn_graph_param(w) for each weight
+ *   input = sn_graph_input(totalNodes, featureDim)
+ *   output = model.forward(graphTensors, true)   -- recorded with real topology
+ *
+ * This function:
+ *   - Adds loss computation (per-sample weighted cross-entropy)
+ *   - Marks loss with ggml_set_loss
+ *   - Builds backward graph (ggml_build_backward_expand with NULL grad_accs)
+ *   - Adds AdamW update nodes using ggml_opt_step_adamw
+ *   - Allocates, uploads, computes, reads back
+ *   - Returns batch loss
+ */
+double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
+                     SnArray *data_arr, SnArray *label_arr, SnArray *weight_arr,
+                     long long num_graphs)
+{
+    if (!g_record_mode || !g_record_ctx) return -1.0;
+    ensure_backend();
+
+    struct ggml_tensor *logits = rec_tensor(logits_rt);
+    struct ggml_tensor *inputs = rec_tensor(input_rt);
+    if (!logits || !inputs) return -1.0;
+
+    int64_t num_actions = logits->ne[0];
+    struct ggml_context *ctx = g_record_ctx;
+
+    /* --- Create label and weight tensors in param context --- */
+    struct ggml_tensor *labels = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32,
+                                                     num_actions, num_graphs);
+    ggml_set_name(labels, "train_labels");
+    ggml_set_input(labels);
+    int lbl_pool = pool_alloc(num_actions, num_graphs, 2);
+    g_record_map[lbl_pool] = labels;
+    {
+        long long llen = sn_array_length(label_arr);
+        for (long long i = 0; i < llen && i < g_pool[lbl_pool].n_elem; i++) {
+            double *v = (double *)sn_array_get(label_arr, i);
+            g_pool[lbl_pool].data[i] = (float)(*v);
+        }
+    }
+
+    struct ggml_tensor *weights = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32,
+                                                      1, num_graphs);
+    ggml_set_name(weights, "train_weights");
+    ggml_set_input(weights);
+    int wgt_pool = pool_alloc(1, num_graphs, 2);
+    g_record_map[wgt_pool] = weights;
+    {
+        long long wlen = sn_array_length(weight_arr);
+        for (long long i = 0; i < wlen && i < g_pool[wgt_pool].n_elem; i++) {
+            double *v = (double *)sn_array_get(weight_arr, i);
+            g_pool[wgt_pool].data[i] = (float)(*v);
+        }
+    }
+
+    /* --- Build per-sample weighted cross-entropy loss ---
+     *
+     * ce[g] = -sum_a( label[g,a] * log(softmax(logits[g,a])) )
+     * loss  = sum_g( ce[g] * weight[g] ) / num_graphs
+     */
+    struct ggml_tensor *sm     = ggml_soft_max(ctx, logits);               /* (A, G) */
+    struct ggml_tensor *lp     = ggml_log(ctx, sm);                        /* (A, G) */
+    struct ggml_tensor *prod   = ggml_mul(ctx, labels, lp);                /* (A, G) */
+    struct ggml_tensor *ce_sum = ggml_sum_rows(ctx, prod);                 /* (1, G) */
+    struct ggml_tensor *ce_neg = ggml_neg(ctx, ce_sum);                    /* (1, G) */
+    struct ggml_tensor *wtd    = ggml_mul(ctx, ce_neg, weights);           /* (1, G) */
+    struct ggml_tensor *total  = ggml_sum(ctx, wtd);                       /* scalar */
+    struct ggml_tensor *loss   = ggml_scale(ctx, total,
+                                            1.0f / (float)num_graphs);     /* scalar */
+
+    ggml_set_output(loss);
+    ggml_set_loss(loss);
+    ggml_set_name(loss, "loss");
+
+    /* --- Build forward graph --- */
+    struct ggml_cgraph *gf = ggml_new_graph_custom(ctx, 16384, true);
+    ggml_build_forward_expand(gf, loss);
+
+    /* --- Build backward graph (appends gradient nodes to gf) ---
+     * Pass NULL for grad_accs — ggml allocates its own internally. */
+    struct ggml_cgraph *gb = ggml_graph_dup(ctx, gf, true);
+    ggml_build_backward_expand(ctx, gb, NULL);
+
+    /* --- Collect param tensors --- */
+    int n_params_in_graph = 0;
+    struct ggml_tensor *param_tensors[TRAIN_MAX_PARAMS];
+    int param_pool_indices[TRAIN_MAX_PARAMS];
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+            if (n_params_in_graph < TRAIN_MAX_PARAMS) {
+                param_tensors[n_params_in_graph] = gt;
+                param_pool_indices[n_params_in_graph] = i;
+                n_params_in_graph++;
+            }
+        }
+    }
+
+    /* --- Add AdamW update nodes for each parameter --- */
+    g_tp_step++;
+
+    float adamw_params_data[7];
+    adamw_params_data[0] = g_tp_lr;
+    adamw_params_data[1] = g_tp_beta1;
+    adamw_params_data[2] = g_tp_beta2;
+    adamw_params_data[3] = g_tp_eps;
+    adamw_params_data[4] = g_tp_wd;
+    adamw_params_data[5] = (float)g_tp_step;
+    adamw_params_data[6] = 0.0f;
+
+    struct ggml_tensor *adamw_params_t = ggml_new_tensor_1d(g_param_ctx, GGML_TYPE_F32, 7);
+    ggml_set_name(adamw_params_t, "adamw_params");
+    ggml_set_input(adamw_params_t);
+    int adamw_pool = pool_alloc(7, 1, 1);
+    g_record_map[adamw_pool] = adamw_params_t;
+    memcpy(g_pool[adamw_pool].data, adamw_params_data, 7 * sizeof(float));
+
+    struct ggml_tensor *m_tensors[TRAIN_MAX_PARAMS];
+    struct ggml_tensor *v_tensors[TRAIN_MAX_PARAMS];
+    int m_pools[TRAIN_MAX_PARAMS];
+    int v_pools[TRAIN_MAX_PARAMS];
+
+    for (int p = 0; p < n_params_in_graph; p++) {
+        struct ggml_tensor *pt = param_tensors[p];
+        int pidx = param_pool_indices[p];
+
+        /* Find or register in training param state */
+        int tp_idx = -1;
+        for (int t = 0; t < g_tp_count; t++) {
+            if (g_tp[t].pool_idx == pidx) { tp_idx = t; break; }
+        }
+        if (tp_idx < 0) {
+            train_register_param(pidx);
+            tp_idx = g_tp_count - 1;
+        }
+
+        /* Get gradient accumulator from the backward graph */
+        struct ggml_tensor *grad = ggml_graph_get_grad_acc(gb, pt);
+        if (!grad) {
+            fprintf(stderr, "train_step: no gradient for param %d\n", p);
+            continue;
+        }
+
+        /* Create m tensor (first moment) */
+        struct ggml_tensor *mt = ggml_dup_tensor(g_param_ctx, pt);
+        ggml_set_name(mt, "adam_m");
+        ggml_set_input(mt);
+        int mp = pool_alloc(pt->ne[0], pt->ne[1], 2);
+        g_record_map[mp] = mt;
+        memcpy(g_pool[mp].data, g_tp[tp_idx].m,
+               (size_t)g_tp[tp_idx].n_elem * sizeof(float));
+        m_tensors[p] = mt;
+        m_pools[p] = mp;
+
+        /* Create v tensor (second moment) */
+        struct ggml_tensor *vt = ggml_dup_tensor(g_param_ctx, pt);
+        ggml_set_name(vt, "adam_v");
+        ggml_set_input(vt);
+        int vp = pool_alloc(pt->ne[0], pt->ne[1], 2);
+        g_record_map[vp] = vt;
+        memcpy(g_pool[vp].data, g_tp[tp_idx].v,
+               (size_t)g_tp[tp_idx].n_elem * sizeof(float));
+        v_tensors[p] = vt;
+        v_pools[p] = vp;
+
+        /* Add AdamW step node — updates pt, mt, vt in-place */
+        struct ggml_tensor *step = ggml_opt_step_adamw(
+            ctx, pt, grad, mt, vt, adamw_params_t);
+        ggml_build_forward_expand(gb, step);
+    }
+
+    /* --- Allocate backend buffers and upload data --- */
+    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+    /* Upload all mapped tensors from pool to backend */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && gt->buffer && g_pool[i].data) {
+            size_t pool_bytes = (size_t)g_pool[i].n_elem * sizeof(float);
+            size_t gt_bytes   = ggml_nbytes(gt);
+            size_t copy_bytes = pool_bytes < gt_bytes ? pool_bytes : gt_bytes;
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0, copy_bytes);
+        }
+    }
+
+    /* --- Compute the full graph: forward → loss → backward → AdamW --- */
+    ggml_backend_t backends[] = { g_backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(
+        backends, NULL, 1, 16384, false, false);
+    ggml_backend_sched_alloc_graph(sched, gb);
+
+    /* Re-upload input tensors — sched alloc may have moved buffers */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && gt->buffer && g_pool[i].data &&
+            (gt->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_PARAM))) {
+            size_t pool_bytes = (size_t)g_pool[i].n_elem * sizeof(float);
+            size_t gt_bytes   = ggml_nbytes(gt);
+            size_t copy_bytes = pool_bytes < gt_bytes ? pool_bytes : gt_bytes;
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0, copy_bytes);
+        }
+    }
+
+    /* Reset gradient accumulators to 0; set loss gradient to 1 */
+    ggml_graph_reset(gb);
+
+    ggml_backend_sched_graph_compute(sched, gb);
+
+    /* --- Read loss --- */
+    float loss_val = 0.0f;
+    ggml_backend_tensor_get(loss, &loss_val, 0, sizeof(float));
+
+    /* --- Read back updated parameters to pool --- */
+    for (int p = 0; p < n_params_in_graph; p++) {
+        int pidx = param_pool_indices[p];
+        struct ggml_tensor *pt = param_tensors[p];
+        TPool *s = &g_pool[pidx];
+        if (pt->buffer) {
+            ggml_backend_tensor_get(pt, s->data, 0,
+                                    (size_t)s->n_elem * sizeof(float));
+        }
+    }
+
+    /* --- Read back updated m/v to persistent state --- */
+    for (int p = 0; p < n_params_in_graph; p++) {
+        int pidx = param_pool_indices[p];
+        int tp_idx = -1;
+        for (int t = 0; t < g_tp_count; t++) {
+            if (g_tp[t].pool_idx == pidx) { tp_idx = t; break; }
+        }
+        if (tp_idx >= 0) {
+            struct ggml_tensor *mt = m_tensors[p];
+            struct ggml_tensor *vt = v_tensors[p];
+            if (mt->buffer) {
+                ggml_backend_tensor_get(mt, g_tp[tp_idx].m, 0,
+                                        (size_t)g_tp[tp_idx].n_elem * sizeof(float));
+            }
+            if (vt->buffer) {
+                ggml_backend_tensor_get(vt, g_tp[tp_idx].v, 0,
+                                        (size_t)g_tp[tp_idx].n_elem * sizeof(float));
+            }
+        }
+    }
+
+    ggml_backend_sched_free(sched);
+
+    return (double)loss_val;
+}
+
+void sn_train_finish(void)
+{
+    for (int i = 0; i < g_tp_count; i++) {
+        if (g_tp[i].m) { free(g_tp[i].m); g_tp[i].m = NULL; }
+        if (g_tp[i].v) { free(g_tp[i].v); g_tp[i].v = NULL; }
+    }
+    g_tp_count  = 0;
+    g_tp_step   = 0;
+    g_tp_active = 0;
 }
 
 /* ======================================================================

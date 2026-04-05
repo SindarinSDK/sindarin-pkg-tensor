@@ -140,6 +140,14 @@ native fn sn_graph_param(t: Tensor): Tensor
 native fn sn_graph_train(output: Tensor, input: Tensor, data: double[], labels: double[], nsamples: int, epochs: int, batchSize: int, valSplit: double, lossType: str, optimizer: str, lr: double, wd: double): double
 
 # ---------------------------------------------------------------------------
+# Graph-aware training (manual forward+backward+AdamW per batch)
+# ---------------------------------------------------------------------------
+
+native fn sn_train_init(lr: double, wd: double): void
+native fn sn_train_step(logits: Tensor, input: Tensor, data: double[], labels: double[], weights: double[], numGraphs: int): double
+native fn sn_train_finish(): void
+
+# ---------------------------------------------------------------------------
 # Optimizer configuration
 # ---------------------------------------------------------------------------
 
