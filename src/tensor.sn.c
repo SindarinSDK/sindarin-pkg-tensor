@@ -1265,9 +1265,12 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     struct ggml_cgraph *gf = ggml_new_graph_custom(ctx, 16384, true);
     ggml_build_forward_expand(gf, loss);
 
-    /* --- Build backward graph (appends gradient nodes to gf) ---
+    /* --- Build backward graph ---
+     * Copy forward graph into gb (shares tensor pointers so gradient
+     * hash lookups resolve to the same param tensors).
      * Pass NULL for grad_accs — ggml allocates its own internally. */
-    struct ggml_cgraph *gb = ggml_graph_dup(ctx, gf, true);
+    struct ggml_cgraph *gb = ggml_new_graph_custom(ctx, 16384, true);
+    ggml_graph_cpy(gf, gb);
     ggml_build_backward_expand(ctx, gb, NULL);
 
     /* --- Collect param tensors --- */
