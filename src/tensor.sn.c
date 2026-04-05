@@ -1265,14 +1265,6 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     struct ggml_cgraph *gf = ggml_new_graph_custom(ctx, 16384, true);
     ggml_build_forward_expand(gf, loss);
 
-    /* --- Build backward graph ---
-     * Copy forward graph into gb (shares tensor pointers so gradient
-     * hash lookups resolve to the same param tensors).
-     * Pass NULL for grad_accs — ggml allocates its own internally. */
-    struct ggml_cgraph *gb = ggml_new_graph_custom(ctx, 16384, true);
-    ggml_graph_cpy(gf, gb);
-    ggml_build_backward_expand(ctx, gb, NULL);
-
     /* --- Collect param tensors --- */
     int n_params_in_graph = 0;
     struct ggml_tensor *param_tensors[TRAIN_MAX_PARAMS];
@@ -1287,6 +1279,31 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
             }
         }
     }
+
+    /* --- Build backward graph ---
+     * Copy forward graph into gb (shares tensor pointers).
+     * Pre-allocate grad_accs for PARAM tensors — ggml_build_backward_expand
+     * only auto-creates them for LOSS tensors, not PARAMs.
+     * The grad_accs array is indexed by forward graph node index. */
+    struct ggml_cgraph *gb = ggml_new_graph_custom(ctx, 16384, true);
+    ggml_graph_cpy(gf, gb);
+
+    int n_fwd_nodes = ggml_graph_n_nodes(gb);
+    struct ggml_tensor **grad_accs_arr = (struct ggml_tensor **)calloc(
+        (size_t)n_fwd_nodes, sizeof(struct ggml_tensor *));
+
+    for (int i = 0; i < n_fwd_nodes; i++) {
+        struct ggml_tensor *node = ggml_graph_node(gb, i);
+        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            struct ggml_tensor *ga = ggml_dup_tensor(ctx, node);
+            ggml_set_name(ga, "grad_acc");
+            ggml_set_zero(ga);
+            grad_accs_arr[i] = ga;
+        }
+    }
+
+    ggml_build_backward_expand(ctx, gb, grad_accs_arr);
+    free(grad_accs_arr);
 
     /* --- Add AdamW update nodes for each parameter --- */
     g_tp_step++;
