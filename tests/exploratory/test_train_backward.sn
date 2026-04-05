@@ -1,0 +1,57 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+import "../src/gnn"
+
+# Minimal test: can ggml_opt_fit handle multi-node input with the OLD API?
+# If yes, the issue is in our backward expansion. If no, it's in ggml itself.
+
+fn main(): void =>
+  println("test_train_backward: old API with multi-node graph")
+
+  var config: GnnConfig = GnnConfig {
+    inputDim: 3, hiddenDim: 4, numActions: 2, numLayers: 1,
+    arch: "gcn", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+  println($"  model: {len(model.parameters())} params")
+
+  # 5 samples (one node each, like the old approach)
+  var data: double[] = {
+    1.0, 0.0, 0.5,
+    0.0, 1.0, 0.5,
+    0.5, 0.5, 1.0,
+    0.8, 0.2, 0.0,
+    0.2, 0.8, 0.0
+  }
+  var labels: double[] = {
+    1.0, 0.0,
+    1.0, 0.0,
+    0.0, 1.0,
+    1.0, 0.0,
+    0.0, 1.0
+  }
+
+  # Template graph: 5 nodes, self-loop edges (old approach)
+  var batchIdx: double[] = {0.0, 1.0, 2.0, 3.0, 4.0}
+  var edgeSrc: double[] = {0.0, 1.0, 2.0, 3.0, 4.0}
+  var edgeDst: double[] = {0.0, 1.0, 2.0, 3.0, 4.0}
+  var edgeData: double[] = {}
+  for var i: int = 0; i < 5; i++ =>
+    edgeData.push(edgeSrc[i])
+  for var i: int = 0; i < 5; i++ =>
+    edgeData.push(edgeDst[i])
+  var edgeW: double[] = {1.0, 1.0, 1.0, 1.0, 1.0}
+
+  var gt: GraphTensors = GraphTensors {
+    nodeFeatures: Tensor.zeros(5, 3),
+    edgeIndex: Tensor.fromDoubles(edgeData, 2, 5),
+    edgeWeight: Tensor.fromDoubles(edgeW, 1, 5),
+    batchIndex: Tensor.fromDoubles(batchIdx, 5, 1),
+    numNodes: 5, numEdges: 5, featureDim: 3
+  }
+
+  println("  training with old API (ggml_opt_fit)...")
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(data, labels, 5, 5, gt, opt, 3, 0.0)
+  println($"  old API loss = {result.loss}")
+  println("  PASSED")

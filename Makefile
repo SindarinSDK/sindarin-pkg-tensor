@@ -83,7 +83,7 @@ $(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
 build-libs:
 	@echo "Building ggml from source for $(PLATFORM)..."
 	@if [ ! -d "$(GGML_SRC)" ]; then \
-	    git clone --depth=1 https://github.com/ggml-org/ggml.git $(GGML_SRC); \
+	    git clone --depth=1 https://github.com/RealOrko/ggml.git $(GGML_SRC); \
 	fi
 	@cmake -S $(GGML_SRC) -B $(GGML_BUILD) \
 	    -G Ninja \
