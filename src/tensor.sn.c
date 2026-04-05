@@ -1295,9 +1295,11 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     for (int i = 0; i < n_fwd_nodes; i++) {
         struct ggml_tensor *node = ggml_graph_node(gb, i);
         if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-            struct ggml_tensor *ga = ggml_dup_tensor(ctx, node);
+            /* Grad accumulators must be in param_ctx (backend-allocated)
+             * because ggml_set_zero writes to ->data which requires allocation. */
+            struct ggml_tensor *ga = ggml_dup_tensor(g_param_ctx, node);
             ggml_set_name(ga, "grad_acc");
-            ggml_set_zero(ga);
+            ggml_set_input(ga);
             grad_accs_arr[i] = ga;
         }
     }
