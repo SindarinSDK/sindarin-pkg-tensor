@@ -327,7 +327,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, 4096, false, false);
 
     /* Allocate backend buffers for all tensors in param context */
-    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+    ggml_backend_buffer_t param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
 
     /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
     for (int i = 0; i < g_pool_count; i++) {
@@ -364,6 +364,7 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
 
     ggml_backend_sched_free(sched);
     ggml_opt_dataset_free(dataset);
+    if (param_buf) ggml_backend_buffer_free(param_buf);
     return 0.0;
 }
 
@@ -1445,7 +1446,7 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
         backends, NULL, 1, 16384, false, false);
 
     /* Allocate param_ctx tensors first (they're referenced by the graph) */
-    ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+    ggml_backend_buffer_t param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
 
     /* Allocate the computation graph (compute_ctx tensors) */
     ggml_backend_sched_alloc_graph(sched, gb);
@@ -1503,6 +1504,7 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     }
 
     ggml_backend_sched_free(sched);
+    if (param_buf) ggml_backend_buffer_free(param_buf);
 
     return (double)loss_val;
 }
