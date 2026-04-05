@@ -421,34 +421,33 @@ RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
     TPool *pa = unwrap(a);
     TPool *pb = unwrap(b);
     if (g_record_mode) {
-        int64_t N = pb->ne[0], M = pa->ne[1];
-        /* Pool convention: A is (K, M) meaning ne0=K, ne1=M
-         *                  B is (N, K) meaning ne0=N, ne1=K
-         * We want C = A @ B → (N, M) meaning ne0=N, ne1=M
+        int64_t K = pa->ne[0], M = pa->ne[1];
+        int64_t N = pb->ne[0];
+        /* Pool convention: A is (K, M), B is (N, K).
+         * We want C = A @ B → (N, M).
          *
-         * ggml_mul_mat(x, y) computes y @ x^T, result ne0=x->ne[0], ne1=y->ne[1]
-         * So ggml_mul_mat(B, A) = A @ B^T — wrong dimensions.
+         * ggml_mul_mat(x, y) dots over ne0: result[i0,i1] = sum_k x[k,i0]*y[k,i1]
+         * Need ne0_x == ne0_y == K (the contraction dim).
+         * A already has ne0=K. B has ne0=N, so we need B transposed: B^T (K, N).
          *
-         * Instead: ggml_mul_mat(A^T, B^T) = B^T @ (A^T)^T = B^T @ A — also wrong.
-         *
-         * The simplest correct approach: use ggml_mul_mat with B transposed.
-         * B^T has ne0=K, ne1=N. A has ne0=K, ne1=M. ne0 match.
-         * ggml_mul_mat(B^T, A) = A @ (B^T)^T = A @ B. Result: ne0=K→N? No...
-         *
-         * Actually ggml_mul_mat result shape: (a->ne[0], b->ne[1]) where
-         * a is the first arg. So ggml_mul_mat(B^T, A) → (B^T->ne[0], A->ne[1]) = (K, M).
-         * That's wrong too.
-         *
-         * Let me just use the working approach but ensure backward works.
-         * The existing sn_graph_train uses this same path and works for
-         * the tabular case. The issue is specifically with backward.
-         *
-         * Workaround: mark the matmul result with ggml_set_name so ggml
-         * can track it, and don't add extra cont nodes that confuse backward.
-         */
-        struct ggml_tensor *bt = ggml_cont(g_record_ctx,
-            ggml_transpose(g_record_ctx, rec_tensor(b)));
-        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, bt, rec_tensor(a));
+         * AVOID ggml_transpose as a graph op — its backward (repeat_back) hits
+         * non-contiguous stride assertions in ggml-cpu. Instead, create a
+         * pre-transposed input tensor with the data rearranged on the host. */
+        int bt_pool = pool_alloc(K, N, 2);
+        TPool *bt_s = &g_pool[bt_pool];
+        /* Transpose B's data: B[col][row] -> B^T[row][col]
+         * B pool layout: ne0=N cols, ne1=K rows, data[row*N + col]
+         * B^T layout:    ne0=K cols, ne1=N rows, data[row*K + col] */
+        for (int64_t r = 0; r < K; r++)
+            for (int64_t c = 0; c < N; c++)
+                bt_s->data[c * K + r] = pb->data[r * N + c];
+
+        struct ggml_tensor *bt_gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, K, N);
+        ggml_set_name(bt_gt, "weight_T");
+        ggml_set_input(bt_gt);
+        g_record_map[bt_pool] = bt_gt;
+
+        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, bt_gt, rec_tensor(a));
         ggml_set_name(result, "matmul_result");
         return rec_wrap(result, N, M);
     }
@@ -754,9 +753,18 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
         ggml_set_input(gpool);
         g_record_map[pool_idx] = gpool;
 
-        /* Transpose features: [feat_dim, num_nodes] → [num_nodes, feat_dim] */
-        struct ggml_tensor *feat_t = ggml_cont(g_record_ctx,
-            ggml_transpose(g_record_ctx, rec_tensor(node_embeddings)));
+        /* Pre-transpose features on host to avoid ggml_transpose backward issues.
+         * features: ne0=feat_dim, ne1=num_nodes → transposed: ne0=num_nodes, ne1=feat_dim */
+        TPool *px_ne = unwrap(node_embeddings);
+        int ft_pool = pool_alloc(num_nodes, feat_dim, 2);
+        TPool *ft_s = &g_pool[ft_pool];
+        for (int64_t r = 0; r < num_nodes; r++)
+            for (int64_t c = 0; c < feat_dim; c++)
+                ft_s->data[c * num_nodes + r] = px_ne->data[r * feat_dim + c];
+        struct ggml_tensor *feat_t = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, feat_dim);
+        ggml_set_name(feat_t, "embed_T");
+        ggml_set_input(feat_t);
+        g_record_map[ft_pool] = feat_t;
 
         /* result = ggml_mul_mat(feat_t, gpool) → [feat_dim, num_graphs] */
         struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, feat_t, gpool);
@@ -874,9 +882,22 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
         ggml_set_input(gadj);
         /* Data uploaded after ggml_backend_alloc_ctx_tensors */
         g_record_map[adj_idx] = gadj;
-        /* result = adj × features: ggml_mul_mat(a,b) = b @ a^T
-         * Transpose features so ne[0] matches adj's ne[0] (num_nodes) */
-        struct ggml_tensor *gfeat_t = ggml_cont(g_record_ctx, ggml_transpose(g_record_ctx, rec_tensor(features)));
+        /* result = adj × features: ggml_mul_mat dots over ne0.
+         * features: ne0=feat_dim, ne1=num_nodes
+         * adj: ne0=num_nodes, ne1=num_nodes
+         * Need features transposed: ne0=num_nodes, ne1=feat_dim
+         * Pre-transpose on host to avoid ggml_transpose backward issues. */
+        TPool *px_f = unwrap(features);
+        int ft_pool = pool_alloc(num_nodes, feat_dim, 2);
+        TPool *ft_s = &g_pool[ft_pool];
+        for (int64_t r = 0; r < num_nodes; r++)
+            for (int64_t c = 0; c < feat_dim; c++)
+                ft_s->data[c * num_nodes + r] = px_f->data[r * feat_dim + c];
+        struct ggml_tensor *gfeat_t = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, feat_dim);
+        ggml_set_name(gfeat_t, "feat_T");
+        ggml_set_input(gfeat_t);
+        g_record_map[ft_pool] = gfeat_t;
+
         struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, gfeat_t, gadj);
         return rec_wrap(result, feat_dim, num_nodes);
     }
