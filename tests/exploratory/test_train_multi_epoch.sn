@@ -1,0 +1,125 @@
+import "sindarin-pkg-test/src/assert"
+import "../../src/tensor"
+import "../../src/gnn"
+
+# Test multi-epoch training loop matching skynet's handleTrain pattern.
+# Checks for NaN after training completes.
+
+fn main(): void =>
+  println("test_train_multi_epoch: 50-epoch training with early stopping")
+
+  var config: GnnConfig = GnnConfig {
+    inputDim: 3, hiddenDim: 4, numActions: 2, numLayers: 1,
+    arch: "gcn", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+  println($"  model: {len(model.parameters())} params")
+
+  # Batch of 2 graphs with real topology
+  var totalNodes: int = 5
+  var totalEdges: int = 3
+  var featureDim: int = 3
+  var numGraphs: int = 2
+  var numActions: int = 2
+
+  var features: double[] = {
+    1.0, 0.0, 0.5, 0.0, 1.0, 0.5, 0.5, 0.5, 1.0,
+    0.8, 0.2, 0.0, 0.2, 0.8, 0.0
+  }
+  var edgeData: double[] = {0.0, 1.0, 3.0, 1.0, 2.0, 4.0}
+  var edgeWeights: double[] = {1.0, 1.0, 1.0}
+  var batchIndex: double[] = {0.0, 0.0, 0.0, 1.0, 1.0}
+
+  var batchTensors: GraphTensors = GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, totalNodes, featureDim),
+    edgeIndex: Tensor.fromDoubles(edgeData, 2, totalEdges),
+    edgeWeight: Tensor.fromDoubles(edgeWeights, 1, totalEdges),
+    batchIndex: Tensor.fromDoubles(batchIndex, totalNodes, 1),
+    numNodes: totalNodes, numEdges: totalEdges, featureDim: featureDim
+  }
+
+  var labels: double[] = {1.0, 0.0, 0.0, 1.0}
+  var weights: double[] = {1.5, 0.5}
+
+  # --- Multi-epoch training loop (matching skynet handleTrain) ---
+  var epochs: int = 50
+  var patience: int = 10
+  var bestLoss: double = 999999.0
+  var staleCount: int = 0
+  var epochsTrained: int = 0
+
+  sn_train_init(0.001, 0.0001)
+
+  for var epoch: int = 0; epoch < epochs; epoch++ =>
+    # Check weight[0] before this epoch
+    var preParams: Tensor[] = model.parameters()
+    var preW: double[] = preParams[0].toDoubles()
+    var preSum: double = 0.0
+    for var k: int = 0; k < len(preW); k++ =>
+      preSum = preSum + preW[k]
+
+    # Per batch: begin → record → step → end
+    sn_graph_begin()
+    var params: Tensor[] = model.parameters()
+    for var p: int = 0; p < len(params); p++ =>
+      sn_graph_param(params[p])
+
+    var input: Tensor = sn_graph_input(totalNodes, featureDim)
+    var recordGraph: GraphTensors = GraphTensors {
+      nodeFeatures: input,
+      edgeIndex: batchTensors.edgeIndex,
+      edgeWeight: batchTensors.edgeWeight,
+      batchIndex: batchTensors.batchIndex,
+      numNodes: totalNodes, numEdges: totalEdges, featureDim: featureDim
+    }
+    var output: GnnOutput = model.forward(recordGraph, true)
+
+    var nodeData: double[] = batchTensors.nodeFeatures.toDoubles()
+    var loss: double = sn_train_step(output.logits, input, nodeData, labels, weights, numGraphs)
+    sn_graph_end()
+
+    # Check weight[0] after this epoch
+    var postParams: Tensor[] = model.parameters()
+    var postW: double[] = postParams[0].toDoubles()
+    var postSum: double = 0.0
+    for var k: int = 0; k < len(postW); k++ =>
+      postSum = postSum + postW[k]
+
+    epochsTrained = epoch + 1
+
+    if epoch < 3 =>
+      println($"  epoch {epoch}: loss={loss}, w0_sum before={preSum} after={postSum}")
+
+    if loss < bestLoss =>
+      bestLoss = loss
+      staleCount = 0
+    else =>
+      staleCount = staleCount + 1
+      if staleCount >= patience =>
+        println($"  early stopping at epoch {epochsTrained}, best loss={bestLoss}")
+        epoch = epochs
+
+    if epoch % 10 == 0 && epoch >= 3 =>
+      println($"  epoch {epoch}: loss={loss}")
+
+  sn_train_finish()
+  println($"  training done: {epochsTrained} epochs, best loss={bestLoss}")
+
+  # --- Check for NaN after training ---
+  println("  inference after training...")
+  var postOutput: GnnOutput = model.forward(batchTensors, false)
+  var postProbs: double[] = postOutput.probs.toDoubles()
+  println($"  graph 0 probs: [{postProbs[0]}, {postProbs[1]}]")
+  if len(postProbs) >= 4 =>
+    println($"  graph 1 probs: [{postProbs[2]}, {postProbs[3]}]")
+
+  # Check for NaN
+  var hasNan: bool = false
+  for var i: int = 0; i < len(postProbs); i++ =>
+    if postProbs[i] != postProbs[i] =>
+      hasNan = true
+      println($"  NaN detected at index {i}")
+
+  assert(!hasNan, "model should not produce NaN after training")
+  assert(bestLoss >= 0.0, "loss should be non-negative")
+  println("  PASSED")

@@ -1360,14 +1360,20 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     /* --- Add AdamW update nodes for each parameter --- */
     g_tp_step++;
 
+    /* Compute bias correction terms for AdamW.
+     * beta1h = 1 / (1 - beta1^step), beta2h = 1 / (1 - beta2^step)
+     * These correct for the zero-initialization of m and v. */
+    float beta1h = 1.0f / (1.0f - powf(g_tp_beta1, (float)g_tp_step));
+    float beta2h = 1.0f / (1.0f - powf(g_tp_beta2, (float)g_tp_step));
+
     float adamw_params_data[7];
     adamw_params_data[0] = g_tp_lr;
     adamw_params_data[1] = g_tp_beta1;
     adamw_params_data[2] = g_tp_beta2;
     adamw_params_data[3] = g_tp_eps;
     adamw_params_data[4] = g_tp_wd;
-    adamw_params_data[5] = (float)g_tp_step;
-    adamw_params_data[6] = 0.0f;
+    adamw_params_data[5] = beta1h;
+    adamw_params_data[6] = beta2h;
 
     struct ggml_tensor *adamw_params_t = ggml_new_tensor_1d(g_param_ctx, GGML_TYPE_F32, 7);
     ggml_set_name(adamw_params_t, "adamw_params");
