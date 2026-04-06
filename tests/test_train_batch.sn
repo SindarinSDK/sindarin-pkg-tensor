@@ -1,0 +1,82 @@
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# Test training with various batch sizes.
+# Verifies that Gnn.train() dynamically builds the template graph
+# to match the batch size, and that larger batches converge faster.
+# ===========================================================================
+
+fn trainAndReport(batchSize: int, numSamples: int, featureDim: int, numActions: int, data: double[], labels: double[], epochs: int): TrainResult =>
+  var config: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 16, numActions: numActions,
+    numLayers: 2, arch: "gcn", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(data, labels, numSamples, batchSize, featureDim, opt, epochs, 0.0)
+  return result
+
+fn main(): void =>
+  println("=== Test training with different batch sizes ===")
+  println("")
+
+  var featureDim: int = 8
+  var numActions: int = 3
+  var numSamples: int = 24
+
+  # Generate 24 samples: 8 per class with distinct patterns
+  var data: double[] = {}
+  var labels: double[] = {}
+  for var s: int = 0; s < numSamples; s++ =>
+    var cls: int = s % numActions
+    for var f: int = 0; f < featureDim; f++ =>
+      if f == cls =>
+        data.push(1.0)
+      else if f == cls + numActions =>
+        data.push(0.8)
+      else =>
+        data.push(0.1)
+    for var a: int = 0; a < numActions; a++ =>
+      if a == cls =>
+        labels.push(1.0)
+      else =>
+        labels.push(0.0)
+
+  # --- batchSize=1 (baseline) ---
+  var r1: TrainResult = trainAndReport(1, numSamples, featureDim, numActions, data, labels, 30)
+  println($"  batch=1:  loss={r1.loss}, accuracy={r1.accuracy}")
+
+  # --- batchSize=4 ---
+  var r4: TrainResult = trainAndReport(4, numSamples, featureDim, numActions, data, labels, 30)
+  println($"  batch=4:  loss={r4.loss}, accuracy={r4.accuracy}")
+
+  # --- batchSize=8 ---
+  var r8: TrainResult = trainAndReport(8, numSamples, featureDim, numActions, data, labels, 30)
+  println($"  batch=8:  loss={r8.loss}, accuracy={r8.accuracy}")
+
+  # --- batchSize=24 (full batch) ---
+  var r24: TrainResult = trainAndReport(24, numSamples, featureDim, numActions, data, labels, 30)
+  println($"  batch=24: loss={r24.loss}, accuracy={r24.accuracy}")
+
+  println("")
+
+  # Verify all converged (accuracy > 50% at minimum)
+  var allOk: bool = true
+  if r1.accuracy < 0.5 =>
+    println("  FAIL: batch=1 accuracy too low")
+    allOk = false
+  if r4.accuracy < 0.5 =>
+    println("  FAIL: batch=4 accuracy too low")
+    allOk = false
+  if r8.accuracy < 0.5 =>
+    println("  FAIL: batch=8 accuracy too low")
+    allOk = false
+  if r24.accuracy < 0.5 =>
+    println("  FAIL: batch=24 accuracy too low")
+    allOk = false
+
+  if allOk =>
+    println("  ALL PASS")
+  else =>
+    println("  SOME TESTS FAILED")

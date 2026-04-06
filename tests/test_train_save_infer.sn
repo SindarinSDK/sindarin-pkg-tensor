@@ -43,15 +43,6 @@ fn main(): void =>
     1.0, 0.0, 0.0
   }
 
-  # Graph template: single node, self-loop, edge weight 1.0
-  var gt: GraphTensors = {
-    nodeFeatures: Tensor.fromDoubles({0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5}, 1, 24),
-    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
-    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
-    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
-    numNodes: 1, numEdges: 1, featureDim: 24
-  }
-
   # --- Pre-training inference ---
   var inferGraph1: GraphTensors = {
     nodeFeatures: Tensor.fromDoubles(s1, 1, 24),
@@ -76,7 +67,7 @@ fn main(): void =>
   # --- Train ---
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
   println("  training 100 epochs...")
-  var result: TrainResult = model.train(data, labels, 4, 1, gt, opt, 100, 0.0)
+  var result: TrainResult = model.train(data, labels, 4, 1, 24, opt, 100, 0.0)
   println($"  train done, loss={result.loss}")
 
   # --- Post-training inference ---

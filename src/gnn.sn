@@ -211,7 +211,7 @@ struct Gnn =>
     if idx < len(loaded) =>
       self.classifierB2 = loaded[idx]
 
-  fn train(data: double[], labels: double[], numSamples: int, batchSize: int, graph: GraphTensors, optimizer: Optimizer, epochs: int, valSplit: double): TrainResult =>
+  fn train(data: double[], labels: double[], numSamples: int, batchSize: int, featureDim: int, optimizer: Optimizer, epochs: int, valSplit: double): TrainResult =>
     # Enter graph recording mode — all tensor ops record to ggml graph
     sn_graph_begin()
 
@@ -220,19 +220,38 @@ struct Gnn =>
     for var i: int = 0; i < len(params); i++ =>
       sn_graph_param(params[i])
 
-    # Create graph-mode input placeholder
-    var input: Tensor = sn_graph_input(batchSize, graph.featureDim)
+    # Build template graph: batchSize nodes, each a self-loop with weight 1.0.
+    # Each node maps to its own graph via batchIndex so meanPool is identity.
+    var templateFeatures: double[] = {}
+    for var i: int = 0; i < batchSize * featureDim; i++ =>
+      templateFeatures.push(0.5)
 
-    # Build the forward computation graph using the same forward() method
+    var edgeSrc: double[] = {}
+    var edgeDst: double[] = {}
+    var edgeWts: double[] = {}
+    var batchIdx: double[] = {}
+    for var i: int = 0; i < batchSize; i++ =>
+      edgeSrc.push(i.toDouble())
+      edgeDst.push(i.toDouble())
+      edgeWts.push(1.0)
+      batchIdx.push(i.toDouble())
+
+    var edgeData: double[] = {}
+    for var i: int = 0; i < len(edgeSrc); i++ =>
+      edgeData.push(edgeSrc[i])
+    for var i: int = 0; i < len(edgeDst); i++ =>
+      edgeData.push(edgeDst[i])
+
     var recordGraph: GraphTensors = {
-      nodeFeatures: input,
-      edgeIndex: graph.edgeIndex,
-      edgeWeight: graph.edgeWeight,
-      batchIndex: graph.batchIndex,
-      numNodes: graph.numNodes,
-      numEdges: graph.numEdges,
-      featureDim: graph.featureDim
+      nodeFeatures: sn_graph_input(batchSize, featureDim),
+      edgeIndex: Tensor.fromDoubles(edgeData, 2, batchSize),
+      edgeWeight: Tensor.fromDoubles(edgeWts, 1, batchSize),
+      batchIndex: Tensor.fromDoubles(batchIdx, batchSize, 1),
+      numNodes: batchSize,
+      numEdges: batchSize,
+      featureDim: featureDim
     }
+    var input: Tensor = recordGraph.nodeFeatures
     var output: GnnOutput = self.forward(recordGraph, true)
 
     # Run ggml_opt on the captured graph — pass logits (pre-softmax),

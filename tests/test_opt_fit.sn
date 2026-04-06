@@ -21,16 +21,8 @@ fn main(): void =>
   var data: double[] = {1.0, 0.0, 0.0, 1.0, 0.8, 0.2, 0.2, 0.8}
   var labels: double[] = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
 
-  # Graph topology for recording — self-loop with weight 1.0
-  var gt: GraphTensors = {
-    nodeFeatures: Tensor.fromDoubles({0.5, 0.5}, 1, 2),
-    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
-    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
-    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
-    numNodes: 1, numEdges: 1, featureDim: 2
-  }
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
-  var result: TrainResult = model.train(data, labels, 4, 1, gt, opt, 50, 0.0)
+  var result: TrainResult = model.train(data, labels, 4, 1, 2, opt, 50, 0.0)
   println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")
 
   var params2: Tensor[] = model.parameters()
