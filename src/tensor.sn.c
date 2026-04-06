@@ -1330,3 +1330,14 @@ void sn_tensor_free(RtTensor *rt)
         s->n_elem = 0;
     }
 }
+
+void sn_tensor_pool_reset(void)
+{
+    for (int i = 0; i < g_pool_count; i++) {
+        if (g_pool[i].data) {
+            free(g_pool[i].data);
+            g_pool[i].data = NULL;
+        }
+    }
+    g_pool_count = 0;
+}
