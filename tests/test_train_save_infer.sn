@@ -1,0 +1,135 @@
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# Integration test: train → save → load → infer
+# Mirrors skynet's full flow: GAT model, 24 features, 3 actions
+# ===========================================================================
+
+fn main(): void =>
+  println("=== Integration: train → save → load → infer ===")
+
+  # --- Create model matching skynet config ---
+  var config: GnnConfig = {
+    inputDim: 24, hiddenDim: 32, numActions: 3,
+    numLayers: 3, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+
+  # --- Training data: 4 samples, 24 features, 3 actions (one-hot) ---
+  var data: double[] = {}
+  # Sample 1: overloaded (high amps, high weight)
+  var s1: double[] = {1.0, 0.3, 0.9, 0.8, 0.2, 0.7, 0.6, 0.9, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.9, 0.7, 0.6}
+  # Sample 2: starved (low amps, low weight)
+  var s2: double[] = {0.0, 0.7, 0.1, 0.2, 0.8, 0.3, 0.4, 0.1, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.1, 0.3, 0.4}
+  # Sample 3: similar to overloaded
+  var s3: double[] = {0.9, 0.4, 0.8, 0.7, 0.3, 0.6, 0.5, 0.8, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.8, 0.6, 0.5}
+  # Sample 4: similar to starved
+  var s4: double[] = {0.1, 0.6, 0.2, 0.3, 0.7, 0.4, 0.5, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.2, 0.4, 0.5}
+  for var i: int = 0; i < len(s1); i++ =>
+    data.push(s1[i])
+  for var i: int = 0; i < len(s2); i++ =>
+    data.push(s2[i])
+  for var i: int = 0; i < len(s3); i++ =>
+    data.push(s3[i])
+  for var i: int = 0; i < len(s4); i++ =>
+    data.push(s4[i])
+
+  # Labels: overloaded→speed_down(idx 1), starved→speed_up(idx 0)
+  var labels: double[] = {
+    0.0, 1.0, 0.0,
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    1.0, 0.0, 0.0
+  }
+
+  # Graph template: single node, self-loop, edge weight 1.0
+  var gt: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles({0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5}, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+
+  # --- Pre-training inference ---
+  var inferGraph1: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles(s1, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+  var inferGraph2: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles(s2, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+
+  var pre1: double[] = model.forward(inferGraph1, false).probs.toDoubles()
+  var pre2: double[] = model.forward(inferGraph2, false).probs.toDoubles()
+  println($"  pre-train overloaded: [{pre1[0]}, {pre1[1]}, {pre1[2]}]")
+  println($"  pre-train starved:    [{pre2[0]}, {pre2[1]}, {pre2[2]}]")
+
+  # --- Train ---
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  println("  training 100 epochs...")
+  var result: TrainResult = model.train(data, labels, 4, 1, gt, opt, 100, 0.0)
+  println($"  train done, loss={result.loss}")
+
+  # --- Post-training inference ---
+  var post1: double[] = model.forward(inferGraph1, false).probs.toDoubles()
+  var post2: double[] = model.forward(inferGraph2, false).probs.toDoubles()
+  println($"  post-train overloaded: [{post1[0]}, {post1[1]}, {post1[2]}]")
+  println($"  post-train starved:    [{post2[0]}, {post2[1]}, {post2[2]}]")
+
+  # --- Save and reload ---
+  var path: str = "/tmp/test_model.bin"
+  model.save(path)
+  println($"  saved to {path}")
+
+  var model2: Gnn = Gnn.create(config)
+  model2.load(path)
+  println("  loaded into fresh model")
+
+  # --- Post-load inference ---
+  var load1: double[] = model2.forward(inferGraph1, false).probs.toDoubles()
+  var load2: double[] = model2.forward(inferGraph2, false).probs.toDoubles()
+  println($"  post-load overloaded: [{load1[0]}, {load1[1]}, {load1[2]}]")
+  println($"  post-load starved:    [{load2[0]}, {load2[1]}, {load2[2]}]")
+
+  # --- Verify ---
+  var trainOk: bool = true
+
+  # Check predictions changed from pre-train
+  var preDelta1: double = pre1[1] - post1[1]
+  if preDelta1 < 0.0 =>
+    preDelta1 = -preDelta1
+  if preDelta1 < 0.01 =>
+    println("  FAIL: overloaded predictions unchanged after training")
+    trainOk = false
+
+  # Check overloaded predicts speed_down (idx 1)
+  if post1[1] <= post1[0] || post1[1] <= post1[2] =>
+    println("  FAIL: overloaded should predict speed_down (idx 1)")
+    trainOk = false
+
+  # Check starved predicts speed_up (idx 0)
+  if post2[0] <= post2[1] || post2[0] <= post2[2] =>
+    println("  FAIL: starved should predict speed_up (idx 0)")
+    trainOk = false
+
+  # Check save/load preserved predictions
+  var loadDelta: double = load1[1] - post1[1]
+  if loadDelta < 0.0 =>
+    loadDelta = -loadDelta
+  if loadDelta > 0.01 =>
+    println($"  FAIL: save/load changed predictions (delta={loadDelta})")
+    trainOk = false
+
+  if trainOk =>
+    println("  ALL PASS")
+  else =>
+    println("  SOME TESTS FAILED")
