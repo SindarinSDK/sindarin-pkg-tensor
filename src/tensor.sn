@@ -56,6 +56,9 @@ native struct Tensor as ref =>
   fn matmul(other: Tensor): Tensor =>
     return sn_tensor_matmul(self, other)
 
+  fn gnnMatmul(weight: Tensor): Tensor =>
+    return sn_tensor_gnn_matmul(self, weight)
+
   fn add(other: Tensor): Tensor =>
     return sn_tensor_add(self, other)
 
@@ -97,6 +100,9 @@ native struct Tensor as ref =>
   fn argmax(dim: int): int =>
     return sn_tensor_argmax(self, dim)
 
+  fn norm(): double =>
+    return sn_tensor_norm(self)
+
   fn crossEntropy(targets: Tensor): Tensor =>
     return sn_tensor_cross_entropy(self, targets)
 
@@ -120,8 +126,10 @@ native fn sn_tensor_scale(t: Tensor, scalar: double): Tensor
 native fn sn_tensor_relu(t: Tensor): Tensor
 native fn sn_tensor_softmax(t: Tensor, dim: int): Tensor
 native fn sn_tensor_dropout(t: Tensor, rate: double, training: bool): Tensor
+native fn sn_tensor_gnn_matmul(features: Tensor, weight: Tensor): Tensor
 native fn sn_tensor_batch_norm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
 native fn sn_tensor_layer_norm(t: Tensor, weight: Tensor, bias: Tensor): Tensor
+native fn sn_tensor_norm(t: Tensor): double
 native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
 native fn sn_tensor_argmax(t: Tensor, dim: int): int
 native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor

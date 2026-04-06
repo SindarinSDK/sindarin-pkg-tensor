@@ -62,7 +62,7 @@ struct GnnLayer =>
 
   static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
     var layer: GnnLayer = GnnLayer {
-      weight: Tensor.zeros(inputDim, outputDim),
+      weight: Tensor.zeros(outputDim, inputDim),
       bias: Tensor.zeros(1, outputDim),
       attWeight: Tensor.zeros(1, 2 * outputDim),
       inputDim: inputDim,
@@ -83,7 +83,7 @@ struct GnnLayer =>
     return x
 
   fn gcnForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
-    var h: Tensor = x.matmul(self.weight).add(self.bias)
+    var h: Tensor = x.gnnMatmul(self.weight).add(self.bias)
     h = h.aggregate(edgeIndex, edgeWeight, "sum_normalized")
     h = h.relu().dropout(self.dropoutRate, training)
     if self.inputDim == self.outputDim =>
@@ -99,7 +99,7 @@ struct GnnLayer =>
     return h
 
   fn gatForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
-    var h: Tensor = x.matmul(self.weight).add(self.bias)
+    var h: Tensor = x.gnnMatmul(self.weight).add(self.bias)
     h = h.attentionAggregate(edgeIndex, edgeWeight, self.attWeight)
     h = h.relu().dropout(self.dropoutRate, training)
     if self.inputDim == self.outputDim =>
@@ -133,7 +133,7 @@ struct Gnn =>
     var na: int = config.numActions
 
     var w1: Tensor = Tensor.zeros(hd, hd)
-    var w2: Tensor = Tensor.zeros(hd, na)
+    var w2: Tensor = Tensor.zeros(na, hd)
     w1.initKaiming()
     w2.initKaiming()
     var b1: Tensor = Tensor.zeros(1, hd)
@@ -157,9 +157,9 @@ struct Gnn =>
     var embedding: Tensor = h.meanPool(graph.batchIndex)
 
     # Classification head
-    var c: Tensor = embedding.matmul(self.classifierW1).add(self.classifierB1).relu()
+    var c: Tensor = embedding.gnnMatmul(self.classifierW1).add(self.classifierB1).relu()
     c = c.dropout(self.config.dropoutRate, training)
-    var logits: Tensor = c.matmul(self.classifierW2).add(self.classifierB2)
+    var logits: Tensor = c.gnnMatmul(self.classifierW2).add(self.classifierB2)
     var probs: Tensor = logits.softmax(1)
 
     return GnnOutput {

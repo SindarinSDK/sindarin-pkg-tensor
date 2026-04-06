@@ -354,11 +354,14 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
         struct ggml_tensor *gt = g_record_map[i];
         if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
             TPool *s = &g_pool[i];
+            float before = s->data[0];
             if (gt->buffer) {
                 ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
             } else if (gt->data) {
                 memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
             }
+            fprintf(stderr, "readback param pool=%d: before=%.6f after=%.6f buf=%p data=%p\n",
+                    i, before, s->data[0], (void*)gt->buffer, (void*)gt->data);
         }
     }
 
@@ -416,6 +419,53 @@ SnArray *sn_tensor_shape(RtTensor *rt)
  * Arithmetic — via ggml graphs
  * ====================================================================== */
 
+/* GNN-specific matmul: features × weight where weight is stored transposed
+ * (ne[0]=inputDim matches features ne[0]=inputDim). No transpose needed in
+ * the graph — gradients flow directly to the weight PARAM tensor.
+ *
+ * features: (inputDim, numNodes)   weight: (inputDim, outputDim)
+ * result:   (outputDim, numNodes) */
+RtTensor *sn_tensor_gnn_matmul(RtTensor *features, RtTensor *weight)
+{
+    TPool *pf = unwrap(features);
+    TPool *pw = unwrap(weight);
+    int64_t inputDim  = pf->ne[0];  /* contraction dim */
+    int64_t numNodes  = pf->ne[1];
+    int64_t outputDim = pw->ne[1];
+
+    if (g_record_mode) {
+        /* ggml_mul_mat(a, b) dots over ne[0]: both have ne[0]=inputDim.
+         * result: (a.ne[1]=outputDim, b.ne[1]=numNodes) */
+        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx,
+            rec_tensor(weight), rec_tensor(features));
+        ggml_set_name(result, "gnn_matmul");
+        return rec_wrap(result, outputDim, numNodes);
+    }
+
+    /* Non-record: ggml graph for single op */
+    struct ggml_context *ctx = micro_ctx_init();
+    struct ggml_tensor *tf = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inputDim, numNodes);
+    struct ggml_tensor *tw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, inputDim, outputDim);
+    ggml_set_input(tf);
+    ggml_set_input(tw);
+    track_input(tf, pf->data);
+    track_input(tw, pw->data);
+
+    struct ggml_tensor *result = ggml_mul_mat(ctx, tw, tf);
+    ggml_set_output(result);
+
+    struct ggml_cgraph *graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, result);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
+
+    int idx = pool_alloc(outputDim, numNodes, 2);
+    ggml_backend_tensor_get(result, g_pool[idx].data, 0, (size_t)(outputDim * numNodes) * sizeof(float));
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    return wrap_pool(idx);
+}
+
 RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
 {
     TPool *pa = unwrap(a);
@@ -428,25 +478,21 @@ RtTensor *sn_tensor_matmul(RtTensor *a, RtTensor *b)
          *
          * ggml_mul_mat(x, y) dots over ne0: result[i0,i1] = sum_k x[k,i0]*y[k,i1]
          * Need ne0_x == ne0_y == K (the contraction dim).
-         * A already has ne0=K. B has ne0=N, so we need B transposed: B^T (K, N).
-         *
-         * AVOID ggml_transpose as a graph op — its backward (repeat_back) hits
-         * non-contiguous stride assertions in ggml-cpu. Instead, create a
-         * pre-transposed input tensor with the data rearranged on the host. */
+         * A already has ne0=K. B has ne0=N, so transpose B in the graph.
+         * The RealOrko/ggml fork fixes repeat_back contiguous assertions
+         * so ggml_transpose backward is safe. */
+        /* Generic matmul: pre-transpose B on host for ggml_mul_mat.
+         * For GNN weight matmuls, use sn_tensor_gnn_matmul instead
+         * which stores weights in the correct layout for direct ggml_mul_mat. */
         int bt_pool = pool_alloc(K, N, 2);
         TPool *bt_s = &g_pool[bt_pool];
-        /* Transpose B's data: B[col][row] -> B^T[row][col]
-         * B pool layout: ne0=N cols, ne1=K rows, data[row*N + col]
-         * B^T layout:    ne0=K cols, ne1=N rows, data[row*K + col] */
         for (int64_t r = 0; r < K; r++)
             for (int64_t c = 0; c < N; c++)
                 bt_s->data[c * K + r] = pb->data[r * N + c];
-
         struct ggml_tensor *bt_gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, K, N);
-        ggml_set_name(bt_gt, "weight_T");
+        ggml_set_name(bt_gt, "matmul_B_T");
         ggml_set_input(bt_gt);
         g_record_map[bt_pool] = bt_gt;
-
         struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, bt_gt, rec_tensor(a));
         ggml_set_name(result, "matmul_result");
         return rec_wrap(result, N, M);
@@ -853,6 +899,15 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
 
     free(count);
     return wrap_pool(idx);
+}
+
+double sn_tensor_norm(RtTensor *t)
+{
+    TPool *pt = unwrap(t);
+    float sum_sq = 0.0f;
+    for (int64_t i = 0; i < pt->n_elem; i++)
+        sum_sq += pt->data[i] * pt->data[i];
+    return (double)sqrtf(sum_sq);
 }
 
 long long sn_tensor_argmax(RtTensor *t, long long dim)
@@ -1367,17 +1422,26 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     struct ggml_cgraph *gf = ggml_new_graph_custom(ctx, 16384, true);
     ggml_build_forward_expand(gf, loss);
 
-    /* --- Collect param tensors --- */
+    /* --- Collect param tensors that are actual graph nodes ---
+     * Only include tensors IN the forward graph. Original weight tensors
+     * registered via sn_graph_param may not be graph nodes (matmul uses
+     * pre-transposed copies instead). */
     int n_params_in_graph = 0;
     struct ggml_tensor *param_tensors[TRAIN_MAX_PARAMS];
     int param_pool_indices[TRAIN_MAX_PARAMS];
-    for (int i = 0; i < g_pool_count; i++) {
-        struct ggml_tensor *gt = g_record_map[i];
-        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
-            if (n_params_in_graph < TRAIN_MAX_PARAMS) {
-                param_tensors[n_params_in_graph] = gt;
-                param_pool_indices[n_params_in_graph] = i;
-                n_params_in_graph++;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        struct ggml_tensor *node = ggml_graph_node(gf, i);
+        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            /* Find the pool index for this graph node */
+            for (int pi = 0; pi < g_pool_count; pi++) {
+                if (g_record_map[pi] == node) {
+                    if (n_params_in_graph < TRAIN_MAX_PARAMS) {
+                        param_tensors[n_params_in_graph] = node;
+                        param_pool_indices[n_params_in_graph] = pi;
+                        n_params_in_graph++;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -1391,44 +1455,51 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
      * Pre-allocate grad_accs for PARAM tensors — ggml_build_backward_expand
      * only auto-creates them for LOSS tensors, not PARAMs.
      * The grad_accs array is indexed by forward graph node index. */
-    struct ggml_cgraph *gb = ggml_graph_dup(ctx, gf, true);
+    /* Build backward directly on the forward graph — no ggml_graph_dup.
+     * The dup was originally needed to avoid ggml_transpose backward issues,
+     * but we pre-transpose weights on the host now, so it's not needed.
+     * Skipping dup avoids broken gradient chains from disconnected tensors. */
+    struct ggml_cgraph *gb = gf;
 
+    /* Allocate grad accumulators for the full graph (nodes + leafs).
+     * ggml_build_backward_expand indexes grad_accs by graph position.
+     * PARAM tensors are leafs — without their entries the gradient
+     * chain to parameters is broken. */
+    int graph_sz = ggml_graph_size(gb);
     int n_fwd_nodes = ggml_graph_n_nodes(gb);
     struct ggml_tensor **grad_accs_arr = (struct ggml_tensor **)calloc(
-        (size_t)n_fwd_nodes, sizeof(struct ggml_tensor *));
+        (size_t)graph_sz, sizeof(struct ggml_tensor *));
 
     for (int i = 0; i < n_fwd_nodes; i++) {
         struct ggml_tensor *node = ggml_graph_node(gb, i);
-        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-            struct ggml_tensor *ga = ggml_dup_tensor(g_param_ctx, node);
-            ggml_set_name(ga, "grad_acc");
-            ggml_set_input(ga);
-            grad_accs_arr[i] = ga;
-        }
+        struct ggml_tensor *ga = ggml_dup_tensor(g_param_ctx, node);
+        ggml_set_name(ga, "grad_acc");
+        ggml_set_input(ga);
+        grad_accs_arr[i] = ga;
     }
 
+    int pre_bwd_nodes = ggml_graph_n_nodes(gb);
     ggml_build_backward_expand(ctx, gb, grad_accs_arr);
+    int post_bwd_nodes = ggml_graph_n_nodes(gb);
     free(grad_accs_arr);
 
-    /* Map duplicated param tensors back to pool indices so we can
-     * read updated weights after compute. ggml_graph_dup created new
-     * tensor objects — find them by matching the PARAM flag. */
-    n_params_in_graph = 0;
-    for (int i = 0; i < ggml_graph_n_nodes(gb); i++) {
-        struct ggml_tensor *node = ggml_graph_node(gb, i);
-        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-            if (n_params_in_graph < TRAIN_MAX_PARAMS) {
-                param_tensors[n_params_in_graph] = node;
-                /* Find matching pool index by comparing against original forward graph */
-                struct ggml_tensor *orig = ggml_graph_node(gf, i);
-                for (int pi = 0; pi < g_pool_count; pi++) {
-                    if (g_record_map[pi] == orig) {
-                        param_pool_indices[n_params_in_graph] = pi;
-                        break;
-                    }
-                }
-                n_params_in_graph++;
-            }
+    /* Param tensors and pool indices are already collected from the
+     * forward graph (which IS the backward graph now — no dup). */
+
+    /* --- Debug: print param count and grad status --- */
+    static int debug_step = 0;
+    debug_step++;
+    if (debug_step <= 1) {
+        fprintf(stderr, "train_step[%d]: %d params in graph, fwd nodes=%d, graph_size=%d, bwd added %d nodes\n",
+                debug_step, n_params_in_graph, n_fwd_nodes, graph_sz,
+                post_bwd_nodes - pre_bwd_nodes);
+        for (int p = 0; p < n_params_in_graph; p++) {
+            fprintf(stderr, "  param[%d] pool=%d name='%s' op=%d shape=[%lld,%lld]\n",
+                    p, param_pool_indices[p],
+                    ggml_get_name(param_tensors[p]),
+                    param_tensors[p]->op,
+                    (long long)param_tensors[p]->ne[0],
+                    (long long)param_tensors[p]->ne[1]);
         }
     }
 
@@ -1479,8 +1550,12 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
         /* Get gradient accumulator from the backward graph */
         struct ggml_tensor *grad = ggml_graph_get_grad_acc(gb, pt);
         if (!grad) {
-            fprintf(stderr, "train_step: no gradient for param %d\n", p);
+            fprintf(stderr, "train_step: no gradient for param %d (pool=%d)\n", p, pidx);
             continue;
+        }
+        if (debug_step <= 3) {
+            fprintf(stderr, "  param[%d] pool=%d: has grad, shape=[%lld,%lld]\n",
+                    p, pidx, (long long)pt->ne[0], (long long)pt->ne[1]);
         }
 
         /* Create m tensor (first moment) */
@@ -1515,15 +1590,11 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
      * Use ggml_backend_sched to handle ALL allocation (both param_ctx and
      * compute_ctx tensors). This matches how ggml_opt_fit works internally.
      * Pre-allocating param_ctx separately can cause stride mismatches. */
-    ggml_backend_t backends[] = { g_backend };
-    ggml_backend_sched_t sched = ggml_backend_sched_new(
-        backends, NULL, 1, 16384, false, false);
-
-    /* Allocate param_ctx tensors first (they're referenced by the graph) */
-    ggml_backend_buffer_t param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
-
-    /* Allocate the computation graph (compute_ctx tensors) */
-    ggml_backend_sched_alloc_graph(sched, gb);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+    ggml_gallocr_t galloc = ggml_gallocr_new(buft);
+    ggml_gallocr_reserve(galloc, gb);
+    ggml_gallocr_alloc_graph(galloc, gb);
+    ggml_backend_buffer_t param_buf = NULL;
 
     /* Upload all data from pool to backend tensors */
     for (int i = 0; i < g_pool_count; i++) {
@@ -1539,20 +1610,80 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
     /* Reset gradient accumulators to 0; set loss gradient to 1 */
     ggml_graph_reset(gb);
 
-    ggml_backend_sched_graph_compute(sched, gb);
+    if (debug_step <= 1) {
+        /* Verify loss gradient was seeded */
+        int n_gb = ggml_graph_n_nodes(gb);
+        for (int i = 0; i < n_gb; i++) {
+            struct ggml_tensor *node = ggml_graph_node(gb, i);
+            if (node->flags & GGML_TENSOR_FLAG_LOSS) {
+                fprintf(stderr, "  loss node found at index %d, flags=0x%x\n", i, node->flags);
+                struct ggml_tensor *ga = ggml_graph_get_grad_acc(gb, node);
+                if (ga && ga->buffer) {
+                    float gval = 0;
+                    ggml_backend_tensor_get(ga, &gval, 0, sizeof(float));
+                    fprintf(stderr, "  loss grad_acc[0] = %.6f (should be 1.0)\n", gval);
+                } else {
+                    fprintf(stderr, "  loss grad_acc: %s\n", ga ? "no buffer" : "NULL");
+                }
+            }
+        }
+    }
+
+    ggml_backend_graph_compute(g_backend, gb);
 
     /* --- Read loss --- */
     float loss_val = 0.0f;
     ggml_backend_tensor_get(loss, &loss_val, 0, sizeof(float));
+
+    /* --- Debug: check gradient flow through the graph --- */
+    if (debug_step <= 1) {
+        int n_gb = ggml_graph_n_nodes(gb);
+        int nonzero_grads = 0;
+        for (int i = 0; i < n_fwd_nodes; i++) {
+            struct ggml_tensor *node = ggml_graph_node(gb, i);
+            float gval = 0;
+            if (grad_accs_arr[i] && grad_accs_arr[i]->buffer) {
+                ggml_backend_tensor_get(grad_accs_arr[i], &gval, 0, sizeof(float));
+            }
+            if (gval != 0.0f) {
+                nonzero_grads++;
+            }
+            /* Print ALL forward nodes to see graph structure */
+            fprintf(stderr, "  fwd[%d] op=%d name='%s' flags=0x%x grad[0]=%.6f\n",
+                    i, node->op, ggml_get_name(node), node->flags, gval);
+        }
+        fprintf(stderr, "  total fwd nodes with nonzero grads: %d / %d\n", nonzero_grads, n_fwd_nodes);
+    }
+    if (debug_step <= 3) {
+        for (int p = 0; p < n_params_in_graph && p < 4; p++) {
+            struct ggml_tensor *pt = param_tensors[p];
+            struct ggml_tensor *grad = ggml_graph_get_grad_acc(gb, pt);
+            if (grad && grad->buffer) {
+                float grad_sample[4] = {0};
+                size_t read_bytes = sizeof(float) * 4;
+                if (read_bytes > ggml_nbytes(grad)) read_bytes = ggml_nbytes(grad);
+                ggml_backend_tensor_get(grad, grad_sample, 0, read_bytes);
+                fprintf(stderr, "  param[%d] grad: [%.6f, %.6f, %.6f, %.6f]\n",
+                        p, grad_sample[0], grad_sample[1], grad_sample[2], grad_sample[3]);
+            } else {
+                fprintf(stderr, "  param[%d] grad: NO BUFFER\n", p);
+            }
+        }
+    }
 
     /* --- Read back updated parameters to pool --- */
     for (int p = 0; p < n_params_in_graph; p++) {
         int pidx = param_pool_indices[p];
         struct ggml_tensor *pt = param_tensors[p];
         TPool *s = &g_pool[pidx];
+        float before_val = s->data[0];
         if (pt->buffer) {
             ggml_backend_tensor_get(pt, s->data, 0,
                                     (size_t)s->n_elem * sizeof(float));
+        }
+        if (debug_step <= 3 && p < 4) {
+            fprintf(stderr, "  param[%d] readback: before=%.6f after=%.6f delta=%.9f\n",
+                    p, before_val, s->data[0], s->data[0] - before_val);
         }
     }
 
@@ -1577,8 +1708,7 @@ double sn_train_step(RtTensor *logits_rt, RtTensor *input_rt,
         }
     }
 
-    ggml_backend_sched_free(sched);
-    if (param_buf) ggml_backend_buffer_free(param_buf);
+    ggml_gallocr_free(galloc);
 
     return (double)loss_val;
 }

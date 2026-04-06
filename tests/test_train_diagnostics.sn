@@ -1,0 +1,151 @@
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# Training diagnostics: traces weight norms, loss, and predictions per epoch.
+# Shows exactly what happens inside the GNN during training.
+# ===========================================================================
+
+fn normalize(raw: double[], mins: double[], maxs: double[]): double[] =>
+  var result: double[] = {}
+  for var i: int = 0; i < len(raw); i++ =>
+    var range: double = maxs[i] - mins[i]
+    if range > 0.001 =>
+      result.push((raw[i] - mins[i]) / range)
+    else =>
+      result.push(0.5)
+  return result
+
+fn main(): void =>
+  println("=== GNN Training Diagnostics ===")
+  println("")
+
+  var config: GnnConfig = {
+    inputDim: 24, hiddenDim: 32, numActions: 3,
+    numLayers: 3, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+
+  var overloadedRaw: double[] = {42.0, 17.6, 195.0, 46.0, 5.5, 68.0, 36.0, 126.0, 1.51, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 146.0, 27.0, 14.0}
+  var starvedRaw: double[] = {18.0, 62.0, 70.0, 28.0, 12.0, 38.0, 20.0, 15.0, 1.48, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 32.0, 18.0, 9.0}
+
+  var mins: double[] = {}
+  var maxs: double[] = {}
+  for var i: int = 0; i < len(overloadedRaw); i++ =>
+    var mn: double = overloadedRaw[i]
+    var mx: double = overloadedRaw[i]
+    if starvedRaw[i] < mn =>
+      mn = starvedRaw[i]
+    if starvedRaw[i] > mx =>
+      mx = starvedRaw[i]
+    mins.push(mn)
+    maxs.push(mx)
+  var overloaded: double[] = normalize(overloadedRaw, mins, maxs)
+  var starved: double[] = normalize(starvedRaw, mins, maxs)
+
+  var g1: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles(overloaded, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+  var g2: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles(starved, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+
+  # Print initial state
+  println("--- Initial weight norms ---")
+  var params: Tensor[] = model.parameters()
+  var paramNames: str[] = {"L0.W", "L0.b", "L0.att", "L1.W", "L1.b", "L1.att", "L2.W", "L2.b", "L2.att", "clf.W1", "clf.B1", "clf.W2", "clf.B2"}
+  for var i: int = 0; i < len(params); i++ =>
+    var name: str = "?"
+    if i < len(paramNames) =>
+      name = paramNames[i]
+    var s: int[] = params[i].shape()
+    println($"  {name}: norm={params[i].norm()}, shape=[{s[0]},{s[1]}]")
+  println("")
+
+  println("--- Initial predictions ---")
+  var p1: double[] = model.forward(g1, false).probs.toDoubles()
+  var p2: double[] = model.forward(g2, false).probs.toDoubles()
+  println($"  overloaded: [{p1[0]}, {p1[1]}, {p1[2]}]")
+  println($"  starved:    [{p2[0]}, {p2[1]}, {p2[2]}]")
+  println("")
+
+  # Training
+  var batchFeatures: double[] = {}
+  for var i: int = 0; i < len(overloaded); i++ =>
+    batchFeatures.push(overloaded[i])
+  for var i: int = 0; i < len(starved); i++ =>
+    batchFeatures.push(starved[i])
+  var batchGraph: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles(batchFeatures, 2, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 1.0, 0.0, 1.0}, 2, 2),
+    edgeWeight: Tensor.fromDoubles({1.0, 1.0}, 1, 2),
+    batchIndex: Tensor.fromDoubles({0.0, 1.0}, 2, 1),
+    numNodes: 2, numEdges: 2, featureDim: 24
+  }
+  var labels: double[] = {0.0, 1.0, 0.0, 1.0, 0.0, 0.0}
+  var weights: double[] = {1.0, 1.0}
+
+  println("--- Training (1000 epochs) ---")
+  println("epoch | loss    | L0.W norm | L1.W norm | L2.W norm | clf.W2 norm | overloaded_sd | starved_su")
+  sn_train_init(0.01, 0.0)
+  for var epoch: int = 0; epoch < 1000; epoch++ =>
+    sn_graph_begin()
+    var ep: Tensor[] = model.parameters()
+    for var p: int = 0; p < len(ep); p++ =>
+      sn_graph_param(ep[p])
+    var eInput: Tensor = sn_graph_input(2, 24)
+    var eGraph: GraphTensors = {
+      nodeFeatures: eInput,
+      edgeIndex: batchGraph.edgeIndex,
+      edgeWeight: batchGraph.edgeWeight,
+      batchIndex: batchGraph.batchIndex,
+      numNodes: 2, numEdges: 2, featureDim: 24
+    }
+    var eOutput: GnnOutput = model.forward(eGraph, true)
+    var loss: double = sn_train_step(eOutput.logits, eInput, batchFeatures, labels, weights, 2)
+    sn_graph_end()
+
+    if epoch == 0 || epoch == 9 || epoch == 49 || epoch == 99 || epoch == 199 || epoch == 499 || epoch == 999 =>
+      # Get current weight norms
+      var curParams: Tensor[] = model.parameters()
+      var l0w: double = curParams[0].norm()
+      var l1w: double = curParams[3].norm()
+      var l2w: double = curParams[6].norm()
+      var cw2: double = curParams[11].norm()
+
+      # Get current predictions
+      var cp1: double[] = model.forward(g1, false).probs.toDoubles()
+      var cp2: double[] = model.forward(g2, false).probs.toDoubles()
+      var osd: double = cp1[1]
+      var ssu: double = cp2[0]
+
+      println($"{epoch + 1}     | {loss} | {l0w} | {l1w} | {l2w} | {cw2} | {osd} | {ssu}")
+
+  sn_train_finish()
+  println("")
+
+  # Final predictions
+  println("--- Final predictions ---")
+  var fp1: double[] = model.forward(g1, false).probs.toDoubles()
+  var fp2: double[] = model.forward(g2, false).probs.toDoubles()
+  println($"  overloaded: [{fp1[0]}, {fp1[1]}, {fp1[2]}]  want speed_down (index 1)")
+  println($"  starved:    [{fp2[0]}, {fp2[1]}, {fp2[2]}]  want speed_up (index 0)")
+
+  var ok1: bool = fp1[1] > fp1[0] && fp1[1] > fp1[2]
+  var ok2: bool = fp2[0] > fp2[1] && fp2[0] > fp2[2]
+  if ok1 =>
+    println("  overloaded: CORRECT")
+  else =>
+    println("  overloaded: WRONG")
+  if ok2 =>
+    println("  starved: CORRECT")
+  else =>
+    println("  starved: WRONG")

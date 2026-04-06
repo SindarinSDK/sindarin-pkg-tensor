@@ -1,0 +1,34 @@
+import "../src/tensor"
+import "../src/gnn"
+
+fn main(): void =>
+  println("=== Test Gnn.train (ggml_opt_fit path) ===")
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.create(config)
+
+  var params: Tensor[] = model.parameters()
+  println($"  param[0] norm before: {params[0].norm()}")
+
+  var data: double[] = {1.0, 0.0, 0.0, 1.0}
+  var labels: double[] = {1.0, 0.0, 0.0, 1.0}
+  var gt: GraphTensors = {
+    nodeFeatures: Tensor.fromDoubles({0.0, 0.0}, 1, 2),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({0.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 2
+  }
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(data, labels, 2, 1, gt, opt, 10, 0.0)
+  println($"  loss: {result.loss}")
+
+  var params2: Tensor[] = model.parameters()
+  println($"  param[0] norm after: {params2[0].norm()}")
+
+  var delta: double = params[0].norm() - params2[0].norm()
+  if delta < 0.0 =>
+    delta = -delta
+  if delta > 0.001 =>
+    println("  WEIGHTS CHANGED")
+  else =>
+    println("  WEIGHTS DID NOT CHANGE")
