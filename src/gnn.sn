@@ -65,13 +65,16 @@ struct GnnLayer =>
   dropoutRate: double
 
   static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
+    var onesData: double[] = {}
+    for var i: int = 0; i < outputDim; i++ =>
+      onesData.push(1.0)
     var layer: GnnLayer = GnnLayer {
       weight: Tensor.zeros(inputDim, outputDim),
       bias: Tensor.zeros(1, outputDim),
-      bnWeight: Tensor.zeros(1, outputDim),
+      bnWeight: Tensor.fromDoubles(onesData, 1, outputDim),
       bnBias: Tensor.zeros(1, outputDim),
       bnMean: Tensor.zeros(1, outputDim),
-      bnVar: Tensor.zeros(1, outputDim),
+      bnVar: Tensor.fromDoubles(onesData, 1, outputDim),
       attWeight: Tensor.zeros(1, 2 * outputDim),
       inputDim: inputDim,
       outputDim: outputDim,
