@@ -31,7 +31,7 @@ fn main(): void =>
   }
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
   var result: TrainResult = model.train(data, labels, 4, 1, gt, opt, 50, 0.0)
-  println($"  loss: {result.loss}")
+  println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")
 
   var params2: Tensor[] = model.parameters()
   println("  norms after:")

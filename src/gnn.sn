@@ -235,15 +235,18 @@ struct Gnn =>
     }
     var output: GnnOutput = self.forward(recordGraph, true)
 
-    # Run ggml_opt_fit on the captured graph — pass logits (pre-softmax),
+    # Run ggml_opt on the captured graph — pass logits (pre-softmax),
     # NOT probs, because ggml cross_entropy_loss applies softmax internally
-    var loss: double = sn_graph_train(output.logits, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
+    sn_graph_train(output.logits, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
+
+    var trainLoss: double = sn_graph_train_loss()
+    var trainAccuracy: double = sn_graph_train_accuracy()
 
     # Exit graph mode — parameters updated in pool
     sn_graph_end()
 
     return TrainResult {
-      loss: loss,
-      accuracy: 0.0,
+      loss: trainLoss,
+      accuracy: trainAccuracy,
       epochs: epochs
     }

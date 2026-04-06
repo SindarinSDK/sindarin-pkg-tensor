@@ -150,6 +150,9 @@ native fn sn_graph_end(): void
 native fn sn_graph_input(rows: int, cols: int): Tensor
 native fn sn_graph_param(t: Tensor): Tensor
 native fn sn_graph_train(output: Tensor, input: Tensor, data: double[], labels: double[], nsamples: int, epochs: int, batchSize: int, valSplit: double, lossType: str, optimizer: str, lr: double, wd: double): double
+native fn sn_graph_train_loss(): double
+native fn sn_graph_train_accuracy(): double
+native fn sn_graph_train_ndata(): int
 
 # ---------------------------------------------------------------------------
 # Optimizer configuration

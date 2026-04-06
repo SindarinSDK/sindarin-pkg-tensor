@@ -267,6 +267,11 @@ RtTensor *sn_graph_param(RtTensor *rt) {
 /* Custom optimizer params callback — returns user-configured lr/wd */
 static struct ggml_opt_optimizer_params g_opt_params;
 
+/* Cached training stats from last sn_graph_train call */
+static double g_train_loss     = 0.0;
+static double g_train_accuracy = 0.0;
+static long long g_train_ndata = 0;
+
 static struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata) {
     (void)userdata;
     return g_opt_params;
@@ -337,16 +342,62 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
         }
     }
 
-    /* g_compute_ctx is no_alloc — ggml_opt manages its allocations.
-     * inputs/outputs are in g_param_ctx (backend-allocated). */
-    ggml_opt_fit(sched, g_compute_ctx, inputs, outputs,
-                 dataset, loss_type, opt_type,
-                 sn_get_opt_params,
-                 nepochs, nbatch, (float)val_split, false);
+    /* Use lower-level ggml_opt API instead of ggml_opt_fit so we can
+     * capture the final training loss (ggml_opt_fit discards it). */
+    int64_t nbatch_physical = inputs->ne[1];
+    int64_t opt_period = nbatch / nbatch_physical;
+    if (opt_period < 1) opt_period = 1;
+    int64_t nbatches_logical = nsamples / nbatch;
+    int64_t ibatch_split = (int64_t)((1.0f - (float)val_split) * nbatches_logical) * opt_period;
+    int64_t idata_split = ibatch_split * nbatch_physical;
 
-    /* Read back trained parameters to pool.
-     * After ggml_opt_fit, parameter data is in backend buffers.
-     * Use ggml_backend_tensor_get if buffer exists, else memcpy from host. */
+    int64_t epoch_counter = 1;
+    struct ggml_opt_params opt_params_s = ggml_opt_default_params(sched, loss_type);
+    opt_params_s.ctx_compute     = g_compute_ctx;
+    opt_params_s.inputs          = inputs;
+    opt_params_s.outputs         = outputs;
+    opt_params_s.opt_period      = opt_period;
+    opt_params_s.get_opt_pars    = sn_get_opt_params;
+    opt_params_s.get_opt_pars_ud = &epoch_counter;
+    opt_params_s.optimizer       = opt_type;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params_s);
+
+    if (nbatch < nsamples) {
+        ggml_opt_dataset_shuffle(opt_ctx, dataset, -1);
+    }
+
+    ggml_opt_result_t result_train = ggml_opt_result_init();
+    ggml_opt_result_t result_val   = ggml_opt_result_init();
+
+    for (; epoch_counter <= nepochs; ++epoch_counter) {
+        if (nbatch < idata_split) {
+            ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+        }
+        ggml_opt_result_reset(result_train);
+        ggml_opt_result_reset(result_val);
+        fprintf(stderr, "ggml_opt_fit: epoch %04lld/%04lld:\n",
+                (long long)epoch_counter, (long long)nepochs);
+        ggml_opt_epoch(opt_ctx, dataset, result_train, result_val,
+                       idata_split,
+                       ggml_opt_epoch_callback_progress_bar,
+                       ggml_opt_epoch_callback_progress_bar);
+        fprintf(stderr, "\n");
+    }
+
+    /* Extract final training stats and cache for accessor functions */
+    ggml_opt_result_loss(result_train, &g_train_loss, NULL);
+    ggml_opt_result_accuracy(result_train, &g_train_accuracy, NULL);
+    {
+        int64_t nd = 0;
+        ggml_opt_result_ndata(result_train, &nd);
+        g_train_ndata = (long long)nd;
+    }
+
+    ggml_opt_free(opt_ctx);
+    ggml_opt_result_free(result_train);
+    ggml_opt_result_free(result_val);
+
+    /* Read back trained parameters to pool */
     for (int i = 0; i < g_pool_count; i++) {
         struct ggml_tensor *gt = g_record_map[i];
         if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
@@ -365,8 +416,12 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
     ggml_backend_sched_free(sched);
     ggml_opt_dataset_free(dataset);
     if (param_buf) ggml_backend_buffer_free(param_buf);
-    return 0.0;
+    return g_train_loss;
 }
+
+double sn_graph_train_loss(void)     { return g_train_loss; }
+double sn_graph_train_accuracy(void) { return g_train_accuracy; }
+long long sn_graph_train_ndata(void) { return g_train_ndata; }
 
 /* ======================================================================
  * Creation
