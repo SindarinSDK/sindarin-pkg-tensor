@@ -3,32 +3,50 @@ import "../src/gnn"
 
 fn main(): void =>
   println("=== Test Gnn.train (ggml_opt_fit path) ===")
+
+  # Simple 1-layer GCN: inputDim=2, hiddenDim=4, numActions=2
   var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
   var model: Gnn = Gnn.create(config)
 
   var params: Tensor[] = model.parameters()
-  println($"  param[0] norm before: {params[0].norm()}")
+  var normsBefore: double[] = {}
+  println("  norms before:")
+  for var i: int = 0; i < len(params); i++ =>
+    var n: double = params[i].norm()
+    normsBefore.push(n)
+    var s: int[] = params[i].shape()
+    println($"    param[{i}] norm={n} shape=[{s[0]},{s[1]}]")
 
-  var data: double[] = {1.0, 0.0, 0.0, 1.0}
-  var labels: double[] = {1.0, 0.0, 0.0, 1.0}
+  # 4 training samples: 2 features each, 2 classes (one-hot labels)
+  var data: double[] = {1.0, 0.0, 0.0, 1.0, 0.8, 0.2, 0.2, 0.8}
+  var labels: double[] = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+
+  # Graph topology for recording — self-loop with weight 1.0
   var gt: GraphTensors = {
-    nodeFeatures: Tensor.fromDoubles({0.0, 0.0}, 1, 2),
+    nodeFeatures: Tensor.fromDoubles({0.5, 0.5}, 1, 2),
     edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
-    edgeWeight: Tensor.fromDoubles({0.0}, 1, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
     batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
     numNodes: 1, numEdges: 1, featureDim: 2
   }
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
-  var result: TrainResult = model.train(data, labels, 2, 1, gt, opt, 10, 0.0)
+  var result: TrainResult = model.train(data, labels, 4, 1, gt, opt, 50, 0.0)
   println($"  loss: {result.loss}")
 
   var params2: Tensor[] = model.parameters()
-  println($"  param[0] norm after: {params2[0].norm()}")
+  println("  norms after:")
+  var anyChanged: bool = false
+  for var i: int = 0; i < len(params2); i++ =>
+    var n: double = params2[i].norm()
+    var s: int[] = params2[i].shape()
+    var delta: double = n - normsBefore[i]
+    if delta < 0.0 =>
+      delta = -delta
+    println($"    param[{i}] norm={n} delta={delta} shape=[{s[0]},{s[1]}]")
+    if delta > 0.0001 =>
+      anyChanged = true
 
-  var delta: double = params[0].norm() - params2[0].norm()
-  if delta < 0.0 =>
-    delta = -delta
-  if delta > 0.001 =>
+  if anyChanged =>
     println("  WEIGHTS CHANGED")
   else =>
     println("  WEIGHTS DID NOT CHANGE")
