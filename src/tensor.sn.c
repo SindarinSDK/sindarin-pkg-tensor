@@ -709,8 +709,8 @@ RtTensor *sn_tensor_layer_norm(RtTensor *t, RtTensor *weight, RtTensor *bias)
         struct ggml_tensor *gb = rec_tensor(bias);
         struct ggml_context *ctx = g_record_ctx;
 
-        /* ggml_norm: normalizes along ne[0] (features) per row — exactly layernorm */
-        struct ggml_tensor *normed = ggml_norm(ctx, gt, eps);
+        /* ggml_rms_norm: normalizes along ne[0] per row — has backward pass support */
+        struct ggml_tensor *normed = ggml_rms_norm(ctx, gt, eps);
         /* scale and shift: output = weight * normed + bias */
         struct ggml_tensor *scaled = ggml_mul(ctx, normed, gw);
         struct ggml_tensor *output = ggml_add(ctx, scaled, gb);
@@ -723,24 +723,17 @@ RtTensor *sn_tensor_layer_norm(RtTensor *t, RtTensor *weight, RtTensor *bias)
     TPool *out = &g_pool[idx];
 
     for (int64_t r = 0; r < num_nodes; r++) {
-        /* Compute mean across features for this node */
-        float mean = 0.0f;
-        for (int64_t c = 0; c < feat_dim; c++)
-            mean += pt->data[r * feat_dim + c];
-        mean /= (float)feat_dim;
-
-        /* Compute variance */
-        float var = 0.0f;
+        /* Compute RMS across features for this node */
+        float sum_sq = 0.0f;
         for (int64_t c = 0; c < feat_dim; c++) {
-            float d = pt->data[r * feat_dim + c] - mean;
-            var += d * d;
+            float v = pt->data[r * feat_dim + c];
+            sum_sq += v * v;
         }
-        var /= (float)feat_dim;
+        float rms = sqrtf(sum_sq / (float)feat_dim + eps);
 
-        /* Normalize, scale, shift */
-        float inv_std = 1.0f / sqrtf(var + eps);
+        /* Normalize by RMS, then scale and shift */
         for (int64_t c = 0; c < feat_dim; c++) {
-            float x = (pt->data[r * feat_dim + c] - mean) * inv_std;
+            float x = pt->data[r * feat_dim + c] / rms;
             out->data[r * feat_dim + c] = x * pw->data[c] + pb->data[c];
         }
     }
