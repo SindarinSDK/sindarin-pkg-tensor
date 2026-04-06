@@ -78,6 +78,9 @@ native struct Tensor as ref =>
   fn batchNorm(weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor =>
     return sn_tensor_batch_norm(self, weight, bias, runningMean, runningVar, training)
 
+  fn layerNorm(weight: Tensor, bias: Tensor): Tensor =>
+    return sn_tensor_layer_norm(self, weight, bias)
+
   # --- GNN aggregation ---
 
   fn aggregate(edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor =>
@@ -118,6 +121,7 @@ native fn sn_tensor_relu(t: Tensor): Tensor
 native fn sn_tensor_softmax(t: Tensor, dim: int): Tensor
 native fn sn_tensor_dropout(t: Tensor, rate: double, training: bool): Tensor
 native fn sn_tensor_batch_norm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
+native fn sn_tensor_layer_norm(t: Tensor, weight: Tensor, bias: Tensor): Tensor
 native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
 native fn sn_tensor_argmax(t: Tensor, dim: int): int
 native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor

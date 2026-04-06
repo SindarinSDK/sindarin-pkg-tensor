@@ -689,6 +689,66 @@ RtTensor *sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
 }
 
 /* ======================================================================
+ * Layer normalization — normalizes across features per sample.
+ * Works in both record mode (ggml_norm) and direct mode (C).
+ * No batch statistics, no running state — identical in training/inference.
+ * ====================================================================== */
+
+RtTensor *sn_tensor_layer_norm(RtTensor *t, RtTensor *weight, RtTensor *bias)
+{
+    TPool *pt = unwrap(t);
+    TPool *pw = unwrap(weight);
+    TPool *pb = unwrap(bias);
+    int64_t feat_dim  = pt->ne[0];
+    int64_t num_nodes = pt->ne[1];
+    float eps = 1e-5f;
+
+    if (g_record_mode) {
+        struct ggml_tensor *gt = rec_tensor(t);
+        struct ggml_tensor *gw = rec_tensor(weight);
+        struct ggml_tensor *gb = rec_tensor(bias);
+        struct ggml_context *ctx = g_record_ctx;
+
+        /* ggml_norm: normalizes along ne[0] (features) per row — exactly layernorm */
+        struct ggml_tensor *normed = ggml_norm(ctx, gt, eps);
+        /* scale and shift: output = weight * normed + bias */
+        struct ggml_tensor *scaled = ggml_mul(ctx, normed, gw);
+        struct ggml_tensor *output = ggml_add(ctx, scaled, gb);
+
+        return rec_wrap(output, feat_dim, num_nodes);
+    }
+
+    /* Direct C implementation for inference */
+    int idx = pool_alloc(feat_dim, num_nodes, 2);
+    TPool *out = &g_pool[idx];
+
+    for (int64_t r = 0; r < num_nodes; r++) {
+        /* Compute mean across features for this node */
+        float mean = 0.0f;
+        for (int64_t c = 0; c < feat_dim; c++)
+            mean += pt->data[r * feat_dim + c];
+        mean /= (float)feat_dim;
+
+        /* Compute variance */
+        float var = 0.0f;
+        for (int64_t c = 0; c < feat_dim; c++) {
+            float d = pt->data[r * feat_dim + c] - mean;
+            var += d * d;
+        }
+        var /= (float)feat_dim;
+
+        /* Normalize, scale, shift */
+        float inv_std = 1.0f / sqrtf(var + eps);
+        for (int64_t c = 0; c < feat_dim; c++) {
+            float x = (pt->data[r * feat_dim + c] - mean) * inv_std;
+            out->data[r * feat_dim + c] = x * pw->data[c] + pb->data[c];
+        }
+    }
+
+    return wrap_pool(idx);
+}
+
+/* ======================================================================
  * Reduction & aggregation — implemented directly for GNN ops
  * ====================================================================== */
 
