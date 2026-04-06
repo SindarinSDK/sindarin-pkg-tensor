@@ -54,10 +54,6 @@ struct GnnOutput =>
 struct GnnLayer =>
   weight: Tensor
   bias: Tensor
-  bnWeight: Tensor
-  bnBias: Tensor
-  bnMean: Tensor
-  bnVar: Tensor
   attWeight: Tensor
   inputDim: int
   outputDim: int
@@ -65,16 +61,9 @@ struct GnnLayer =>
   dropoutRate: double
 
   static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
-    var onesData: double[] = {}
-    for var i: int = 0; i < outputDim; i++ =>
-      onesData.push(1.0)
     var layer: GnnLayer = GnnLayer {
       weight: Tensor.zeros(inputDim, outputDim),
       bias: Tensor.zeros(1, outputDim),
-      bnWeight: Tensor.fromDoubles(onesData, 1, outputDim),
-      bnBias: Tensor.zeros(1, outputDim),
-      bnMean: Tensor.zeros(1, outputDim),
-      bnVar: Tensor.fromDoubles(onesData, 1, outputDim),
       attWeight: Tensor.zeros(1, 2 * outputDim),
       inputDim: inputDim,
       outputDim: outputDim,
@@ -96,25 +85,22 @@ struct GnnLayer =>
   fn gcnForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     var h: Tensor = x.matmul(self.weight).add(self.bias)
     h = h.aggregate(edgeIndex, edgeWeight, "sum_normalized")
-    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
     return h.relu().dropout(self.dropoutRate, training)
 
   fn sageForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     var agg: Tensor = x.aggregate(edgeIndex, edgeWeight, "mean")
     var h: Tensor = agg.matmul(self.weight).add(self.bias)
-    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
     return h.relu().dropout(self.dropoutRate, training)
 
   fn gatForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     var h: Tensor = x.matmul(self.weight).add(self.bias)
     h = h.attentionAggregate(edgeIndex, edgeWeight, self.attWeight)
-    h = h.batchNorm(self.bnWeight, self.bnBias, self.bnMean, self.bnVar, training)
     return h.relu().dropout(self.dropoutRate, training)
 
   fn parameters(): Tensor[] =>
     if self.arch == "gat" =>
-      return {self.weight, self.bias, self.bnWeight, self.bnBias, self.attWeight}
-    return {self.weight, self.bias, self.bnWeight, self.bnBias}
+      return {self.weight, self.bias, self.attWeight}
+    return {self.weight, self.bias}
 
 # ---------------------------------------------------------------------------
 # Full GNN model: message-passing layers + readout + classification head
@@ -199,12 +185,6 @@ struct Gnn =>
         idx = idx + 1
       if idx < len(loaded) =>
         self.layers[i].bias = loaded[idx]
-        idx = idx + 1
-      if idx < len(loaded) =>
-        self.layers[i].bnWeight = loaded[idx]
-        idx = idx + 1
-      if idx < len(loaded) =>
-        self.layers[i].bnBias = loaded[idx]
         idx = idx + 1
       if self.layers[i].arch == "gat" =>
         if idx < len(loaded) =>
