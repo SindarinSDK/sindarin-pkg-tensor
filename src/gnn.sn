@@ -180,6 +180,9 @@ struct Gnn =>
     params.push(self.classifierB2)
     return params
 
+  fn reset(): void =>
+    sn_tensor_pool_reset()
+
   fn save(path: str): void =>
     sn_model_save(self.parameters(), path)
 
