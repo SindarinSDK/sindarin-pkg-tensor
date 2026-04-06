@@ -1341,3 +1341,24 @@ void sn_tensor_pool_reset(void)
     }
     g_pool_count = 0;
 }
+
+static int g_pool_checkpoint = 0;
+
+long long sn_tensor_pool_checkpoint(void)
+{
+    g_pool_checkpoint = g_pool_count;
+    return (long long)g_pool_checkpoint;
+}
+
+void sn_tensor_pool_restore(long long checkpoint)
+{
+    int cp = (int)checkpoint;
+    if (cp < 0 || cp > g_pool_count) return;
+    for (int i = cp; i < g_pool_count; i++) {
+        if (g_pool[i].data) {
+            free(g_pool[i].data);
+            g_pool[i].data = NULL;
+        }
+    }
+    g_pool_count = cp;
+}

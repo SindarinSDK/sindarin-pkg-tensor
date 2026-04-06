@@ -183,6 +183,12 @@ struct Gnn =>
   fn reset(): void =>
     sn_tensor_pool_reset()
 
+  fn checkpoint(): long =>
+    return sn_tensor_pool_checkpoint()
+
+  fn restore(cp: long): void =>
+    sn_tensor_pool_restore(cp)
+
   fn save(path: str): void =>
     sn_model_save(self.parameters(), path)
 

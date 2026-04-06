@@ -141,6 +141,8 @@ native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
 native fn sn_model_save(params: Tensor[], path: str): void
 native fn sn_model_load(path: str): Tensor[]
 native fn sn_tensor_pool_reset(): void
+native fn sn_tensor_pool_checkpoint(): long
+native fn sn_tensor_pool_restore(checkpoint: long): void
 
 # ---------------------------------------------------------------------------
 # Graph recording mode (for training)
