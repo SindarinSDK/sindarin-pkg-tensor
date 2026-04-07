@@ -26,6 +26,14 @@ vcpkg_cmake_configure(
         ${FEATURE_OPTIONS}
         -DBUILD_SHARED_LIBS=OFF
         -DGGML_STATIC=ON
+        # GGML_NATIVE=OFF disables -march=native and similar host-specific
+        # optimization flags. Required for any distributable library build:
+        # release binaries must run on consumer hardware that doesn't match
+        # the build host's microarchitecture. Also fixes the macOS x86_64
+        # cross-compile (the runners are now Apple Silicon M3, so
+        # -march=native resolves to "apple-m3" which clang doesn't accept
+        # when targeting x86_64).
+        -DGGML_NATIVE=OFF
         -DGGML_BUILD_TESTS=OFF
         -DGGML_BUILD_EXAMPLES=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
