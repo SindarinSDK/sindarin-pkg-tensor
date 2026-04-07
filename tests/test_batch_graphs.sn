@@ -1,0 +1,269 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+
+# ===========================================================================
+# test_batch_graphs.sn — unit test for batchGraphs() in src/tensor.sn
+#
+# Verifies that the per-graph offset arithmetic, the row-major feature
+# concat, and the batchIndex construction all produce the expected output
+# layout byte-for-byte. This is the building block for the variable-shape
+# train loop in Step 2c — if the arithmetic here is wrong, every consumer
+# silently corrupts.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn makeGraph(features: double[], srcs: double[], dsts: double[],
+  numNodes: int, numEdges: int, featureDim: int): GraphTensors =>
+  var edgeData: double[] = {}
+  for var i: int = 0; i < numEdges; i++ =>
+    edgeData.push(srcs[i])
+  for var i: int = 0; i < numEdges; i++ =>
+    edgeData.push(dsts[i])
+  var weights: double[] = {}
+  for var i: int = 0; i < numEdges; i++ =>
+    weights.push(1.0)
+  var batch: double[] = {}
+  for var i: int = 0; i < numNodes; i++ =>
+    batch.push(0.0)
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, numNodes, featureDim),
+    edgeIndex: Tensor.fromDoubles(edgeData, 2, numEdges),
+    edgeWeight: Tensor.fromDoubles(weights, 1, numEdges),
+    batchIndex: Tensor.fromDoubles(batch, numNodes, 1),
+    numNodes: numNodes,
+    numEdges: numEdges,
+    featureDim: featureDim
+  }
+
+# ---------------------------------------------------------------------------
+# Case 1 — Two single-node graphs.
+# ---------------------------------------------------------------------------
+fn case1(): void =>
+  print("case 1: two single-node graphs\n")
+
+  # Graph A: 1 node features [1, 2], 1 self-loop (0,0)
+  var ga: GraphTensors = makeGraph(
+    {1.0, 2.0}, # features
+    {0.0}, # srcs
+    {0.0}, # dsts
+    1, 1, 2
+  )
+  # Override edgeWeight to 1.5 to verify weight concat
+  ga.edgeWeight = Tensor.fromDoubles({1.5}, 1, 1)
+
+  # Graph B: 1 node features [3, 4], 1 self-loop (0,0)
+  var gb: GraphTensors = makeGraph(
+    {3.0, 4.0},
+    {0.0},
+    {0.0},
+    1, 1, 2
+  )
+  gb.edgeWeight = Tensor.fromDoubles({2.5}, 1, 1)
+
+  var graphs: GraphTensors[] = {ga, gb}
+  var batched: GraphTensors = batchGraphs(graphs)
+
+  assertEqualInt(batched.numNodes, 2, "case1 numNodes")
+  assertEqualInt(batched.numEdges, 2, "case1 numEdges")
+  assertEqualInt(batched.featureDim, 2, "case1 featureDim")
+
+  var feats: double[] = batched.nodeFeatures.toDoubles()
+  assertEqualInt(len(feats), 4, "case1 features length")
+  assertEqualDouble(feats[0], 1.0, "case1 feats[0]")
+  assertEqualDouble(feats[1], 2.0, "case1 feats[1]")
+  assertEqualDouble(feats[2], 3.0, "case1 feats[2]")
+  assertEqualDouble(feats[3], 4.0, "case1 feats[3]")
+
+  var ei: double[] = batched.edgeIndex.toDoubles()
+  assertEqualInt(len(ei), 4, "case1 edgeIndex length (2 rows * 2 edges)")
+  # Layout: [src_0, src_1, dst_0, dst_1]
+  assertEqualDouble(ei[0], 0.0, "case1 src[0] (graph 0 self-loop, no offset)")
+  assertEqualDouble(ei[1], 1.0, "case1 src[1] (graph 1 self-loop, offset by 1)")
+  assertEqualDouble(ei[2], 0.0, "case1 dst[0]")
+  assertEqualDouble(ei[3], 1.0, "case1 dst[1]")
+
+  var ew: double[] = batched.edgeWeight.toDoubles()
+  assertEqualInt(len(ew), 2, "case1 edgeWeight length")
+  assertEqualDouble(ew[0], 1.5, "case1 weight[0]")
+  assertEqualDouble(ew[1], 2.5, "case1 weight[1]")
+
+  var bi: double[] = batched.batchIndex.toDoubles()
+  assertEqualInt(len(bi), 2, "case1 batchIndex length")
+  assertEqualDouble(bi[0], 0.0, "case1 batchIndex[0]")
+  assertEqualDouble(bi[1], 1.0, "case1 batchIndex[1]")
+
+# ---------------------------------------------------------------------------
+# Case 2 — Two multi-node graphs of different sizes.
+# Graph A: 3 nodes, chain 0->1->2
+# Graph B: 2 nodes, edge 0->1
+# Expected: 5 nodes total, edges remapped to operate on the global node space.
+# ---------------------------------------------------------------------------
+fn case2(): void =>
+  print("case 2: two multi-node graphs of different sizes\n")
+
+  # Graph A: 3 nodes features [[1,0],[0,1],[1,1]], chain 0->1->2
+  var ga: GraphTensors = makeGraph(
+    {1.0, 0.0, 0.0, 1.0, 1.0, 1.0}, # features(row - major)
+    {0.0, 1.0}, # srcs
+    {1.0, 2.0}, # dsts
+    3, 2, 2
+  )
+
+  # Graph B: 2 nodes features [[2,2],[3,3]], edge 0->1
+  var gb: GraphTensors = makeGraph(
+    {2.0, 2.0, 3.0, 3.0},
+    {0.0},
+    {1.0},
+    2, 1, 2
+  )
+
+  var graphs: GraphTensors[] = {ga, gb}
+  var batched: GraphTensors = batchGraphs(graphs)
+
+  assertEqualInt(batched.numNodes, 5, "case2 numNodes")
+  assertEqualInt(batched.numEdges, 3, "case2 numEdges")
+  assertEqualInt(batched.featureDim, 2, "case2 featureDim")
+
+  var feats: double[] = batched.nodeFeatures.toDoubles()
+  assertEqualInt(len(feats), 10, "case2 features length")
+  # Graph A's 6 features then Graph B's 4 features, in order
+  assertEqualDouble(feats[0], 1.0, "case2 feats[0] (g0 n0 f0)")
+  assertEqualDouble(feats[1], 0.0, "case2 feats[1] (g0 n0 f1)")
+  assertEqualDouble(feats[2], 0.0, "case2 feats[2] (g0 n1 f0)")
+  assertEqualDouble(feats[3], 1.0, "case2 feats[3] (g0 n1 f1)")
+  assertEqualDouble(feats[4], 1.0, "case2 feats[4] (g0 n2 f0)")
+  assertEqualDouble(feats[5], 1.0, "case2 feats[5] (g0 n2 f1)")
+  assertEqualDouble(feats[6], 2.0, "case2 feats[6] (g1 n0 f0)")
+  assertEqualDouble(feats[7], 2.0, "case2 feats[7] (g1 n0 f1)")
+  assertEqualDouble(feats[8], 3.0, "case2 feats[8] (g1 n1 f0)")
+  assertEqualDouble(feats[9], 3.0, "case2 feats[9] (g1 n1 f1)")
+
+  var ei: double[] = batched.edgeIndex.toDoubles()
+  assertEqualInt(len(ei), 6, "case2 edgeIndex length (2 rows * 3 edges)")
+  # Layout: [src_0, src_1, src_2, dst_0, dst_1, dst_2]
+  # g0: edges (0,1), (1,2) -> sources [0,1], dests [1,2]
+  # g1 (offset 3): edge (0,1) -> source 3, dest 4
+  assertEqualDouble(ei[0], 0.0, "case2 src[0] (g0 edge0)")
+  assertEqualDouble(ei[1], 1.0, "case2 src[1] (g0 edge1)")
+  assertEqualDouble(ei[2], 3.0, "case2 src[2] (g1 edge0, offset 3)")
+  assertEqualDouble(ei[3], 1.0, "case2 dst[0]")
+  assertEqualDouble(ei[4], 2.0, "case2 dst[1]")
+  assertEqualDouble(ei[5], 4.0, "case2 dst[2] (offset 3)")
+
+  var bi: double[] = batched.batchIndex.toDoubles()
+  assertEqualInt(len(bi), 5, "case2 batchIndex length")
+  assertEqualDouble(bi[0], 0.0, "case2 batchIndex[0]")
+  assertEqualDouble(bi[1], 0.0, "case2 batchIndex[1]")
+  assertEqualDouble(bi[2], 0.0, "case2 batchIndex[2]")
+  assertEqualDouble(bi[3], 1.0, "case2 batchIndex[3]")
+  assertEqualDouble(bi[4], 1.0, "case2 batchIndex[4]")
+
+# ---------------------------------------------------------------------------
+# Case 3 — Three graphs with varied edge counts including a cycle.
+# ---------------------------------------------------------------------------
+fn case3(): void =>
+  print("case 3: three graphs with varied edge counts\n")
+
+  # Graph A: 2 nodes, 2 self-loops
+  var ga: GraphTensors = makeGraph(
+    {1.0, 1.0, 2.0, 2.0},
+    {0.0, 1.0},
+    {0.0, 1.0},
+    2, 2, 2
+  )
+
+  # Graph B: 1 node, 1 self-loop
+  var gb: GraphTensors = makeGraph(
+    {3.0, 3.0},
+    {0.0},
+    {0.0},
+    1, 1, 2
+  )
+
+  # Graph C: 3 nodes, 3 edges forming a cycle 0->1->2->0
+  var gc: GraphTensors = makeGraph(
+    {4.0, 4.0, 5.0, 5.0, 6.0, 6.0},
+    {0.0, 1.0, 2.0},
+    {1.0, 2.0, 0.0},
+    3, 3, 2
+  )
+
+  var graphs: GraphTensors[] = {ga, gb, gc}
+  var batched: GraphTensors = batchGraphs(graphs)
+
+  assertEqualInt(batched.numNodes, 6, "case3 numNodes")
+  assertEqualInt(batched.numEdges, 6, "case3 numEdges")
+  assertEqualInt(batched.featureDim, 2, "case3 featureDim")
+
+  var feats: double[] = batched.nodeFeatures.toDoubles()
+  assertEqualInt(len(feats), 12, "case3 features length")
+  assertEqualDouble(feats[0], 1.0, "case3 feats[0]")
+  assertEqualDouble(feats[1], 1.0, "case3 feats[1]")
+  assertEqualDouble(feats[2], 2.0, "case3 feats[2]")
+  assertEqualDouble(feats[3], 2.0, "case3 feats[3]")
+  assertEqualDouble(feats[4], 3.0, "case3 feats[4]")
+  assertEqualDouble(feats[5], 3.0, "case3 feats[5]")
+  assertEqualDouble(feats[6], 4.0, "case3 feats[6]")
+  assertEqualDouble(feats[7], 4.0, "case3 feats[7]")
+  assertEqualDouble(feats[8], 5.0, "case3 feats[8]")
+  assertEqualDouble(feats[9], 5.0, "case3 feats[9]")
+  assertEqualDouble(feats[10], 6.0, "case3 feats[10]")
+  assertEqualDouble(feats[11], 6.0, "case3 feats[11]")
+
+  var ei: double[] = batched.edgeIndex.toDoubles()
+  assertEqualInt(len(ei), 12, "case3 edgeIndex length (2 rows * 6 edges)")
+  # nodeOffsets: [0, 2, 3]
+  # g0 srcs [0,1] -> [0,1]
+  # g1 srcs [0]   -> [2]   (offset 2)
+  # g2 srcs [0,1,2] -> [3,4,5] (offset 3)
+  # combined sources: [0, 1, 2, 3, 4, 5]
+  # g0 dsts [0,1] -> [0,1]
+  # g1 dsts [0]   -> [2]
+  # g2 dsts [1,2,0] -> [4, 5, 3]
+  # combined dests: [0, 1, 2, 4, 5, 3]
+  assertEqualDouble(ei[0], 0.0, "case3 src[0]")
+  assertEqualDouble(ei[1], 1.0, "case3 src[1]")
+  assertEqualDouble(ei[2], 2.0, "case3 src[2]")
+  assertEqualDouble(ei[3], 3.0, "case3 src[3]")
+  assertEqualDouble(ei[4], 4.0, "case3 src[4]")
+  assertEqualDouble(ei[5], 5.0, "case3 src[5]")
+  assertEqualDouble(ei[6], 0.0, "case3 dst[0]")
+  assertEqualDouble(ei[7], 1.0, "case3 dst[1]")
+  assertEqualDouble(ei[8], 2.0, "case3 dst[2]")
+  assertEqualDouble(ei[9], 4.0, "case3 dst[3]")
+  assertEqualDouble(ei[10], 5.0, "case3 dst[4]")
+  assertEqualDouble(ei[11], 3.0, "case3 dst[5]")
+
+  var ew: double[] = batched.edgeWeight.toDoubles()
+  assertEqualInt(len(ew), 6, "case3 edgeWeight length")
+  for var i: int = 0; i < 6; i++ =>
+    assertEqualDouble(ew[i], 1.0, $"case3 weight[{i}]")
+
+  var bi: double[] = batched.batchIndex.toDoubles()
+  assertEqualInt(len(bi), 6, "case3 batchIndex length")
+  assertEqualDouble(bi[0], 0.0, "case3 batchIndex[0]")
+  assertEqualDouble(bi[1], 0.0, "case3 batchIndex[1]")
+  assertEqualDouble(bi[2], 1.0, "case3 batchIndex[2]")
+  assertEqualDouble(bi[3], 2.0, "case3 batchIndex[3]")
+  assertEqualDouble(bi[4], 2.0, "case3 batchIndex[4]")
+  assertEqualDouble(bi[5], 2.0, "case3 batchIndex[5]")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+fn main(): void =>
+  println("=== test_batch_graphs ===")
+  println("")
+  case1()
+  case2()
+  case3()
+  summary()
+
+  # Exit non-zero on failure so `make test` flips red.
+  # NOTE: same shim as test_real_graph_topology — replace once SDK exposes panic().
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

@@ -1,0 +1,192 @@
+import "sindarin-pkg-test/src/assert"
+import "sindarin-pkg-sdk/src/core/random"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_real_graph_topology.sn — failing baseline for Bug B1
+#
+# Verifies that Gnn.train() actually learns from the graph topology the
+# caller hands it, not from a flattened-feature MLP fallback.
+#
+# Setup:
+# Two graphs with IDENTICAL 3-node features [[1,0,0,0],[0,1,0,0],[0,0,1,0]]
+# but DIFFERENT edge structure:
+# Graph A — chain 0->1->2 (plus self-loops on every node)
+# Graph B — isolated nodes (self-loops only)
+#
+# Labels:
+# Graph A -> action 0
+# Graph B -> action 1
+#
+# Because both graphs have the same node-feature multiset, any trainer that
+# only consumes flattened features cannot tell A and B apart and is forced
+# to predict ~uniform on the training set. The only signal that distinguishes
+# them is the EDGE STRUCTURE — which the current Gnn.train() does not pass
+# to ggml-opt at all (see src/gnn.sn:223-280, the self-loop template builder).
+#
+# Pass criteria after 200 epochs:
+# - forward(graphA).probs[0] > 0.7
+# - forward(graphB).probs[1] > 0.7
+# - JSD(forward(graphA).probs, forward(graphB).probs) > 0.3
+#
+# Expected today: FAIL on all three. Once Bug B1 is fixed (Step 2 of
+# docs/issues/golden-path.md), this test must pass.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn buildGraphA(): GraphTensors =>
+  # 3 nodes, identical features as Graph B.
+  var feats: double[] = {
+    1.0, 0.0, 0.0, 0.0, # node 0
+    0.0, 1.0, 0.0, 0.0, # node 1
+    0.0, 0.0, 1.0, 0.0 # node 2
+  }
+  # Self-loops on every node + chain edges 0->1, 1->2.
+  # edgeIndex layout: row 0 = sources, row 1 = destinations.
+  # 5 edges total: (0,0),(1,1),(2,2),(0,1),(1,2)
+  var edges: double[] = {
+    0.0, 1.0, 2.0, 0.0, 1.0, # sources
+    0.0, 1.0, 2.0, 1.0, 2.0 # destinations
+  }
+  var weights: double[] = {1.0, 1.0, 1.0, 1.0, 1.0}
+  var batch: double[] = {0.0, 0.0, 0.0}
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, 3, 4),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 5),
+    edgeWeight: Tensor.fromDoubles(weights, 1, 5),
+    batchIndex: Tensor.fromDoubles(batch, 3, 1),
+    numNodes: 3, numEdges: 5, featureDim: 4
+  }
+
+fn buildGraphB(): GraphTensors =>
+  # Identical features to Graph A — only the edge structure differs.
+  var feats: double[] = {
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0
+  }
+  # Self-loops only — no chain edges.
+  # 3 edges: (0,0),(1,1),(2,2)
+  var edges: double[] = {
+    0.0, 1.0, 2.0,
+    0.0, 1.0, 2.0
+  }
+  var weights: double[] = {1.0, 1.0, 1.0}
+  var batch: double[] = {0.0, 0.0, 0.0}
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, 3, 4),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 3),
+    edgeWeight: Tensor.fromDoubles(weights, 1, 3),
+    batchIndex: Tensor.fromDoubles(batch, 3, 1),
+    numNodes: 3, numEdges: 3, featureDim: 4
+  }
+
+# Jensen-Shannon divergence between two probability distributions.
+# JSD(P, Q) = 0.5 * KL(P || M) + 0.5 * KL(Q || M)  where M = (P + Q) / 2
+fn jsd(p: double[], q: double[]): double =>
+  var n: int = len(p)
+  var eps: double = 0.000000000001
+  var m: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    m.push((p[i] + q[i]) * 0.5)
+  var klPm: double = 0.0
+  var klQm: double = 0.0
+  for var i: int = 0; i < n; i++ =>
+    if p[i] > eps && m[i] > eps =>
+      klPm = klPm + p[i] * log(p[i] / m[i])
+    if q[i] > eps && m[i] > eps =>
+      klQm = klQm + q[i] * log(q[i] / m[i])
+  return 0.5 * klPm + 0.5 * klQm
+
+# ---------------------------------------------------------------------------
+# Main test
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_real_graph_topology — Bug B1 baseline ===")
+  println("")
+
+  var featureDim: int = 4
+  var numActions: int = 2
+
+  # Build the two graphs (used at inference time).
+  var graphA: GraphTensors = buildGraphA()
+  var graphB: GraphTensors = buildGraphB()
+
+  # Build the model — small GAT, 2 layers, no dropout.
+  var config: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 16, numActions: numActions,
+    numLayers: 2, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.create(config)
+
+  # --- Pre-train forward on real graphs --------------------------------
+  var preCp: long = model.checkpoint()
+  var preProbsA: double[] = model.forward(graphA, false).probs.toDoubles()
+  var preProbsB: double[] = model.forward(graphB, false).probs.toDoubles()
+  model.restore(preCp)
+  var preJsd: double = jsd(preProbsA, preProbsB)
+  println($"  pre-train  graphA probs=[{preProbsA[0]}, {preProbsA[1]}]")
+  println($"  pre-train  graphB probs=[{preProbsB[0]}, {preProbsB[1]}]")
+  println($"  pre-train  JSD={preJsd}")
+
+  # --- Train --------------------------------------------------------------
+  # The current API can only consume flat features. Both graphs have the
+  # SAME node-feature multiset, so the only honest flat representation is
+  # the per-graph mean of the node features. That mean is identical for
+  # both graphs — which is exactly the point: the trainer is given two
+  # samples it cannot tell apart, with opposite labels.
+  #
+  # When we land Bug B1's fix (Step 2 of golden-path.md), the train call
+  # will instead receive the GraphTensors directly and will have access
+  # to the edges that DO distinguish A from B.
+  var meanA: double[] = {0.333333, 0.333333, 0.333333, 0.0}
+  var meanB: double[] = {0.333333, 0.333333, 0.333333, 0.0}
+  var data: double[] = {}
+  for var i: int = 0; i < featureDim; i++ =>
+    data.push(meanA[i])
+  for var i: int = 0; i < featureDim; i++ =>
+    data.push(meanB[i])
+  var labels: double[] = {
+    1.0, 0.0, # Graph A - > action 0
+    0.0, 1.0 # Graph B - > action 1
+  }
+
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  println("  training 200 epochs, batch=2...")
+  var result: TrainResult = model.train(data, labels, 2, 2, featureDim, opt, 200, 0.0)
+  println($"  train done loss={result.loss} accuracy={result.accuracy}")
+  println("")
+
+  # --- Post-train forward on real graphs --------------------------------
+  var postProbsA: double[] = model.forward(graphA, false).probs.toDoubles()
+  var postProbsB: double[] = model.forward(graphB, false).probs.toDoubles()
+  var postJsd: double = jsd(postProbsA, postProbsB)
+  println($"  post-train graphA probs=[{postProbsA[0]}, {postProbsA[1]}]")
+  println($"  post-train graphB probs=[{postProbsB[0]}, {postProbsB[1]}]")
+  println($"  post-train JSD={postJsd}")
+  println("")
+
+  # --- Assertions ---------------------------------------------------------
+  assertTrue(postProbsA[0] > 0.7,
+    "graphA should predict action 0 with prob > 0.7 after training")
+  assertTrue(postProbsB[1] > 0.7,
+    "graphB should predict action 1 with prob > 0.7 after training")
+  assertTrue(postJsd > 0.3,
+    "JSD between graphA and graphB predictions should exceed 0.3")
+
+  summary()
+
+  # Exit non-zero on failure so `make test` actually flips red.
+  # NOTE: shim — the SDK currently exposes no panic()/exit() function.
+  # The compiler runtime aborts on division-by-zero (sn_arith.h), which
+  # is the cheapest mechanism available today. Replace once a proper
+  # panic primitive lands in sindarin-pkg-sdk.
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

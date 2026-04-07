@@ -1,0 +1,36 @@
+import "sindarin-pkg-test/src/assert"
+
+# ===========================================================================
+# tests/assert/helpers.sn — package-local test assertion helpers
+#
+# Builds on top of sindarin-pkg-test/src/assert. Anything that lives here
+# is a tensor-package-specific assertion that doesn't yet make sense to
+# upstream into pkg-test.
+#
+# Usage from a test file:
+# import "sindarin-pkg-test/src/assert"
+# import "./assert/helpers"
+#
+# assertApproxDouble(loss, 0.4076, 0.00001, "weighted CE matches numpy")
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# assertApproxDouble — compare two doubles with a tolerance.
+#
+# pkg-test's assertEqualDouble uses bit-exact comparison, which doesn't
+# survive a float32 round-trip through ggml. Use this for any assertion
+# whose value comes from the tensor backend.
+#
+# Routes through pkg-test's check() so the global pass/fail counters and
+# summary() output stay consistent across all assertions.
+# ---------------------------------------------------------------------------
+fn assertApproxDouble(actual: double, expected: double,
+  tolerance: double, message: str): void =>
+  var diff: double = actual - expected
+  if diff < 0.0 =>
+    diff = -diff
+  if diff < tolerance =>
+    check(true, message)
+  else =>
+    var fullMsg: str = $"{message} (expected {expected}, got {actual}, diff {diff}, tol {tolerance})"
+    check(false, fullMsg)

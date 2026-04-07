@@ -1,0 +1,134 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+
+# ===========================================================================
+# test_weighted_ce.sn — unit test for sn_tensor_weighted_cross_entropy
+#
+# Verifies that the per-sample weighted cross-entropy loss op produces the
+# right scalar for known inputs in direct mode (no record mode, no
+# backward, no training). Building block for Step 2c, where the same
+# function will be wired into the recorded forward graph as the loss node.
+#
+# Test inputs are designed so the per-sample CEs are different, which makes
+# the three weight configurations produce visibly different total losses
+# (otherwise the weights would have no observable effect).
+#
+# Reference values computed by hand:
+#
+# logits row 0: [3, 0, 0]   labels row 0: [1, 0, 0]   true class 0
+# logsumexp = log(e^3 + 1 + 1) = log(22.0855369...) = 3.0949001...
+# log_softmax[0] = 3 - 3.0949001 = -0.0949001
+# contribution = -0.0949001
+#
+# logits row 1: [0, 0, 1]   labels row 1: [0, 0, 1]   true class 2
+# logsumexp = log(1 + 1 + e) = log(4.71828...) = 1.55145
+# log_softmax[2] = 1 - 1.55145 = -0.55145
+# contribution = -0.55145
+#
+# Loss formula:  loss = -sum_i (weight[i] * contribution[i]) / batchRows
+# = sum_i (weight[i] * |contribution[i]|) / batchRows
+# (since contributions are negative)
+#
+# weights [1, 1] : loss = (0.0949001 + 0.55145) / 2 = 0.323176
+# weights [2, 0] : loss = (0.0949001 * 2 + 0)    / 2 = 0.094900
+# weights [0, 2] : loss = (0 + 0.55145 * 2)      / 2 = 0.551449
+# ===========================================================================
+
+fn buildLogits(): Tensor =>
+  # 2 rows, 3 cols. Row-major: [row0_col0, row0_col1, row0_col2, row1_col0, ...]
+  # Row 0: [3, 0, 0]   strongly confident in class 0
+  # Row 1: [0, 0, 1]   slightly confident in class 2
+  return Tensor.fromDoubles({3.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+
+fn buildLabels(): Tensor =>
+  # Row 0: [1, 0, 0]   true class 0 (model is right)
+  # Row 1: [0, 0, 1]   true class 2 (model is right)
+  return Tensor.fromDoubles({1.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+
+# ---------------------------------------------------------------------------
+# Case 1 — uniform weights [1, 1]
+# Expected loss: 0.323176
+# This is the unweighted-equivalent baseline.
+# ---------------------------------------------------------------------------
+fn case1(): void =>
+  print("case 1: uniform weights [1, 1]\n")
+  var logits: Tensor = buildLogits()
+  var labels: Tensor = buildLabels()
+  var weights: Tensor = Tensor.fromDoubles({1.0, 1.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossData: double[] = loss.toDoubles()
+
+  assertEqualInt(len(lossData), 1, "case1 loss is scalar (1 element)")
+  assertApproxDouble(lossData[0], 0.323176, 0.0001,
+    "case1 weighted CE matches hand-computed reference")
+
+# ---------------------------------------------------------------------------
+# Case 2 — weights [2, 0]
+# Sample 0 contributes double, sample 1 contributes zero.
+# Expected loss: 0.094900
+# ---------------------------------------------------------------------------
+fn case2(): void =>
+  print("case 2: weights [2, 0]\n")
+  var logits: Tensor = buildLogits()
+  var labels: Tensor = buildLabels()
+  var weights: Tensor = Tensor.fromDoubles({2.0, 0.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossData: double[] = loss.toDoubles()
+
+  assertApproxDouble(lossData[0], 0.094900, 0.0001,
+    "case2 weighted CE — only sample 0 contributes (weight 2)")
+
+# ---------------------------------------------------------------------------
+# Case 3 — weights [0, 2]
+# Sample 0 contributes zero, sample 1 contributes double.
+# Expected loss: 0.551449
+# ---------------------------------------------------------------------------
+fn case3(): void =>
+  print("case 3: weights [0, 2]\n")
+  var logits: Tensor = buildLogits()
+  var labels: Tensor = buildLabels()
+  var weights: Tensor = Tensor.fromDoubles({0.0, 2.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossData: double[] = loss.toDoubles()
+
+  assertApproxDouble(lossData[0], 0.551449, 0.0001,
+    "case3 weighted CE — only sample 1 contributes (weight 2)")
+
+# ---------------------------------------------------------------------------
+# Case 4 — sanity: weights [1, 1] equals weights [0.5, 0.5] * 2 (linearity)
+# Verifies that the loss scales linearly with a uniform weight multiplier.
+# Expected: case 4 loss == case 1 loss / 2 (since each weight is halved
+# and we still divide by batchRows=2).
+# ---------------------------------------------------------------------------
+fn case4(): void =>
+  print("case 4: weights [0.5, 0.5] (linearity check)\n")
+  var logits: Tensor = buildLogits()
+  var labels: Tensor = buildLabels()
+  var weights: Tensor = Tensor.fromDoubles({0.5, 0.5}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossData: double[] = loss.toDoubles()
+
+  # 0.323176 / 2 = 0.161588
+  assertApproxDouble(lossData[0], 0.161588, 0.0001,
+    "case4 weighted CE — uniform 0.5 weights equal half of unit weights")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+fn main(): void =>
+  println("=== test_weighted_ce ===")
+  println("")
+  case1()
+  case2()
+  case3()
+  case4()
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

@@ -1213,6 +1213,87 @@ RtTensor *sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
     return wrap_pool(idx);
 }
 
+/* Per-sample weighted cross-entropy loss.
+ *
+ * logits  : shape (numClasses, batchRows)  -- pre-softmax
+ * labels  : shape (numClasses, batchRows)  -- one-hot encoded
+ * weights : shape (1,          batchRows)  -- per-sample importance weights
+ *
+ * Math:
+ *   per_sample_i = -sum_c (label[i,c] * log_softmax(logits[i,c]))
+ *   loss         = sum_i (weight[i] * per_sample_i) / batchRows
+ *
+ * Convention: scale by 1/batchRows (not 1/sum(weights)). Weights are
+ * relative importance, not effective sample counts. With weights all 1.0,
+ * this exactly matches ggml_cross_entropy_loss.
+ *
+ * Works in both record mode (loss tensor wired into the recorded forward
+ * graph for backward in train_step) and direct mode (one-shot eval, used
+ * by tests/test_weighted_ce.sn).
+ */
+RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
+                                           RtTensor *labels_rt,
+                                           RtTensor *weights_rt)
+{
+    TPool *pl  = unwrap(logits_rt);
+    TPool *plb = unwrap(labels_rt);
+    TPool *pw  = unwrap(weights_rt);
+
+    int64_t numClasses = pl->ne[0];
+    int64_t batchRows  = pl->ne[1];
+    float inv_n = -1.0f / (float)(batchRows > 0 ? batchRows : 1);
+
+    if (g_record_mode) {
+        struct ggml_context *ctx = g_record_ctx;
+        struct ggml_tensor *gl  = rec_tensor(logits_rt);
+        struct ggml_tensor *glb = rec_tensor(labels_rt);
+        struct ggml_tensor *gw  = rec_tensor(weights_rt);
+
+        struct ggml_tensor *softmax    = ggml_soft_max(ctx, gl);
+        struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
+        struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm, glb);
+        struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
+        struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, gw);
+        struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
+        struct ggml_tensor *loss       = ggml_scale(ctx, summed, inv_n);
+        ggml_set_name(loss, "weighted_ce_loss");
+        return rec_wrap(loss, 1, 1);
+    }
+
+    /* Direct mode: build one-shot graph, execute, read scalar back */
+    struct ggml_context *ctx = micro_ctx_init();
+
+    struct ggml_tensor *tl  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numClasses, batchRows);
+    struct ggml_tensor *tlb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numClasses, batchRows);
+    struct ggml_tensor *tw  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,          batchRows);
+    ggml_set_input(tl);
+    ggml_set_input(tlb);
+    ggml_set_input(tw);
+    track_input(tl,  pl->data);
+    track_input(tlb, plb->data);
+    track_input(tw,  pw->data);
+
+    struct ggml_tensor *softmax    = ggml_soft_max(ctx, tl);
+    struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
+    struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm, tlb);
+    struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
+    struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, tw);
+    struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
+    struct ggml_tensor *loss       = ggml_scale(ctx, summed, inv_n);
+    ggml_set_output(loss);
+
+    struct ggml_cgraph *graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, loss);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
+
+    int idx = pool_alloc(1, 1, 1);
+    ggml_backend_tensor_get(loss, g_pool[idx].data, 0, sizeof(float));
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    return wrap_pool(idx);
+}
+
 /* ======================================================================
  * Initialization
  * ====================================================================== */
