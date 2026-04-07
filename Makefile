@@ -1,6 +1,6 @@
 # Sindarin Tensor Package - Makefile
 
-.PHONY: all test hooks build-libs install-libs clean help
+.PHONY: all test hooks install-libs clean help
 
 # Disable implicit rules for .sn.c files (compiled by the Sindarin compiler)
 %.sn: %.sn.c
@@ -34,16 +34,6 @@ SRC_SOURCES := $(wildcard src/*.sn) $(wildcard src/*.sn.c)
 
 TEST_SRCS := $(wildcard tests/test_*.sn)
 TEST_BINS := $(patsubst tests/%.sn,$(BIN_DIR)/%$(EXE_EXT),$(TEST_SRCS))
-
-#------------------------------------------------------------------------------
-# ggml build configuration
-#------------------------------------------------------------------------------
-GGML_SRC   := /tmp/ggml-src
-GGML_BUILD := /tmp/ggml-build
-GGML_INST  := /tmp/ggml-install
-
-# Set GGML_CUDA=ON to enable CUDA backend
-GGML_CUDA ?= OFF
 
 #------------------------------------------------------------------------------
 # Targets
@@ -80,26 +70,6 @@ $(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
 	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
 	 $(SN) $< -o $@ -l 1
 
-build-libs:
-	@echo "Building ggml from source for $(PLATFORM)..."
-	@if [ ! -d "$(GGML_SRC)" ]; then \
-	    git clone --depth=1 https://github.com/RealOrko/ggml.git $(GGML_SRC); \
-	fi
-	@cmake -S $(GGML_SRC) -B $(GGML_BUILD) \
-	    -G Ninja \
-	    -DCMAKE_BUILD_TYPE=Release \
-	    -DCMAKE_INSTALL_PREFIX=$(GGML_INST) \
-	    -DBUILD_SHARED_LIBS=OFF \
-	    -DGGML_STATIC=ON \
-	    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-	    -DGGML_CUDA=$(GGML_CUDA)
-	@cmake --build $(GGML_BUILD) -j
-	@cmake --install $(GGML_BUILD)
-	@cmake -S . -B build/package \
-	    -DGGML_INSTALL_PREFIX=$(GGML_INST)
-	@cmake --build build/package
-	@echo "Libraries built in libs/$(PLATFORM)/"
-
 install-libs:
 	@bash scripts/install.sh
 
@@ -119,8 +89,6 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make test              Build and run all tests"
-	@echo "  make build-libs        Build ggml libraries from source"
-	@echo "  make build-libs GGML_CUDA=ON   Build with CUDA support"
 	@echo "  make install-libs      Download pre-built libraries from GitHub releases"
 	@echo "  make clean             Remove build artifacts"
 	@echo "  make help              Show this help"
