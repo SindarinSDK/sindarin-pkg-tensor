@@ -1,6 +1,6 @@
 # The Golden Path: Fix `sindarin-pkg-tensor` So Skynet Can Learn
 
-## Status: IN PROGRESS — single-node case unblocked, multi-node case has remaining issues
+## Status: IN PROGRESS — core training loop complete (single-node and multi-node), TrainResult diagnostics / observability extensions outstanding
 
 ## Progress log
 

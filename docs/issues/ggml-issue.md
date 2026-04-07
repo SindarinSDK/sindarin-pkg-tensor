@@ -1,6 +1,6 @@
 # ggml backward-pass contiguity assertions block multi-node GNN training
 
-## Status: RESOLVED — patched in fork (RealOrko/ggml@sn-pkg-tensor)
+## Status: RESOLVED — patched in fork (RealOrko/ggml@master)
 
 The original ggml-side crashes are fixed by the two patches documented
 below. The "remaining convergence" issue noted earlier was tracked down
@@ -105,7 +105,7 @@ of another binary op (e.g. accumulating gradients via `ggml_add_or_set` →
 
 `ggml_permute` has the same issue.
 
-## Patches (RealOrko/ggml@sn-pkg-tensor commit `4ebc6531`)
+## Patches (RealOrko/ggml@master)
 
 Two minimal additions to `vendor/ggml/src/ggml.c`:
 
@@ -221,25 +221,26 @@ closed.
 
 ## How the patch is consumed
 
-The patches are committed to `RealOrko/ggml` on branch `sn-pkg-tensor`
-at SHA `4ebc65314b17901daea2655e1525caa0efbce625`. The
-`sindarin-pkg-tensor` repo consumes them via a vcpkg overlay port:
+The patches live on `RealOrko/ggml` branch `master`. The current pin
+is SHA `00418f0a45ca61feb61c2a51a3d23d14c44cc780` (bumped from the
+original `sn-pkg-tensor` feature branch in commit `de8613f`). The
+`sindarin-pkg-tensor` repo consumes the fork via a vcpkg overlay port:
 
 ```
-vcpkg-overlay/ggml/portfile.cmake     # vcpkg_from_github(REPO RealOrko/ggml, REF 4ebc6531...)
+vcpkg-overlay/ggml/portfile.cmake     # vcpkg_from_github(REPO RealOrko/ggml, REF 00418f0a...)
 vcpkg-overlay/ggml/vcpkg.json         # port metadata
 vcpkg-configuration.json              # overlay-ports = ["./vcpkg-overlay"]
 ```
 
-`.github/workflows/ci.yml` and `.github/workflows/release.yml` were
-updated to bootstrap vcpkg, run `vcpkg install` (which picks up the
-overlay automatically via `vcpkg-configuration.json`), and copy the
-installed static libs into `libs/<platform>/lib`. The previous inline
+`.github/workflows/ci.yml` and `.github/workflows/release.yml`
+bootstrap vcpkg, run `vcpkg install` (which picks up the overlay
+automatically via `vcpkg-configuration.json`), and copy the installed
+static libs into `libs/<platform>/lib`. The previous inline
 `git clone https://github.com/ggml-org/ggml.git && cmake ...` block was
 removed.
 
-To bump the patch: rebase / commit on `RealOrko/ggml@sn-pkg-tensor`,
-push, recompute the SHA512 of the new tarball, and update
+To bump the patch: commit on `RealOrko/ggml@master`, push, recompute
+the SHA512 of the new tarball, and update
 `vcpkg-overlay/ggml/portfile.cmake` (REF + SHA512).
 
 ## Upstreaming
