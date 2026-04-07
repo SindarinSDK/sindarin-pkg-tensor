@@ -1,17 +1,17 @@
-# Overlay port for ggml — pinned to RealOrko/ggml@sn-pkg-tensor with the
+# Overlay port for ggml — pinned to RealOrko/ggml@master with the
 # repeat_back/transpose/permute backward contiguity fixes that
 # sindarin-pkg-tensor's GNN training path requires.
 #
 # See docs/issues/ggml-issue.md for background. The patches are committed
-# to RealOrko/ggml branch sn-pkg-tensor at the SHA below; bump REF + SHA512
-# when the branch is updated.
+# to RealOrko/ggml branch master at the SHA below; bump REF + SHA512
+# when master is updated.
 
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO RealOrko/ggml
-    REF 4ebc65314b17901daea2655e1525caa0efbce625
-    SHA512 4ca3a5dd9a5f27c835d4cf51359a8625eaac5dc332a60bdf96d0a6dca46efd3439a972e2d16234728392815e3fb2b082d96ab0d78875c914fb19673f8a261545
-    HEAD_REF sn-pkg-tensor
+    REF 00418f0a45ca61feb61c2a51a3d23d14c44cc780
+    SHA512 e38e032dfab033c6ae52ec3a22fc1c7423d590bb44dad1ecb69d6b173e10191118c4ff7ca60d8f23d6729392223b4853772fb946b90b3a3fc5652820f9b53a8d
+    HEAD_REF master
 )
 
 vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
