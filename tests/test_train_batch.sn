@@ -96,3 +96,4 @@ fn main(): void =>
     println("  ALL PASS")
   else =>
     println("  SOME TESTS FAILED")
+    assert(false, "test_train_batch: one or more batch sizes failed")
