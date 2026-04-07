@@ -8,5 +8,27 @@
       "name": "ggml",
       "default-features": false
     }
-  ]
+  ],
+  "features": {
+    "metal": {
+      "description": "Enable Metal acceleration on macOS",
+      "dependencies": [
+        {
+          "name": "ggml",
+          "default-features": false,
+          "features": ["metal"]
+        }
+      ]
+    },
+    "cuda": {
+      "description": "Enable CUDA acceleration",
+      "dependencies": [
+        {
+          "name": "ggml",
+          "default-features": false,
+          "features": ["cuda"]
+        }
+      ]
+    }
+  }
 }

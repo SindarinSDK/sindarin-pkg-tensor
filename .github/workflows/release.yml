@@ -119,8 +119,11 @@ jobs:
       - name: Install ggml via vcpkg overlay port (with Metal feature)
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
-          # Enable the metal feature on macOS — see vcpkg-overlay/ggml/vcpkg.json
-          "$VCPKG_ROOT/vcpkg" install ggml[metal] --triplet=${{ matrix.triplet }} --x-install-root=vcpkg/installed
+          # Enable the metal feature on macOS — declared as a manifest-level
+          # feature in vcpkg.json so it can be activated in manifest mode
+          # via --x-feature. Passing `ggml[metal]` as a positional package
+          # argument is rejected by recent vcpkg versions in manifest mode.
+          "$VCPKG_ROOT/vcpkg" install --x-feature=metal --triplet=${{ matrix.triplet }} --x-install-root=vcpkg/installed
 
       - name: Package libraries
         run: |
