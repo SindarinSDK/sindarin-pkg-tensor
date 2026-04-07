@@ -420,7 +420,6 @@ struct Gnn =>
     # For totalSamples == batchSize (one batch), nBatches == 1 and the
     # shuffle is a no-op, which is the only correct behaviour: there is
     # only one batch and its slot ordering is fixed by the static graph.
-    var rng: Random = Random.createWithSeed(seed)
     var nBatches: int = totalSamples / batchSize
     var batchOrder: double[] = {}
     for var i: int = 0; i < nBatches; i++ =>
@@ -433,25 +432,30 @@ struct Gnn =>
     var totalLoss: double = 0.0
     var eps: double = 0.00000001
 
-    for var epoch: int = 0; epoch < epochs; epoch++ =>
-      # Permute batch order, then rebuild perm so each block of batchSize
-      # entries refers to the source-batch's contiguous samples in their
-      # original within-batch order.
-      rng.shuffleDouble(batchOrder)
-      for var b: int = 0; b < nBatches; b++ =>
-        var srcBatch: int = batchOrder[b].toInt()
-        for var k: int = 0; k < batchSize; k++ =>
-          perm[b * batchSize + k] = (srcBatch * batchSize + k).toDouble()
+    # The `using` block scopes the xoshiro256 state buffer to the
+    # epoch loop. Random.dispose() fires at block exit and frees the
+    # state buffer that sn_random_create_with_seed allocated — without
+    # this the 32-byte state leaks once per Gnn.train() call.
+    using rng = Random.createWithSeed(seed) =>
+      for var epoch: int = 0; epoch < epochs; epoch++ =>
+        # Permute batch order, then rebuild perm so each block of batchSize
+        # entries refers to the source-batch's contiguous samples in their
+        # original within-batch order.
+        rng.shuffleDouble(batchOrder)
+        for var b: int = 0; b < nBatches; b++ =>
+          var srcBatch: int = batchOrder[b].toInt()
+          for var k: int = 0; k < batchSize; k++ =>
+            perm[b * batchSize + k] = (srcBatch * batchSize + k).toDouble()
 
-      var epochLoss: double = sn_graph_train_epoch(
-        loss, nodeFeaturesInput, labelsInput, weightsInput,
-        featuresHost, labels, weights, perm,
-        featuresPerSample, numClasses, batchSize,
-        optimizer.kind,
-        optimizer.learningRate,
-        optimizer.beta1, optimizer.beta2, eps,
-        optimizer.weightDecay)
-      totalLoss = totalLoss + epochLoss
+        var epochLoss: double = sn_graph_train_epoch(
+          loss, nodeFeaturesInput, labelsInput, weightsInput,
+          featuresHost, labels, weights, perm,
+          featuresPerSample, numClasses, batchSize,
+          optimizer.kind,
+          optimizer.learningRate,
+          optimizer.beta1, optimizer.beta2, eps,
+          optimizer.weightDecay)
+        totalLoss = totalLoss + epochLoss
 
     var avgLoss: double = totalLoss / epochs.toDouble()
 
