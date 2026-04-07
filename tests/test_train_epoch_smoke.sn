@@ -1,0 +1,118 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+
+# ===========================================================================
+# test_train_epoch_smoke.sn — Gnn-free smoke test for sn_graph_train_epoch
+#
+# Validates the new per-epoch training driver in isolation BEFORE Step 2c.3
+# wires it into Gnn.train(). If sn_graph_train_epoch has a bug (wrong
+# loss flow, missing upload, broken AdamW step injection), it shows up
+# here against a tiny by-hand model rather than buried in an end-to-end
+# GNN training failure where the cause is hard to localize.
+#
+# Setup:
+# - Tiny linear classifier: 2 inputs → 2 outputs (one weight matrix + bias)
+# - 2 training samples:
+# Sample 0: features [1, 0], label [1, 0]   (correct class is 0)
+# Sample 1: features [0, 1], label [0, 1]   (correct class is 1)
+# - Both weights = 1.0
+# - Full-batch (batchSize = 2), 30 epochs
+# - AdamW lr=0.1
+#
+# Acceptance:
+# - The first epoch's loss is well above zero (random init, model wrong)
+# - The final epoch's loss is meaningfully lower than the first
+# - The trained weights produce correct predictions on the training set
+# ===========================================================================
+
+fn main(): void =>
+  println("=== test_train_epoch_smoke ===")
+  println("")
+
+  sn_graph_begin()
+
+  # ----------------------------------------------------------------------
+  # Build a tiny model: 2x2 weight matrix + 2-element bias
+  # Weights laid out as (inputDim, outputDim) per the gnnMatmul convention
+  # so that gnnMatmul(features, weight) gives the right shape.
+  # ----------------------------------------------------------------------
+  # Note: do NOT reassign the result of sn_graph_param. The Sindarin
+  # compiler's refcount management treats `t = sn_graph_param(t)` as a
+  # drop-then-take, which frees the tensor when the function returns the
+  # same pointer. Just call sn_graph_param without reassigning.
+  var weight: Tensor = Tensor.fromDoubles({0.1, -0.1, -0.1, 0.1}, 2, 2)
+  sn_graph_param(weight)
+
+  var bias: Tensor = Tensor.fromDoubles({0.0, 0.0}, 1, 2)
+  sn_graph_param(bias)
+
+  # ----------------------------------------------------------------------
+  # Build the input tensors as graph inputs (will be uploaded per batch).
+  # Initial values match what we'll upload first batch — the contents
+  # don't matter beyond compile-time validation since the per-batch loop
+  # overwrites them.
+  # features layout: 2 samples, 2 features each, row-major
+  # labels   layout: 2 samples, 2 classes each, row-major
+  # weights  layout: 2 samples, one scalar each
+  # ----------------------------------------------------------------------
+  var features: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 1.0}, 2, 2)
+  var labels: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 1.0}, 2, 2)
+  var weights: Tensor = sn_graph_input_data({1.0, 1.0}, 2, 1)
+
+  # ----------------------------------------------------------------------
+  # Forward pass: logits = features @ weight + bias
+  # ----------------------------------------------------------------------
+  var logits: Tensor = features.gnnMatmul(weight).add(bias)
+
+  # ----------------------------------------------------------------------
+  # Loss: per-sample weighted cross-entropy reduced to a scalar
+  # ----------------------------------------------------------------------
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+
+  # ----------------------------------------------------------------------
+  # Train for 30 epochs (full-batch, deterministic order, no shuffling).
+  # featuresHost contains the same data we want uploaded each batch.
+  # ----------------------------------------------------------------------
+  var featuresHost: double[] = {1.0, 0.0, 0.0, 1.0}
+  var labelsHost: double[] = {1.0, 0.0, 0.0, 1.0}
+  var weightsHost: double[] = {1.0, 1.0}
+  var perm: double[] = {0.0, 1.0} # full - batch, no shuffle
+
+  var initialLoss: double = -1.0
+  var finalLoss: double = -1.0
+
+  for var epoch: int = 0; epoch < 30; epoch++ =>
+    var epochLoss: double = sn_graph_train_epoch(
+      loss, features, labels, weights,
+      featuresHost, labelsHost, weightsHost,
+      perm,
+      2, 2, 2, # featuresPerSample, labelsPerSample, nPerBatch
+      "adamw",
+      0.1, 0.9, 0.999, 0.00000001, 0.0) # lr, beta1, beta2, eps, wd
+    if epoch == 0 =>
+      initialLoss = epochLoss
+    finalLoss = epochLoss
+
+  println($"  initial loss: {initialLoss}")
+  println($"  final   loss: {finalLoss}")
+
+  sn_graph_end()
+
+  # ----------------------------------------------------------------------
+  # Acceptance assertions
+  # ----------------------------------------------------------------------
+  assertTrue(initialLoss > 0.5,
+    "initial loss should be well above zero (random init)")
+  assertTrue(finalLoss < initialLoss * 0.5,
+    "final loss should be at least half the initial loss after 30 epochs")
+  assertTrue(finalLoss < 0.2,
+    "final loss should be small (model should fit 2 samples easily)")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

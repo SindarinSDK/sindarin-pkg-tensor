@@ -205,12 +205,24 @@ static ggml_gallocr_t run_graph(struct ggml_context *ctx, struct ggml_cgraph *gr
 
 /* Forward declarations */
 RtTensor *sn_tensor_zeros(long long rows, long long cols);
+RtTensor *sn_tensor_from_doubles(SnArray *data, long long rows, long long cols);
 
 /* ======================================================================
  * Graph recording API
  * ====================================================================== */
 
 static int g_pool_count_before_record = 0;
+
+/* State for sn_graph_train_epoch — persists across epoch calls inside one
+ * sn_graph_begin/end cycle. Lazy-initialized on the first epoch call,
+ * freed in sn_graph_end. */
+static ggml_opt_context_t    g_opt_ctx              = NULL;
+static ggml_backend_sched_t  g_opt_sched            = NULL;
+static ggml_backend_buffer_t g_opt_param_buf        = NULL;
+static struct ggml_tensor   *g_opt_loss_tensor      = NULL;
+static struct ggml_tensor   *g_opt_features_tensor  = NULL;
+static struct ggml_tensor   *g_opt_labels_tensor    = NULL;
+static struct ggml_tensor   *g_opt_weights_tensor   = NULL;
 
 void sn_graph_begin(void) {
     ensure_backend();
@@ -225,9 +237,27 @@ void sn_graph_begin(void) {
     g_record_ctx = g_compute_ctx;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = true;
+
+    /* Reset epoch-loop training state — fresh per begin/end cycle */
+    g_opt_ctx              = NULL;
+    g_opt_sched            = NULL;
+    g_opt_param_buf        = NULL;
+    g_opt_loss_tensor      = NULL;
+    g_opt_features_tensor  = NULL;
+    g_opt_labels_tensor    = NULL;
+    g_opt_weights_tensor   = NULL;
 }
 
 void sn_graph_end(void) {
+    /* Tear down epoch-loop training state if it was lazy-initialized */
+    if (g_opt_ctx)       { ggml_opt_free(g_opt_ctx);                  g_opt_ctx       = NULL; }
+    if (g_opt_sched)     { ggml_backend_sched_free(g_opt_sched);      g_opt_sched     = NULL; }
+    if (g_opt_param_buf) { ggml_backend_buffer_free(g_opt_param_buf); g_opt_param_buf = NULL; }
+    g_opt_loss_tensor     = NULL;
+    g_opt_features_tensor = NULL;
+    g_opt_labels_tensor   = NULL;
+    g_opt_weights_tensor  = NULL;
+
     if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
     if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }
     g_record_ctx = NULL;
@@ -248,6 +278,72 @@ RtTensor *sn_graph_input(long long rows, long long cols) {
     ggml_set_name(gt, "input");
     ggml_set_input(gt);
     return rec_wrap(gt, cols, rows);
+}
+
+/* Like sn_graph_input, but pre-populates the host pool slot with caller data
+ * so the same slot can be uploaded to the backend later via the standard
+ * "iterate g_record_map and upload" loop. Used for non-PARAM inputs whose
+ * values change between calls (labels, weights, batched node features). */
+RtTensor *sn_graph_input_data(SnArray *data, long long rows, long long cols) {
+    if (!g_record_mode) return sn_tensor_from_doubles(data, rows, cols);
+
+    int idx = pool_alloc(cols, rows, 2);
+    TPool *s = &g_pool[idx];
+    long long n = sn_array_length(data);
+    for (long long i = 0; i < n && i < s->n_elem; i++) {
+        double *p = (double *)sn_array_get(data, i);
+        s->data[i] = (float)(*p);
+    }
+
+    struct ggml_tensor *gt = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, cols, rows);
+    ggml_set_name(gt, "input_data");
+    ggml_set_input(gt);
+    g_record_map[idx] = gt;
+    return wrap_pool(idx);
+}
+
+/* Execute the recorded forward graph that ends at `loss_rt` and read the
+ * scalar value back. Used by tests to validate record-mode loss expressions
+ * in isolation, without ggml_opt / backward / optimizer involvement. */
+double sn_graph_compute_loss(RtTensor *loss_rt) {
+    if (!g_record_mode || !g_record_ctx || !loss_rt) return 0.0;
+
+    struct ggml_tensor *loss = rec_tensor(loss_rt);
+    if (!loss) return 0.0;
+    ggml_set_output(loss);
+
+    ensure_backend();
+
+    /* Allocate backend buffers for all tensors in the param context (inputs) */
+    ggml_backend_buffer_t param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+    /* Upload host data for every recorded input/param that has pool data */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && gt->buffer && g_pool[i].data) {
+            size_t want = (size_t)g_pool[i].n_elem * sizeof(float);
+            size_t have = ggml_nbytes(gt);
+            ggml_backend_tensor_set(gt, g_pool[i].data, 0, want < have ? want : have);
+        }
+    }
+
+    /* Build the forward graph from the loss tensor's ancestors */
+    struct ggml_cgraph *graph = ggml_new_graph_custom(g_compute_ctx, 4096, false);
+    ggml_build_forward_expand(graph, loss);
+
+    /* Allocate the compute graph via gallocr and compute */
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
+    ggml_gallocr_t alloc = ggml_gallocr_new(buft);
+    ggml_gallocr_alloc_graph(alloc, graph);
+    ggml_backend_graph_compute(g_backend, graph);
+
+    /* Read the scalar back */
+    float loss_value = 0.0f;
+    ggml_backend_tensor_get(loss, &loss_value, 0, sizeof(float));
+
+    ggml_gallocr_free(alloc);
+    if (param_buf) ggml_backend_buffer_free(param_buf);
+    return (double)loss_value;
 }
 
 RtTensor *sn_graph_param(RtTensor *rt) {
@@ -422,6 +518,193 @@ double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
 double sn_graph_train_loss(void)     { return g_train_loss; }
 double sn_graph_train_accuracy(void) { return g_train_accuracy; }
 long long sn_graph_train_ndata(void) { return g_train_ndata; }
+
+/* ======================================================================
+ * Per-epoch training driver
+ *
+ * This is the new training entry point. Unlike sn_graph_train (which
+ * wraps ggml_opt_epoch with the dataset abstraction), this function:
+ *
+ *   - Uses ggml_opt with loss_type=GGML_OPT_LOSS_TYPE_SUM and a
+ *     pre-built loss tensor as `outputs`. ggml_sum of a scalar is
+ *     identity, so the entire loss expression flows through unchanged
+ *     and backward propagates correctly.
+ *   - Drives the per-batch loop manually via ggml_opt_alloc/eval, with
+ *     three input uploads per batch (features, labels, weights).
+ *   - Lazy-initializes the opt context on the first call within a
+ *     sn_graph_begin/end cycle and reuses it across epochs. The state
+ *     is freed in sn_graph_end.
+ *
+ * Caller is responsible for shuffling: pass a permutation of sample
+ * indices in `batch_perm` (one entry per training sample). Per-epoch
+ * shuffling means re-shuffling the permutation between calls.
+ * ====================================================================== */
+double sn_graph_train_epoch(
+    RtTensor *loss_rt,
+    RtTensor *features_rt,
+    RtTensor *labels_rt,
+    RtTensor *weights_rt,
+    SnArray  *features_host,    /* total_samples * features_per_sample doubles */
+    SnArray  *labels_host,      /* total_samples * labels_per_sample doubles */
+    SnArray  *weights_host,     /* total_samples doubles, one weight per sample */
+    SnArray  *batch_perm,       /* total_samples doubles (integer-valued permutation) */
+    long long features_per_sample,
+    long long labels_per_sample,
+    long long n_per_batch,
+    char     *optimizer_str,
+    double    lr,
+    double    beta1,
+    double    beta2,
+    double    eps,
+    double    wd)
+{
+    if (!g_record_mode || !g_record_ctx) return -1.0;
+
+    struct ggml_tensor *loss     = rec_tensor(loss_rt);
+    struct ggml_tensor *features = rec_tensor(features_rt);
+    struct ggml_tensor *labels   = rec_tensor(labels_rt);
+    struct ggml_tensor *weights  = rec_tensor(weights_rt);
+    if (!loss || !features || !labels || !weights) return -1.0;
+
+    /* Update optimizer params (the callback reads from g_opt_params) */
+    g_opt_params = ggml_opt_get_default_optimizer_params(NULL);
+    g_opt_params.adamw.alpha = (float)lr;
+    g_opt_params.adamw.beta1 = (float)beta1;
+    g_opt_params.adamw.beta2 = (float)beta2;
+    g_opt_params.adamw.eps   = (float)eps;
+    g_opt_params.adamw.wd    = (float)wd;
+    g_opt_params.sgd.alpha   = (float)lr;
+    g_opt_params.sgd.wd      = (float)wd;
+
+    /* Lazy initialize opt context on the first call.
+     * Subsequent calls reuse the same opt context, sched, and param_buf. */
+    if (!g_opt_ctx) {
+        ggml_set_output(loss);
+
+        enum ggml_opt_optimizer_type opt_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+        if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
+
+        ggml_backend_t backends[] = { g_backend };
+        g_opt_sched = ggml_backend_sched_new(backends, NULL, 1, 4096, false, false);
+
+        /* Allocate backend buffers for params + recorded inputs in g_param_ctx */
+        g_opt_param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
+
+        /* Upload host data for every recorded tensor that has pool data.
+         * This populates params (from initKaiming) and the initial
+         * features/labels/weights values (which the per-batch loop will
+         * overwrite each batch). */
+        for (int i = 0; i < g_pool_count; i++) {
+            struct ggml_tensor *gt = g_record_map[i];
+            if (gt && gt->buffer && g_pool[i].data) {
+                size_t want = (size_t)g_pool[i].n_elem * sizeof(float);
+                size_t have = ggml_nbytes(gt);
+                ggml_backend_tensor_set(gt, g_pool[i].data, 0, want < have ? want : have);
+            }
+        }
+
+        struct ggml_opt_params opt_params_s = ggml_opt_default_params(g_opt_sched, GGML_OPT_LOSS_TYPE_SUM);
+        opt_params_s.ctx_compute     = g_compute_ctx;
+        opt_params_s.inputs          = features;  /* required non-null for static graphs */
+        opt_params_s.outputs         = loss;      /* OUR pre-built loss; sum-of-scalar = identity */
+        opt_params_s.opt_period      = 1;
+        opt_params_s.get_opt_pars    = sn_get_opt_params;
+        opt_params_s.get_opt_pars_ud = NULL;
+        opt_params_s.optimizer       = opt_type;
+
+        g_opt_ctx              = ggml_opt_init(opt_params_s);
+        /* Use ggml_opt_loss() — the loss tensor that ggml_opt_build creates
+         * in ctx_static (with a real buffer). The original `loss` we built
+         * lives in g_compute_ctx (no_alloc) and has no buffer to read from. */
+        g_opt_loss_tensor      = ggml_opt_loss(g_opt_ctx);
+        g_opt_features_tensor  = features;
+        g_opt_labels_tensor    = labels;
+        g_opt_weights_tensor   = weights;
+    }
+
+    /* Sanity check: caller must use the same tensors as the init call */
+    if (features != g_opt_features_tensor ||
+        labels   != g_opt_labels_tensor   ||
+        weights  != g_opt_weights_tensor) {
+        return -1.0;
+    }
+
+    long long total_samples = sn_array_length(batch_perm);
+    long long n_batches     = total_samples / n_per_batch;
+    if (n_batches == 0) return 0.0;
+
+    /* Per-batch scratch buffers — sized from the tensor shapes, since
+     * each batch fills the entire input tensor. */
+    size_t features_bytes = ggml_nbytes(features);
+    size_t labels_bytes   = ggml_nbytes(labels);
+    size_t weights_bytes  = ggml_nbytes(weights);
+
+    float *features_buf = (float *)malloc(features_bytes);
+    float *labels_buf   = (float *)malloc(labels_bytes);
+    float *weights_buf  = (float *)malloc(weights_bytes);
+
+    double total_loss = 0.0;
+
+    for (long long batch_idx = 0; batch_idx < n_batches; batch_idx++) {
+        /* Build this batch's host buffers by indexing through the permutation */
+        for (long long i = 0; i < n_per_batch; i++) {
+            double *perm_val = (double *)sn_array_get(batch_perm, batch_idx * n_per_batch + i);
+            long long sample_idx = (long long)(*perm_val);
+
+            /* Features for this sample (features_per_sample doubles) */
+            for (long long j = 0; j < features_per_sample; j++) {
+                double *v = (double *)sn_array_get(features_host, sample_idx * features_per_sample + j);
+                features_buf[i * features_per_sample + j] = (float)(*v);
+            }
+
+            /* Labels for this sample (labels_per_sample doubles) */
+            for (long long j = 0; j < labels_per_sample; j++) {
+                double *v = (double *)sn_array_get(labels_host, sample_idx * labels_per_sample + j);
+                labels_buf[i * labels_per_sample + j] = (float)(*v);
+            }
+
+            /* One weight per sample */
+            double *w = (double *)sn_array_get(weights_host, sample_idx);
+            weights_buf[i] = (float)(*w);
+        }
+
+        /* Allocate the OPT graph for this batch (cached after first call) */
+        ggml_opt_alloc(g_opt_ctx, /*backward =*/ true);
+
+        /* Upload the batch's input data to the backend buffers */
+        ggml_backend_tensor_set(g_opt_features_tensor, features_buf, 0, features_bytes);
+        ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
+        ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
+
+        /* Run forward + backward + AdamW step (NULL result — we read loss directly) */
+        ggml_opt_eval(g_opt_ctx, NULL);
+
+        /* Read the scalar loss back */
+        float batch_loss = 0.0f;
+        ggml_backend_tensor_get(g_opt_loss_tensor, &batch_loss, 0, sizeof(float));
+        total_loss += (double)batch_loss;
+    }
+
+    free(features_buf);
+    free(labels_buf);
+    free(weights_buf);
+
+    /* Read back updated PARAM data into the pool slots so subsequent
+     * inference (forward() outside record mode) sees the trained values. */
+    for (int i = 0; i < g_pool_count; i++) {
+        struct ggml_tensor *gt = g_record_map[i];
+        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+            TPool *s = &g_pool[i];
+            if (gt->buffer) {
+                ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
+            } else if (gt->data) {
+                memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
+            }
+        }
+    }
+
+    return total_loss / (double)n_batches;
+}
 
 /* ======================================================================
  * Creation
@@ -904,18 +1187,14 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
         ggml_set_input(gpool);
         g_record_map[pool_idx] = gpool;
 
-        /* Pre-transpose features on host to avoid ggml_transpose backward issues.
-         * features: ne0=feat_dim, ne1=num_nodes → transposed: ne0=num_nodes, ne1=feat_dim */
-        TPool *px_ne = unwrap(node_embeddings);
-        int ft_pool = pool_alloc(num_nodes, feat_dim, 2);
-        TPool *ft_s = &g_pool[ft_pool];
-        for (int64_t r = 0; r < num_nodes; r++)
-            for (int64_t c = 0; c < feat_dim; c++)
-                ft_s->data[c * num_nodes + r] = px_ne->data[r * feat_dim + c];
-        struct ggml_tensor *feat_t = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, feat_dim);
+        /* Transpose features INSIDE the graph (not on host) so per-batch
+         * uploads of node_embeddings are reflected in the recorded graph.
+         * Requires the patched ggml_repeat_back that handles non-contiguous
+         * input tensors via internal ggml_cont (see vendor/ggml patch). */
+        struct ggml_tensor *gfeat = rec_tensor(node_embeddings);
+        struct ggml_tensor *feat_t = ggml_cont(g_record_ctx,
+            ggml_transpose(g_record_ctx, gfeat));
         ggml_set_name(feat_t, "embed_T");
-        ggml_set_input(feat_t);
-        g_record_map[ft_pool] = feat_t;
 
         /* result = ggml_mul_mat(feat_t, gpool) → [feat_dim, num_graphs] */
         struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, feat_t, gpool);
@@ -1042,21 +1321,14 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
         ggml_set_input(gadj);
         /* Data uploaded after ggml_backend_alloc_ctx_tensors */
         g_record_map[adj_idx] = gadj;
-        /* result = adj × features: ggml_mul_mat dots over ne0.
-         * features: ne0=feat_dim, ne1=num_nodes
-         * adj: ne0=num_nodes, ne1=num_nodes
-         * Need features transposed: ne0=num_nodes, ne1=feat_dim
-         * Pre-transpose on host to avoid ggml_transpose backward issues. */
-        TPool *px_f = unwrap(features);
-        int ft_pool = pool_alloc(num_nodes, feat_dim, 2);
-        TPool *ft_s = &g_pool[ft_pool];
-        for (int64_t r = 0; r < num_nodes; r++)
-            for (int64_t c = 0; c < feat_dim; c++)
-                ft_s->data[c * num_nodes + r] = px_f->data[r * feat_dim + c];
-        struct ggml_tensor *gfeat_t = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, feat_dim);
+
+        /* Transpose features INSIDE the graph (not on host) so per-batch
+         * uploads of `features` are reflected in the recorded graph.
+         * Requires the patched ggml_repeat_back. */
+        struct ggml_tensor *gfeat = rec_tensor(features);
+        struct ggml_tensor *gfeat_t = ggml_cont(g_record_ctx,
+            ggml_transpose(g_record_ctx, gfeat));
         ggml_set_name(gfeat_t, "feat_T");
-        ggml_set_input(gfeat_t);
-        g_record_map[ft_pool] = gfeat_t;
 
         struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, gfeat_t, gadj);
         return rec_wrap(result, feat_dim, num_nodes);

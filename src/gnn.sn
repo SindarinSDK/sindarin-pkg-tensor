@@ -15,6 +15,7 @@
 # ==============================================================================
 
 import "./tensor"
+import "sindarin-pkg-sdk/src/core/random"
 
 # ---------------------------------------------------------------------------
 # GNN configuration
@@ -220,61 +221,133 @@ struct Gnn =>
     if idx < len(loaded) =>
       self.classifierB2 = loaded[idx]
 
-  fn train(data: double[], labels: double[], numSamples: int, batchSize: int, featureDim: int, optimizer: Optimizer, epochs: int, valSplit: double): TrainResult =>
-    # Enter graph recording mode — all tensor ops record to ggml graph
+  # Train the GNN against a list of caller-supplied graphs.
+  #
+  # Constraint: all graphs must share the same per-graph numNodes, numEdges,
+  # and featureDim. The recorded forward graph is built from the FIRST
+  # `batchSize` graphs and reused across all minibatches — every minibatch
+  # must therefore produce the same batched-graph shape. Variable-shape
+  # graphs within a single train() call are not supported (caller must
+  # bucket by shape and call train() once per bucket).
+  #
+  # Per-sample weights: weights[i] is the loss multiplier for sample i.
+  # Pass all 1.0s for unweighted training. Pass per-sample advantages or
+  # importance weights for policy-gradient training.
+  #
+  # Shuffling: deterministic via Random.createWithSeed(seed). Pass the same
+  # seed across runs to reproduce the exact same training trajectory.
+  #
+  # IMPORTANT: do NOT reassign the result of sn_graph_param(t) — see
+  # docs/issues/compiler-problems.29.md for the refcount self-assignment
+  # bug. The discard pattern below is the safe form.
+  fn train(graphs: GraphTensors[], labels: double[], weights: double[],
+    optimizer: Optimizer, epochs: int, batchSize: int,
+    valSplit: double, seed: long): TrainResult =>
+
+    if len(graphs) == 0 || epochs <= 0 || batchSize <= 0 =>
+      return TrainResult {
+        loss: 0.0,
+        accuracy: 0.0,
+        epochs: 0
+      }
+
+    var totalSamples: int = len(graphs)
+    var nodesPerGraph: int = graphs[0].numNodes
+    var featureDim: int = graphs[0].featureDim
+    var numClasses: int = self.config.numActions
+    var featuresPerSample: int = nodesPerGraph * featureDim
+
+    # --- Build the batched graph from the FIRST batchSize graphs.
+    # This defines the recorded forward graph's STRUCTURE (edges,
+    # batchIndex). All subsequent minibatches must produce the same shape.
+    var template: GraphTensors[] = {}
+    for var i: int = 0; i < batchSize; i++ =>
+      template.push(graphs[i])
+    var batched: GraphTensors = batchGraphs(template)
+
+    # --- Extract host-side feature data from ALL training graphs into
+    # one flat double[] in [graph0_features..., graph1_features..., ...]
+    # order. The C-side per-batch loop indexes into this via the
+    # permutation array.
+    var featuresHost: double[] = {}
+    for var i: int = 0; i < totalSamples; i++ =>
+      var f: double[] = graphs[i].nodeFeatures.toDoubles()
+      for var j: int = 0; j < len(f); j++ =>
+        featuresHost.push(f[j])
+
+    # --- Begin record mode and build the static training graph.
     sn_graph_begin()
 
-    # Register all model parameters as trainable
+    # Register PARAMs (DISCARD return — see compiler bug note above).
     var params: Tensor[] = self.parameters()
     for var i: int = 0; i < len(params); i++ =>
       sn_graph_param(params[i])
 
-    # Build template graph: batchSize nodes, each a self-loop with weight 1.0.
-    # Each node maps to its own graph via batchIndex so meanPool is identity.
-    var templateFeatures: double[] = {}
-    for var i: int = 0; i < batchSize * featureDim; i++ =>
-      templateFeatures.push(0.5)
-
-    var edgeSrc: double[] = {}
-    var edgeDst: double[] = {}
-    var edgeWts: double[] = {}
-    var batchIdx: double[] = {}
+    # Initial dummy values for the input tensors. The per-batch upload
+    # in sn_graph_train_epoch overwrites these on every batch, so the
+    # initial contents don't affect training — they only need to match
+    # the tensor shapes.
+    var initFeatures: double[] = {}
+    for var i: int = 0; i < batched.numNodes * featureDim; i++ =>
+      initFeatures.push(0.0)
+    var initLabels: double[] = {}
+    for var i: int = 0; i < batchSize * numClasses; i++ =>
+      initLabels.push(0.0)
+    var initWeights: double[] = {}
     for var i: int = 0; i < batchSize; i++ =>
-      edgeSrc.push(i.toDouble())
-      edgeDst.push(i.toDouble())
-      edgeWts.push(1.0)
-      batchIdx.push(i.toDouble())
+      initWeights.push(0.0)
 
-    var edgeData: double[] = {}
-    for var i: int = 0; i < len(edgeSrc); i++ =>
-      edgeData.push(edgeSrc[i])
-    for var i: int = 0; i < len(edgeDst); i++ =>
-      edgeData.push(edgeDst[i])
+    var nodeFeaturesInput: Tensor = sn_graph_input_data(
+      initFeatures, batched.numNodes, featureDim)
+    var labelsInput: Tensor = sn_graph_input_data(
+      initLabels, batchSize, numClasses)
+    var weightsInput: Tensor = sn_graph_input_data(
+      initWeights, batchSize, 1)
 
-    var recordGraph: GraphTensors = {
-      nodeFeatures: sn_graph_input(batchSize, featureDim),
-      edgeIndex: Tensor.fromDoubles(edgeData, 2, batchSize),
-      edgeWeight: Tensor.fromDoubles(edgeWts, 1, batchSize),
-      batchIndex: Tensor.fromDoubles(batchIdx, batchSize, 1),
-      numNodes: batchSize,
-      numEdges: batchSize,
-      featureDim: featureDim
+    # Build a fresh GraphTensors with the input nodeFeatures + the
+    # constant edge structure from `batched`. This avoids any field
+    # reassignment on `batched` (see compiler-problems.29.md).
+    var inputGraph: GraphTensors = {
+      nodeFeatures: nodeFeaturesInput,
+      edgeIndex: batched.edgeIndex,
+      edgeWeight: batched.edgeWeight,
+      batchIndex: batched.batchIndex,
+      numNodes: batched.numNodes,
+      numEdges: batched.numEdges,
+      featureDim: batched.featureDim
     }
-    var input: Tensor = recordGraph.nodeFeatures
-    var output: GnnOutput = self.forward(recordGraph, true)
 
-    # Run ggml_opt on the captured graph — pass logits (pre-softmax),
-    # NOT probs, because ggml cross_entropy_loss applies softmax internally
-    sn_graph_train(output.logits, input, data, labels, numSamples, epochs, batchSize, valSplit, "cross_entropy", optimizer.kind, optimizer.learningRate, optimizer.weightDecay)
+    var output: GnnOutput = self.forward(inputGraph, true)
+    var loss: Tensor = sn_tensor_weighted_cross_entropy(
+      output.logits, labelsInput, weightsInput)
 
-    var trainLoss: double = sn_graph_train_loss()
-    var trainAccuracy: double = sn_graph_train_accuracy()
+    # --- Epoch loop with deterministic shuffling.
+    var rng: Random = Random.createWithSeed(seed)
+    var perm: double[] = {}
+    for var i: int = 0; i < totalSamples; i++ =>
+      perm.push(i.toDouble())
 
-    # Exit graph mode — parameters updated in pool
+    var totalLoss: double = 0.0
+    var eps: double = 0.00000001
+
+    for var epoch: int = 0; epoch < epochs; epoch++ =>
+      rng.shuffleDouble(perm)
+      var epochLoss: double = sn_graph_train_epoch(
+        loss, nodeFeaturesInput, labelsInput, weightsInput,
+        featuresHost, labels, weights, perm,
+        featuresPerSample, numClasses, batchSize,
+        optimizer.kind,
+        optimizer.learningRate,
+        optimizer.beta1, optimizer.beta2, eps,
+        optimizer.weightDecay)
+      totalLoss = totalLoss + epochLoss
+
+    var avgLoss: double = totalLoss / epochs.toDouble()
+
     sn_graph_end()
 
     return TrainResult {
-      loss: trainLoss,
-      accuracy: trainAccuracy,
+      loss: avgLoss,
+      accuracy: 0.0, # TODO: compute in 2c.5 with full TrainResult diagnostics
       epochs: epochs
     }

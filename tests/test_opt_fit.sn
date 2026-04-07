@@ -1,8 +1,17 @@
 import "../src/tensor"
 import "../src/gnn"
 
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
 fn main(): void =>
-  println("=== Test Gnn.train (ggml_opt_fit path) ===")
+  println("=== Test Gnn.train (per-epoch path) ===")
 
   # Simple 1-layer GCN: inputDim=2, hiddenDim=4, numActions=2
   var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
@@ -18,11 +27,18 @@ fn main(): void =>
     println($"    param[{i}] norm={n} shape=[{s[0]},{s[1]}]")
 
   # 4 training samples: 2 features each, 2 classes (one-hot labels)
-  var data: double[] = {1.0, 0.0, 0.0, 1.0, 0.8, 0.2, 0.2, 0.8}
+  var trainGraphs: GraphTensors[] = {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2)
+  }
   var labels: double[] = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+  var weights: double[] = {1.0, 1.0, 1.0, 1.0}
 
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
-  var result: TrainResult = model.train(data, labels, 4, 1, 2, opt, 50, 0.0)
+  var result: TrainResult = model.train(
+    trainGraphs, labels, weights, opt, 50, 1, 0.0, 42l)
   println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")
 
   var params2: Tensor[] = model.parameters()

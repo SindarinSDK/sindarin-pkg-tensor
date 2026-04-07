@@ -1,6 +1,15 @@
 import "../src/tensor"
 import "../src/gnn"
 
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
 # ===========================================================================
 # Crusher policy learning test.
 # Uses real crusher sensor features to verify the GNN can learn:
@@ -20,7 +29,6 @@ fn main(): void =>
   var numActions: int = 3
 
   # --- Training data: 15 samples covering all 3 scenarios ---
-  var data: double[] = {}
   var labels: double[] = {}
 
   # SPEED UP samples (starved: low amps, low weight)
@@ -76,18 +84,23 @@ fn main(): void =>
       if allSamples[s][f] > maxs[f] =>
         maxs[f] = allSamples[s][f]
 
+  var trainGraphs: GraphTensors[] = {}
+  var weights: double[] = {}
   for var s: int = 0; s < len(allSamples); s++ =>
+    var normFeatures: double[] = {}
     for var f: int = 0; f < featureDim; f++ =>
       var range: double = maxs[f] - mins[f]
       if range > 0.001 =>
-        data.push((allSamples[s][f] - mins[f]) / range)
+        normFeatures.push((allSamples[s][f] - mins[f]) / range)
       else =>
-        data.push(0.5)
+        normFeatures.push(0.5)
+    trainGraphs.push(singleNode(normFeatures, featureDim))
     for var a: int = 0; a < numActions; a++ =>
       if a == allActions[s] =>
         labels.push(1.0)
       else =>
         labels.push(0.0)
+    weights.push(1.0)
 
   var numSamples: int = len(allSamples)
   println($"  samples: {numSamples} ({len(speedUp)} speed_up, {len(speedDown)} speed_down, {len(hold)} hold)")
@@ -101,7 +114,8 @@ fn main(): void =>
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
 
   println("  training 200 epochs, batch=5...")
-  var result: TrainResult = model.train(data, labels, numSamples, 5, featureDim, opt, 200, 0.0)
+  var result: TrainResult = model.train(
+    trainGraphs, labels, weights, opt, 200, 5, 0.0, 42l)
   println($"  loss={result.loss}, accuracy={result.accuracy}")
   println("")
 

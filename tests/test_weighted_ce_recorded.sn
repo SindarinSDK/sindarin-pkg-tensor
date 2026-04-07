@@ -1,0 +1,135 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+
+# ===========================================================================
+# test_weighted_ce_recorded.sn — record-mode unit test for
+# sn_tensor_weighted_cross_entropy
+#
+# Step 2b's test_weighted_ce.sn covered the direct-mode branch only.
+# This test exercises the record-mode branch BEFORE Step 2c relies on it
+# inside the train loop. If the record-mode branch has a graph-build bug
+# (wrong shape, missing op, broken set_output), it'll show up here in
+# isolation rather than buried in an end-to-end training failure.
+#
+# Strategy:
+# - sn_graph_begin() to enter record mode
+# - Create logits/labels/weights as graph inputs via sn_graph_input_data
+# (allocates ggml input tensors AND seeds the pool slot with host data)
+# - Call sn_tensor_weighted_cross_entropy — routes through the record-mode
+# branch since g_record_mode is true
+# - Call sn_graph_compute_loss to execute the recorded forward graph and
+# read the scalar loss back
+# - Compare against the SAME hand-computed reference values from
+# test_weighted_ce.sn (Step 2b)
+# - sn_graph_end() to tear down the record context
+#
+# Reference values (identical to test_weighted_ce.sn):
+# logits row 0: [3, 0, 0]   labels row 0: [1, 0, 0]   contribution = -0.0949001
+# logits row 1: [0, 0, 1]   labels row 1: [0, 0, 1]   contribution = -0.55145
+#
+# weights [1, 1] : 0.323176
+# weights [2, 0] : 0.094900
+# weights [0, 2] : 0.551449
+# weights [0.5, 0.5] : 0.161588
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Case 1 — uniform weights [1, 1]
+# ---------------------------------------------------------------------------
+fn case1(): void =>
+  print("case 1 (recorded): uniform weights [1, 1]\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data(
+    {3.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var labels: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var weights: Tensor = sn_graph_input_data({1.0, 1.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 0.323176, 0.0001,
+    "case1 recorded weighted CE matches direct-mode reference")
+
+# ---------------------------------------------------------------------------
+# Case 2 — weights [2, 0]
+# ---------------------------------------------------------------------------
+fn case2(): void =>
+  print("case 2 (recorded): weights [2, 0]\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data(
+    {3.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var labels: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var weights: Tensor = sn_graph_input_data({2.0, 0.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 0.094900, 0.0001,
+    "case2 recorded weighted CE — only sample 0 contributes")
+
+# ---------------------------------------------------------------------------
+# Case 3 — weights [0, 2]
+# ---------------------------------------------------------------------------
+fn case3(): void =>
+  print("case 3 (recorded): weights [0, 2]\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data(
+    {3.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var labels: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var weights: Tensor = sn_graph_input_data({0.0, 2.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 0.551449, 0.0001,
+    "case3 recorded weighted CE — only sample 1 contributes")
+
+# ---------------------------------------------------------------------------
+# Case 4 — uniform 0.5 weights (linearity check)
+# ---------------------------------------------------------------------------
+fn case4(): void =>
+  print("case 4 (recorded): weights [0.5, 0.5]\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data(
+    {3.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var labels: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 0.0, 0.0, 0.0, 1.0}, 2, 3)
+  var weights: Tensor = sn_graph_input_data({0.5, 0.5}, 2, 1)
+
+  var loss: Tensor = sn_tensor_weighted_cross_entropy(logits, labels, weights)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 0.161588, 0.0001,
+    "case4 recorded weighted CE — uniform 0.5 weights = half of unit")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+fn main(): void =>
+  println("=== test_weighted_ce_recorded ===")
+  println("")
+  case1()
+  case2()
+  case3()
+  case4()
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

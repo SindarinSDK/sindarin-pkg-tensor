@@ -6,6 +6,15 @@ import "../src/gnn"
 # Mirrors skynet's full flow: GAT model, 24 features, 3 actions
 # ===========================================================================
 
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
 fn main(): void =>
   println("=== Integration: train → save → load → infer ===")
 
@@ -17,7 +26,6 @@ fn main(): void =>
   var model: Gnn = Gnn.create(config)
 
   # --- Training data: 4 samples, 24 features, 3 actions (one-hot) ---
-  var data: double[] = {}
   # Sample 1: overloaded (high amps, high weight)
   var s1: double[] = {1.0, 0.3, 0.9, 0.8, 0.2, 0.7, 0.6, 0.9, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.9, 0.7, 0.6}
   # Sample 2: starved (low amps, low weight)
@@ -26,14 +34,6 @@ fn main(): void =>
   var s3: double[] = {0.9, 0.4, 0.8, 0.7, 0.3, 0.6, 0.5, 0.8, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.8, 0.6, 0.5}
   # Sample 4: similar to starved
   var s4: double[] = {0.1, 0.6, 0.2, 0.3, 0.7, 0.4, 0.5, 0.2, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.2, 0.4, 0.5}
-  for var i: int = 0; i < len(s1); i++ =>
-    data.push(s1[i])
-  for var i: int = 0; i < len(s2); i++ =>
-    data.push(s2[i])
-  for var i: int = 0; i < len(s3); i++ =>
-    data.push(s3[i])
-  for var i: int = 0; i < len(s4); i++ =>
-    data.push(s4[i])
 
   # Labels: overloaded→speed_down(idx 1), starved→speed_up(idx 0)
   var labels: double[] = {
@@ -42,6 +42,7 @@ fn main(): void =>
     0.0, 1.0, 0.0,
     1.0, 0.0, 0.0
   }
+  var trainWeights: double[] = {1.0, 1.0, 1.0, 1.0}
 
   # --- Pre-training inference ---
   var inferGraph1: GraphTensors = {
@@ -64,10 +65,20 @@ fn main(): void =>
   println($"  pre-train overloaded: [{pre1[0]}, {pre1[1]}, {pre1[2]}]")
   println($"  pre-train starved:    [{pre2[0]}, {pre2[1]}, {pre2[2]}]")
 
+  # --- Build single-node training graphs (one per sample) ---
+  var trainGraphs: GraphTensors[] = {
+    singleNode(s1, 24),
+    singleNode(s2, 24),
+    singleNode(s3, 24),
+    singleNode(s4, 24)
+  }
+
   # --- Train ---
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
   println("  training 100 epochs...")
-  var result: TrainResult = model.train(data, labels, 4, 1, 24, opt, 100, 0.0)
+  var result: TrainResult = model.train(
+    trainGraphs, labels, trainWeights,
+    opt, 100, 1, 0.0, 42l)
   println($"  train done, loss={result.loss}")
 
   # --- Post-training inference ---

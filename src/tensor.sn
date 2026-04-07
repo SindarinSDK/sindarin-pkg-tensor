@@ -152,11 +152,26 @@ native fn sn_tensor_pool_restore(checkpoint: long): void
 native fn sn_graph_begin(): void
 native fn sn_graph_end(): void
 native fn sn_graph_input(rows: int, cols: int): Tensor
+native fn sn_graph_input_data(data: double[], rows: int, cols: int): Tensor
 native fn sn_graph_param(t: Tensor): Tensor
+native fn sn_graph_compute_loss(t: Tensor): double
 native fn sn_graph_train(output: Tensor, input: Tensor, data: double[], labels: double[], nsamples: int, epochs: int, batchSize: int, valSplit: double, lossType: str, optimizer: str, lr: double, wd: double): double
 native fn sn_graph_train_loss(): double
 native fn sn_graph_train_accuracy(): double
 native fn sn_graph_train_ndata(): int
+
+# Per-epoch training driver. Lazy-initializes a static-graph ggml_opt
+# context on the first call within a sn_graph_begin/end cycle, runs one
+# epoch's worth of minibatches with manual data uploads, and returns the
+# average per-batch loss. Caller owns the permutation array (shuffled by
+# the caller per epoch for deterministic-but-shuffled training).
+native fn sn_graph_train_epoch(
+  loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
+  featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  batchPerm: double[],
+  featuresPerSample: int, labelsPerSample: int, nPerBatch: int,
+  optimizer: str,
+  lr: double, beta1: double, beta2: double, eps: double, wd: double): double
 
 # ---------------------------------------------------------------------------
 # Optimizer configuration
