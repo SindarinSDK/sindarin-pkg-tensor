@@ -111,6 +111,9 @@ native struct Tensor as ref =>
   fn initKaiming(): void =>
     sn_tensor_init_kaiming(self)
 
+  fn initKaimingSeeded(seed: long): void =>
+    sn_tensor_init_kaiming_seeded(self, seed)
+
 # ---------------------------------------------------------------------------
 # Native function declarations
 # ---------------------------------------------------------------------------
@@ -137,6 +140,7 @@ native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edg
 native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
 native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weights: Tensor): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
+native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
 native fn sn_gpu_available(): bool
 native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
 native fn sn_model_save(params: Tensor[], path: str): void

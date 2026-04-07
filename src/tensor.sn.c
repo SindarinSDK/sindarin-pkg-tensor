@@ -1566,23 +1566,75 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
 
 /* ======================================================================
  * Initialization
- * ====================================================================== */
+ * ======================================================================
+ *
+ * Kaiming weight init uses a local xorshift64 PRNG rather than libc
+ * rand(). Two reasons:
+ *   1. libc rand() is a global: any other caller (including dropout)
+ *      shares state, so init becomes order-dependent.
+ *   2. The old code called srand(time(NULL)) once per process, which
+ *      made model weights jitter across runs at 1-second resolution —
+ *      untrained inference was silently non-reproducible even when the
+ *      caller thought they had fixed the seed. See the seeded variant
+ *      below and Gnn.createWithSeed in src/gnn.sn.
+ */
 
-RtTensor *sn_tensor_init_kaiming(RtTensor *t)
+static uint64_t xorshift64(uint64_t *state)
 {
-    TPool *pt = unwrap(t);
-    static int seeded = 0;
-    if (!seeded) { srand((unsigned)time(NULL)); seeded = 1; }
+    uint64_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    return x;
+}
 
-    /* Kaiming uniform: U(-bound, bound) where bound = sqrt(6 / fan_in) */
+/* Fill `pt` with Kaiming-uniform values drawn from the given PRNG
+ * state. U(-bound, bound) where bound = sqrt(6 / fan_in). */
+static void kaiming_fill(TPool *pt, uint64_t *state)
+{
     int64_t fan_in = pt->ne[0];
     float bound = sqrtf(6.0f / (float)(fan_in > 0 ? fan_in : 1));
-
     for (int64_t i = 0; i < pt->n_elem; i++) {
-        float u = (float)rand() / (float)RAND_MAX;
+        /* Take the high 24 bits and map to [0, 1). */
+        uint64_t r = xorshift64(state);
+        float u = (float)(r >> 40) * (1.0f / 16777216.0f);
         pt->data[i] = (2.0f * u - 1.0f) * bound;
     }
+}
 
+/* Unseeded Kaiming init. Lazy-seeds a process-local xorshift state
+ * from time(NULL) on first use, then advances that state across
+ * subsequent calls. Same observable "different every run" behaviour
+ * as the previous srand(time(NULL)) path — just without polluting
+ * libc rand() and without the 1-second-resolution correlation gap.
+ * Callers that need reproducibility should use the seeded variant. */
+RtTensor *sn_tensor_init_kaiming(RtTensor *t)
+{
+    static uint64_t g_state = 0;
+    if (g_state == 0) {
+        g_state = (uint64_t)time(NULL);
+        /* xorshift64 degenerates at state 0, so substitute the
+         * golden-ratio constant if time() returned 0. */
+        if (g_state == 0) g_state = 0x9E3779B97F4A7C15ULL;
+    }
+    kaiming_fill(unwrap(t), &g_state);
+    return t;
+}
+
+/* Seeded Kaiming init. Produces bit-identical weights for the same
+ * seed across process invocations and machine rebuilds. */
+RtTensor *sn_tensor_init_kaiming_seeded(RtTensor *t, long long seed)
+{
+    uint64_t state = (uint64_t)seed;
+    if (state == 0) state = 0x9E3779B97F4A7C15ULL;
+    /* Warm-up rounds so small/adjacent seeds decorrelate before we
+     * start sampling. xorshift has a long period but short-seed
+     * trajectories look correlated for the first few outputs. */
+    xorshift64(&state);
+    xorshift64(&state);
+    xorshift64(&state);
+    kaiming_fill(unwrap(t), &state);
     return t;
 }
 

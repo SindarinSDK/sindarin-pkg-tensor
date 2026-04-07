@@ -23,7 +23,7 @@ fn main(): void =>
     inputDim: 24, hiddenDim: 32, numActions: 3,
     numLayers: 3, arch: "gat", dropoutRate: 0.0
   }
-  var model: Gnn = Gnn.create(config)
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
 
   # --- Training data: 4 samples, 24 features, 3 actions (one-hot) ---
   # Sample 1: overloaded (high amps, high weight)

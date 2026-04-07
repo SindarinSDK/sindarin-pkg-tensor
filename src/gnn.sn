@@ -74,6 +74,24 @@ struct GnnLayer =>
     layer.weight.initKaiming()
     return layer
 
+  # Deterministic variant of create(): seeds the weight tensor's Kaiming
+  # init from the given value so two runs with the same seed produce
+  # bit-identical layers. bias and attWeight remain at zeros (matching
+  # create()).
+  static fn createWithSeed(arch: str, inputDim: int, outputDim: int,
+    dropoutRate: double, seed: long): GnnLayer =>
+    var layer: GnnLayer = GnnLayer {
+      weight: Tensor.zeros(outputDim, inputDim),
+      bias: Tensor.zeros(1, outputDim),
+      attWeight: Tensor.zeros(1, 2 * outputDim),
+      inputDim: inputDim,
+      outputDim: outputDim,
+      arch: arch,
+      dropoutRate: dropoutRate
+    }
+    layer.weight.initKaimingSeeded(seed)
+    return layer
+
   fn forward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     if self.arch == "gcn" =>
       return self.gcnForward(x, edgeIndex, edgeWeight, training)
@@ -137,6 +155,43 @@ struct Gnn =>
     var w2: Tensor = Tensor.zeros(na, hd)
     w1.initKaiming()
     w2.initKaiming()
+    var b1: Tensor = Tensor.zeros(1, hd)
+    var b2: Tensor = Tensor.zeros(1, na)
+
+    return Gnn {
+      layers: gnnLayers,
+      classifierW1: w1,
+      classifierB1: b1,
+      classifierW2: w2,
+      classifierB2: b2,
+      config: config
+    }
+
+  # Deterministic variant of create(): every Kaiming-initialized weight
+  # is seeded from the given base seed so two runs (and two rebuilds)
+  # produce bit-identical initial weights. Seeds are distributed as:
+  # layer[i].weight   -> base + i            (0 <= i < numLayers)
+  # classifierW1      -> base + numLayers
+  # classifierW2      -> base + numLayers + 1
+  # The C-side xorshift PRNG runs warm-up rounds, so adjacent base+k
+  # seeds decorrelate before any weights are sampled.
+  static fn createWithSeed(config: GnnConfig, seed: long): Gnn =>
+    var gnnLayers: GnnLayer[] = {}
+    gnnLayers.push(GnnLayer.createWithSeed(
+      config.arch, config.inputDim, config.hiddenDim,
+      config.dropoutRate, seed))
+    for var i: int = 1; i < config.numLayers; i++ =>
+      gnnLayers.push(GnnLayer.createWithSeed(
+        config.arch, config.hiddenDim, config.hiddenDim,
+        config.dropoutRate, seed + i.toLong()))
+
+    var hd: int = config.hiddenDim
+    var na: int = config.numActions
+
+    var w1: Tensor = Tensor.zeros(hd, hd)
+    var w2: Tensor = Tensor.zeros(na, hd)
+    w1.initKaimingSeeded(seed + config.numLayers.toLong())
+    w2.initKaimingSeeded(seed + config.numLayers.toLong() + 1l)
     var b1: Tensor = Tensor.zeros(1, hd)
     var b2: Tensor = Tensor.zeros(1, na)
 
