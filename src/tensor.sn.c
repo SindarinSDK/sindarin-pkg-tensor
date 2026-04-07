@@ -985,7 +985,7 @@ RtTensor *sn_tensor_softmax(RtTensor *t, long long dim)
 RtTensor *sn_tensor_dropout(RtTensor *t, double rate, int training)
 {
     TPool *pt = unwrap(t);
-    if (g_record_mode) { t->__rc__++; return t; } /* identity in graph mode — retain for caller ownership */
+    if (g_record_mode) return t; /* identity in graph mode — borrow-inference handles rc at call site */
     int idx = pool_alloc(pt->ne[0], pt->ne[1], pt->n_dims);
     TPool *out = &g_pool[idx];
 
@@ -1010,7 +1010,7 @@ RtTensor *sn_tensor_batch_norm(RtTensor *t, RtTensor *weight, RtTensor *bias,
                                RtTensor *running_mean, RtTensor *running_var,
                                int training)
 {
-    if (g_record_mode) { t->__rc__++; return t; } /* identity — batchnorm removed from GNN architecture */
+    if (g_record_mode) return t; /* identity — batchnorm removed from GNN architecture */
     TPool *pt   = unwrap(t);
     TPool *pw   = unwrap(weight);
     TPool *pb   = unwrap(bias);
@@ -1161,7 +1161,6 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
                 if ((int64_t)pb->data[i] != i) { is_identity = 0; break; }
             }
             if (is_identity) {
-                node_embeddings->__rc__++;
                 return node_embeddings;
             }
         }
@@ -1312,7 +1311,6 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
             /* Adjacency is I — aggregate returns input unchanged */
             free(adj->data); adj->data = NULL;
             g_pool_count--; /* reclaim the adj slot */
-            features->__rc__++;
             return features;
         }
 
