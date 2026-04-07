@@ -12,21 +12,28 @@
 | **Step 2b** — `sn_tensor_weighted_cross_entropy` op (record + direct mode) + 5-assertion unit test | DONE | Bypasses ggml-opt's hardcoded loss_type enum via the `loss_type=SUM` injection point discovered in `vendor/ggml/src/ggml-opt.cpp:396-401`. Committed in `b4d9b59`. |
 | **Step 2c.1** — record-mode test for the loss op + `sn_graph_input_data` + `sn_graph_compute_loss` helpers | DONE | Validates the record-mode branch produces identical results to direct-mode within 1e-4. 4/4 PASS. |
 | **Step 2c.2** — `sn_graph_train_epoch` C entry point + by-hand model smoke test | DONE | Static-graph ggml_opt with `loss_type=SUM` and our pre-built loss as `outputs`. Lazy-init in first epoch call, persists across epochs in `sn_graph_begin/end` cycle. Loss drops 0.598 → 0.017 in 30 epochs on a 2x2 by-hand classifier. |
-| **Step 2c.3** — `Gnn.train()` rewrite + migrate all 5 existing tests + ggml patch | PARTIAL | Gnn.train rewritten to take `graphs[]` instead of flat features. New signature: `train(graphs[], labels[], weights[], optimizer, epochs, batchSize, valSplit, seed)`. All 5 tests migrated. **9/10 tests pass.** Multi-node `test_real_graph_topology` no longer crashes thanks to the ggml patches at `RealOrko/ggml@sn-pkg-tensor` (see `docs/issues/ggml-issue.md`), but the model still doesn't converge — loss stays at the random baseline. Gradients are flowing (verified via param-norm-delta), so the issue is somewhere in the loss expression or the cont(transpose) data flow, not in the assertion crash. |
+| **Step 2c.3** — `Gnn.train()` rewrite + migrate all 5 existing tests + ggml patch | DONE | Gnn.train rewritten to take `graphs[]` instead of flat features. New signature: `train(graphs[], labels[], weights[], optimizer, epochs, batchSize, valSplit, seed)`. All 5 tests migrated. **10/10 tests pass.** Multi-node `test_real_graph_topology` no longer crashes (ggml patches at `RealOrko/ggml@sn-pkg-tensor`) and now converges (loss `0.034`, JSD `0.51`). The convergence fix was in `src/gnn.sn`: replaced the per-epoch within-batch shuffle (which scrambled the static-topology slot binding) with an across-batch shuffle, plus added a runtime precondition assertion. See `docs/issues/ggml-issue.md` "Final status" and the new `docs/issues/heterogeneous-graph-batching.md` for the architectural precondition this surfaced. |
 
 ## Outstanding work
 
-1. **Fix the multi-node convergence bug.** Most likely a sign error in the
-   record-mode branch of `sn_tensor_weighted_cross_entropy`, or `ggml_cont`
-   of a non-contiguous transposed view producing wrong values. Investigation
-   path: hand-compute the forward pass on a tiny case and compare to the
-   recorded output.
+1. ~~Fix the multi-node convergence bug.~~ **DONE** in Step 2c.3 — root
+   cause was the per-epoch within-batch shuffle in `Gnn.train()`
+   scrambling the static-topology slot binding, not a ggml or weighted-CE
+   bug. Fix was replacing it with an across-batch shuffle. See
+   `docs/issues/ggml-issue.md` "Final status".
 2. **Bug B3 attWeight sub-bug** (called out in Step 0): GAT attention weights
    never receive gradients because `sn_tensor_attention_aggregate` falls back
    to `sparse_aggregate` in record mode and never references `attWeight`.
    Separate from B1; tracked but not yet fixed.
 3. **Steps 2c.4 onwards** — `TrainResult` diagnostics, `predictBatch` /
    `distributionDivergence`, metric callback API, release tagging.
+4. **Heterogeneous-graph batching** (deferred — see
+   `docs/issues/heterogeneous-graph-batching.md`): the static-topology
+   design fundamentally limits `Gnn.train()` to graphs that share
+   `numNodes`/`featureDim` (and `numEdges` for multi-batch). A runtime
+   assertion now catches violations, but extending the package to real
+   variable-shape GNN workloads (molecules, social graphs, RL with
+   variable-arity environments) requires an architectural change.
 
 ## Skynet unblock status
 

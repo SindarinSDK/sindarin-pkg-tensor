@@ -1,6 +1,14 @@
 # ggml backward-pass contiguity assertions block multi-node GNN training
 
-## Status: PATCHED in fork (RealOrko/ggml@sn-pkg-tensor), partial fix
+## Status: RESOLVED — patched in fork (RealOrko/ggml@sn-pkg-tensor)
+
+The original ggml-side crashes are fixed by the two patches documented
+below. The "remaining convergence" issue noted earlier was tracked down
+to a separate Sindarin-side bug in the training driver (per-epoch
+within-batch shuffle scrambling the static-topology slot binding) and
+fixed in `src/gnn.sn`. See "Final status" at the end of this document
+and `docs/issues/heterogeneous-graph-batching.md` for the architectural
+precondition that the fix surfaces.
 
 ## Background
 
@@ -153,7 +161,7 @@ case GGML_OP_TRANSPOSE: {
 Stored gradients are always contiguous, so any downstream consumer
 satisfies the binary-op contiguity assertion.
 
-## Acceptance and known remaining issue
+## Acceptance
 
 After these two patches:
 
@@ -167,33 +175,49 @@ After these two patches:
   delta ≈ 1.63 across 10 params). Gradients flow correctly through the
   whole `cont(transpose(features)) → mul_mat → add bias → relu` chain.
 
-**However**: the model still doesn't converge for the multi-node case.
-Loss stays at ~`ln(2) = 0.6931` (the random-classification baseline) even
-after 200 epochs, and post-train predictions for both graphs converge to
-roughly `[0.5, 0.5]`. This is a *separate* bug, not in ggml's contiguity
-invariants. The most likely candidates:
+## Final status — convergence bug was NOT in ggml
 
-1. **Sign error somewhere in the weighted-CE loss expression** (record
-   mode branch of `sn_tensor_weighted_cross_entropy` in
-   `src/tensor.sn.c`). The optimizer is making predictions slightly
-   *worse* than random over time, which is the classic symptom of
-   maximizing instead of minimizing.
+After the patches, `test_real_graph_topology.sn` no longer crashed but
+also did not converge: loss stayed at `ln(2) ≈ 0.693`, post-train probs
+collapsed to `[0.5, 0.5]`. The "remaining issue" section originally
+listed three suspects (sign error in weighted-CE, wrong cont/transpose
+values, GAT capacity collapse). All three were wrong.
 
-2. **`ggml_cont` of a non-contiguous transposed view computes the wrong
-   values.** The forward result has the right shape but maybe reads from
-   the underlying buffer ignoring strides. Needs a hand-computed
-   verification on a tiny example.
+The actual root cause was in `src/gnn.sn:334`, the per-epoch
+`rng.shuffleDouble(perm)` in `Gnn.train()`. The shuffle permuted which
+graph's *features* landed in which *slot* of the static batched
+topology, but the topology itself is fixed at record time. When two
+graphs share node-feature distributions but differ in edges (which is
+exactly what `test_real_graph_topology.sn` was designed to expose),
+shuffling alternated which embedding got paired with which label across
+epochs. The model was being asked to predict opposite labels for
+identical inputs every other epoch, locking the optimizer onto the
+maximum-entropy `[0.5, 0.5]` fixed point — exactly the observed symptom.
 
-3. **The loss landscape for this specific test is degenerate.** The two
-   training graphs have identical node features and only differ in edge
-   structure; if the GAT attention falls back to sum-aggregate (which it
-   does — see `sn_tensor_attention_aggregate` record-mode fallback at
-   `tensor.sn.c:1133`, plus the unmoving `attWeight` params noted in
-   Step 0 of `golden-path.md`), the model may not have enough capacity
-   to discriminate them in 200 epochs.
+**Verification**: temporarily commenting out the shuffle line and
+re-running the test produced loss `0.0328`, graphA prob[0] `0.733`,
+graphB prob[1] `0.99994`, JSD `0.367`. All assertions passed.
 
-The first cause is the most likely and the most actionable. It needs a
-focused investigation in the next session.
+**Permanent fix**: replaced the within-batch shuffle with an
+across-batch shuffle that permutes batch presentation order across
+epochs while keeping the within-batch slot-to-graph binding stable. For
+the topology test (1 batch), this collapses to a no-op. For
+multi-batch training, it randomizes batch order without scrambling the
+slot binding. See the new docstring on `Gnn.train` in `src/gnn.sn` and
+the precondition assertion that fires when caller-supplied graphs
+violate the static-topology requirement.
+
+**Architectural precondition surfaced by this work**: the static-
+batched-topology design fundamentally requires every graph in a single
+`train()` call to share `numNodes` and `featureDim`, and additionally
+share `numEdges` when `len(graphs) > batchSize`. This was always
+implicitly true; the convergence failure made it explicit. See
+`docs/issues/heterogeneous-graph-batching.md` for the long-term plan to
+support variable-shape graph batches.
+
+The ggml patches in this document are correct, complete, and necessary.
+They are not the cause of any remaining package issue. This document is
+closed.
 
 ## How the patch is consumed
 
