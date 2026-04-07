@@ -1,3 +1,4 @@
 [submodule "vendor/ggml"]
 	path = vendor/ggml
 	url = git@github.com:RealOrko/ggml.git
+	branch = sn-pkg-tensor

@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "description": "ggml tensor library for Sindarin",
   "dependencies": [
-    "ggml"
+    {
+      "name": "ggml",
+      "default-features": false
+    }
   ]
 }

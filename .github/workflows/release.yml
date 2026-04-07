@@ -23,10 +23,12 @@ jobs:
         include:
           - arch: x64
             runner: ubuntu-latest
-            platform: linux
+            triplet: x64-linux
           - arch: arm64
             runner: ubuntu-24.04-arm
-            platform: linux
+            triplet: arm64-linux
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,36 +36,35 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
+          sudo apt-get install -y build-essential cmake ninja-build curl zip unzip tar pkg-config
 
-      - name: Cache ggml build
+      - name: Bootstrap vcpkg
+        run: |
+          if [ ! -d "$HOME/vcpkg" ]; then
+            git clone --depth=1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+            "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+          echo "$HOME/vcpkg" >> $GITHUB_PATH
+
+      - name: Cache vcpkg binary cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
-          key: ggml-main-linux-${{ matrix.arch }}-cpu-v1
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-linux-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay/**') }}
+          restore-keys: |
+            vcpkg-linux-${{ matrix.arch }}-
 
-      - name: Build ggml
+      - name: Install ggml via vcpkg overlay port
         run: |
-          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
-            echo "Using cached ggml build"
-          else
-            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
-            cmake -S ggml-src -B ggml-build \
-              -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DGGML_STATIC=ON \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-            cmake --build ggml-build -j$(nproc)
-            cmake --install ggml-build
-          fi
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          "$VCPKG_ROOT/vcpkg" install --triplet=${{ matrix.triplet }} --x-install-root=vcpkg/installed
 
       - name: Package libraries
         run: |
           mkdir -p libs/linux/lib libs/linux/include
-          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
-          cp -r ggml-install/include/* libs/linux/include/
+          find vcpkg/installed/${{ matrix.triplet }}/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
+          cp -r vcpkg/installed/${{ matrix.triplet }}/include/* libs/linux/include/
           echo "${{ env.VERSION }}" > libs/linux/VERSION
           echo "linux" > libs/linux/PLATFORM
           ls libs/linux/lib/*.a
@@ -84,45 +85,48 @@ jobs:
         include:
           - arch: x64
             runner: macos-15
+            triplet: x64-osx
           - arch: arm64
             runner: macos-latest
+            triplet: arm64-osx
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
-          brew install cmake ninja
+          brew install cmake ninja pkg-config
 
-      - name: Cache ggml build
+      - name: Bootstrap vcpkg
+        run: |
+          if [ ! -d "$HOME/vcpkg" ]; then
+            git clone --depth=1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+            "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+          echo "$HOME/vcpkg" >> $GITHUB_PATH
+
+      - name: Cache vcpkg binary cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
-          key: ggml-main-darwin-${{ matrix.arch }}-cpu-v1
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-darwin-${{ matrix.arch }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay/**') }}
+          restore-keys: |
+            vcpkg-darwin-${{ matrix.arch }}-
 
-      - name: Build ggml
+      - name: Install ggml via vcpkg overlay port (with Metal feature)
         run: |
-          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
-            echo "Using cached ggml build"
-          else
-            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
-            cmake -S ggml-src -B ggml-build \
-              -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DGGML_STATIC=ON \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-              -DGGML_METAL=ON
-            cmake --build ggml-build -j$(sysctl -n hw.logicalcpu)
-            cmake --install ggml-build
-          fi
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Enable the metal feature on macOS — see vcpkg-overlay/ggml/vcpkg.json
+          "$VCPKG_ROOT/vcpkg" install ggml[metal] --triplet=${{ matrix.triplet }} --x-install-root=vcpkg/installed
 
       - name: Package libraries
         run: |
           mkdir -p libs/darwin/lib libs/darwin/include
-          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/darwin/lib/ \;
-          cp -r ggml-install/include/* libs/darwin/include/
+          find vcpkg/installed/${{ matrix.triplet }}/lib -maxdepth 1 -name "*.a" -exec cp {} libs/darwin/lib/ \;
+          cp -r vcpkg/installed/${{ matrix.triplet }}/include/* libs/darwin/include/
           echo "${{ env.VERSION }}" > libs/darwin/VERSION
           echo "darwin" > libs/darwin/PLATFORM
           ls libs/darwin/lib/*.a
@@ -138,6 +142,8 @@ jobs:
   build-windows:
     name: Build Windows Libraries
     runs-on: windows-latest
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\.vcpkg-cache
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -172,35 +178,35 @@ jobs:
       - name: Install build tools
         run: choco install ninja -y
 
-      - name: Cache ggml build
+      - name: Bootstrap vcpkg
+        run: |
+          if (-not (Test-Path "$env:USERPROFILE\vcpkg")) {
+            git clone --depth=1 https://github.com/microsoft/vcpkg.git "$env:USERPROFILE\vcpkg"
+            & "$env:USERPROFILE\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          }
+          "VCPKG_ROOT=$env:USERPROFILE\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$env:USERPROFILE\vcpkg" | Out-File -FilePath $env:GITHUB_PATH -Append
+        shell: pwsh
+
+      - name: Cache vcpkg binary cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
-          key: ggml-main-windows-x64-cpu-v1
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay/**') }}
+          restore-keys: |
+            vcpkg-windows-x64-
 
-      - name: Build ggml
+      - name: Install ggml via vcpkg overlay port
         run: |
-          if ((Test-Path "ggml-install/lib") -and (Test-Path "ggml-install/include")) {
-            Write-Host "Using cached ggml build"
-          } else {
-            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
-            cmake -S ggml-src -B ggml-build `
-              -G Ninja `
-              -DCMAKE_BUILD_TYPE=Release `
-              -DCMAKE_INSTALL_PREFIX="$(Get-Location)/ggml-install" `
-              -DBUILD_SHARED_LIBS=OFF `
-              -DGGML_STATIC=ON `
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-            cmake --build ggml-build -j
-            cmake --install ggml-build
-          }
+          New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet=x64-mingw-static --x-install-root=vcpkg/installed
         shell: pwsh
 
       - name: Package libraries
         run: |
           New-Item -ItemType Directory -Force -Path libs/windows/lib, libs/windows/include | Out-Null
-          Get-ChildItem ggml-install/lib -Filter "*.a" | Copy-Item -Destination libs/windows/lib/
-          Copy-Item -Recurse ggml-install/include/* -Destination libs/windows/include -Force
+          Get-ChildItem vcpkg/installed/x64-mingw-static/lib -Filter "*.a" | Copy-Item -Destination libs/windows/lib/
+          Copy-Item -Recurse vcpkg/installed/x64-mingw-static/include/* -Destination libs/windows/include -Force
           "${{ env.VERSION }}" | Out-File libs/windows/VERSION -NoNewline
           "windows" | Out-File libs/windows/PLATFORM -NoNewline
           Get-ChildItem libs/windows/lib/*.a

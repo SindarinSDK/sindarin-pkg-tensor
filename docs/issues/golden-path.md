@@ -1,6 +1,45 @@
 # The Golden Path: Fix `sindarin-pkg-tensor` So Skynet Can Learn
 
-## Status: OPEN
+## Status: IN PROGRESS — single-node case unblocked, multi-node case has remaining issues
+
+## Progress log
+
+| Step | Status | Notes |
+|---|---|---|
+| **Step 0** — establish baseline | DONE | All existing tests passed against the broken self-loop template — confirmed every existing test was single-node and tripped the identity short-circuit, so the multi-node code path was effectively dead. Documented in commit `b4d9b59`. |
+| **Step 1** — failing baseline `tests/test_real_graph_topology.sn` | DONE | Two graphs with identical features but different edge structure (chain vs self-loops). Originally failed with `loss=ln(2)` because the trainer collapsed both samples into identical inputs via the self-loop template. Committed in `b4d9b59`. |
+| **Step 2a** — `batchGraphs(graphs[]): GraphTensors` helper + 89-assertion unit test | DONE | Pure-Sindarin graph batching with offset edge indices and per-row batchIndex. Committed in `b4d9b59`. |
+| **Step 2b** — `sn_tensor_weighted_cross_entropy` op (record + direct mode) + 5-assertion unit test | DONE | Bypasses ggml-opt's hardcoded loss_type enum via the `loss_type=SUM` injection point discovered in `vendor/ggml/src/ggml-opt.cpp:396-401`. Committed in `b4d9b59`. |
+| **Step 2c.1** — record-mode test for the loss op + `sn_graph_input_data` + `sn_graph_compute_loss` helpers | DONE | Validates the record-mode branch produces identical results to direct-mode within 1e-4. 4/4 PASS. |
+| **Step 2c.2** — `sn_graph_train_epoch` C entry point + by-hand model smoke test | DONE | Static-graph ggml_opt with `loss_type=SUM` and our pre-built loss as `outputs`. Lazy-init in first epoch call, persists across epochs in `sn_graph_begin/end` cycle. Loss drops 0.598 → 0.017 in 30 epochs on a 2x2 by-hand classifier. |
+| **Step 2c.3** — `Gnn.train()` rewrite + migrate all 5 existing tests + ggml patch | PARTIAL | Gnn.train rewritten to take `graphs[]` instead of flat features. New signature: `train(graphs[], labels[], weights[], optimizer, epochs, batchSize, valSplit, seed)`. All 5 tests migrated. **9/10 tests pass.** Multi-node `test_real_graph_topology` no longer crashes thanks to the ggml patches at `RealOrko/ggml@sn-pkg-tensor` (see `docs/issues/ggml-issue.md`), but the model still doesn't converge — loss stays at the random baseline. Gradients are flowing (verified via param-norm-delta), so the issue is somewhere in the loss expression or the cont(transpose) data flow, not in the assertion crash. |
+
+## Outstanding work
+
+1. **Fix the multi-node convergence bug.** Most likely a sign error in the
+   record-mode branch of `sn_tensor_weighted_cross_entropy`, or `ggml_cont`
+   of a non-contiguous transposed view producing wrong values. Investigation
+   path: hand-compute the forward pass on a tiny case and compare to the
+   recorded output.
+2. **Bug B3 attWeight sub-bug** (called out in Step 0): GAT attention weights
+   never receive gradients because `sn_tensor_attention_aggregate` falls back
+   to `sparse_aggregate` in record mode and never references `attWeight`.
+   Separate from B1; tracked but not yet fixed.
+3. **Steps 2c.4 onwards** — `TrainResult` diagnostics, `predictBatch` /
+   `distributionDivergence`, metric callback API, release tagging.
+
+## Skynet unblock status
+
+**The skynet crusher domain is functionally unblocked** by the work landed
+so far. Every "graph" in the crusher use case is a single-node graph (one
+state observation = one node), which trips the identity short-circuit in
+`sparse_aggregate` and `mean_pool` and bypasses the multi-node code path
+entirely. `test_crusher_policy.sn` passes 15/15 with the new `Gnn.train()`
+signature.
+
+The multi-node convergence bug only matters when a consumer wants to train
+on graphs with non-trivial edge structure. That's a future requirement,
+not a blocker for the immediate skynet unblock.
 
 ## Why this document exists
 

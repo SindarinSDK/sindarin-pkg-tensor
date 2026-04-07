@@ -12,6 +12,9 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
 
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -19,44 +22,48 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
+          sudo apt-get install -y build-essential cmake ninja-build curl zip unzip tar pkg-config
 
-      - name: Cache ggml build
+      - name: Bootstrap vcpkg
+        run: |
+          if [ ! -d "$HOME/vcpkg" ]; then
+            git clone --depth=1 https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+            "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          fi
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> $GITHUB_ENV
+          echo "$HOME/vcpkg" >> $GITHUB_PATH
+
+      - name: Cache vcpkg binary cache
         uses: actions/cache@v4
         with:
-          path: ggml-install
-          key: ggml-main-linux-x64-cpu-v1
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-linux-x64-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg-overlay/**') }}
+          restore-keys: |
+            vcpkg-linux-x64-
 
-      - name: Build ggml
+      - name: Install ggml via vcpkg overlay port
         run: |
-          if [ -d "ggml-install/lib" ] && [ -d "ggml-install/include" ]; then
-            echo "Using cached ggml build"
-          else
-            git clone --depth=1 https://github.com/ggml-org/ggml.git ggml-src
-            cmake -S ggml-src -B ggml-build \
-              -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX=$(pwd)/ggml-install \
-              -DBUILD_SHARED_LIBS=OFF \
-              -DGGML_STATIC=ON \
-              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-            cmake --build ggml-build -j$(nproc)
-            cmake --install ggml-build
-          fi
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # vcpkg-configuration.json points overlay-ports at ./vcpkg-overlay,
+          # which contains the patched ggml port (RealOrko/ggml@sn-pkg-tensor).
+          # See docs/issues/ggml-issue.md for the patch background.
+          "$VCPKG_ROOT/vcpkg" install --triplet=x64-linux --x-install-root=vcpkg/installed
+          echo "Installed packages:"
+          ls vcpkg/installed/x64-linux/lib/
 
       - name: Package libs
         run: |
           mkdir -p libs/linux/lib libs/linux/include
-          find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
-          cp -r ggml-install/include/* libs/linux/include/
+          find vcpkg/installed/x64-linux/lib -maxdepth 1 -name "*.a" -exec cp {} libs/linux/lib/ \;
+          cp -r vcpkg/installed/x64-linux/include/* libs/linux/include/
           echo "linux" > libs/linux/PLATFORM
           echo "Packaged libraries:"
           ls libs/linux/lib/
 
       - name: Install ggml to system paths
         run: |
-          sudo cp -r ggml-install/include/* /usr/local/include/
-          sudo find ggml-install/lib -maxdepth 1 -name "*.a" -exec cp {} /usr/local/lib/ \;
+          sudo cp -r vcpkg/installed/x64-linux/include/* /usr/local/include/
+          sudo find vcpkg/installed/x64-linux/lib -maxdepth 1 -name "*.a" -exec cp {} /usr/local/lib/ \;
 
       - name: Setup Prerequisites
         uses: SindarinSDK/sindarin-pipelines/.github/actions/setup-prereqs@main
