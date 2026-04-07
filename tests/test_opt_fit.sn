@@ -15,7 +15,7 @@ fn main(): void =>
 
   # Simple 1-layer GCN: inputDim=2, hiddenDim=4, numActions=2
   var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
-  var model: Gnn = Gnn.create(config)
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
 
   var params: Tensor[] = model.parameters()
   var normsBefore: double[] = {}

@@ -23,7 +23,7 @@ fn trainAndReport(batchSize: int, featureDim: int, numActions: int,
     inputDim: featureDim, hiddenDim: 16, numActions: numActions,
     numLayers: 2, arch: "gcn", dropoutRate: 0.0
   }
-  var model: Gnn = Gnn.create(config)
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
   return model.train(graphs, labels, weights, opt, epochs, batchSize, 0.0, 42l)
 

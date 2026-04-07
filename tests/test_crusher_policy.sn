@@ -110,7 +110,7 @@ fn main(): void =>
     inputDim: featureDim, hiddenDim: 32, numActions: numActions,
     numLayers: 3, arch: "gat", dropoutRate: 0.0
   }
-  var model: Gnn = Gnn.create(config)
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
 
   println("  training 200 epochs, batch=5...")
