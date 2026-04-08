@@ -80,11 +80,29 @@ that's safe to optimize for many epochs. Two ingredients:
 
 The `min` over the unclipped and clipped surrogates means the
 optimizer cannot make the loss arbitrarily negative by pushing `r`
-arbitrarily large or small — once `r` leaves `[1−ε, 1+ε]`, the
-clipped term takes over and gradient w.r.t. `θ` becomes zero. The
-loss is bounded above (by the unclipped term), and the policy can
-only move ε away from `π_old` per training call. Multi-epoch training
-on the same batch is then safe; PPO's typical regime is 4-10 epochs.
+arbitrarily large or small: the loss is **bounded below**. The
+gradient-vanishing is asymmetric, though — it only kicks in when `r`
+has moved in the direction favored by the sign of `A`:
+
+- `A > 0` and `r > 1+ε`: clipped branch wins, gradient is zero
+  (further increasing `r` wouldn't help).
+- `A < 0` and `r < 1−ε`: clipped branch wins, gradient is zero
+  (further decreasing `r` wouldn't help).
+- `A > 0` and `r < 1−ε`: unclipped branch wins, gradient is nonzero
+  and pulls `r` back up toward 1.
+- `A < 0` and `r > 1+ε`: unclipped branch wins, gradient is nonzero
+  and pulls `r` back down toward 1.
+
+So PPO-clipped is not a strict trust region: it zeroes gradient only
+after the policy has already moved "enough" in the favored direction,
+but still lets gradient flow to pull `r` back when an earlier epoch
+drifted it the wrong way. This is a soft disincentive, not a hard
+constraint, and production implementations layer a KL-divergence
+early-stopping guard on top (e.g., abort the epoch if
+`KL(π_old || π_θ) > 1.5 · target_kl`). Multi-epoch training on the
+same batch is then safe in practice; PPO's typical regime is 3-10
+epochs (Schulman et al. use K=3 for Atari and K=10 for MuJoCo;
+stable-baselines3 defaults to K=10).
 
 In this formulation:
 - **Positive `Aᵢ` (good action):** the optimizer maximizes `r` toward
@@ -95,6 +113,20 @@ In this formulation:
   vanishes once `r ≤ 1−ε`, regardless of how negative `A` is.
 
 That's the property the current weighted-CE loss lacks.
+
+### Scope: policy term only
+
+The full PPO objective in Schulman et al. is
+
+> L(θ) = L^CLIP(θ) − c₁ · L^VF(θ) + c₂ · S[π_θ](s)
+
+where `L^VF` is a value-function MSE loss and `S[π_θ]` is an entropy
+bonus (typically `c₁ = 1.0`, `c₂ = 0.01`). The op proposed here
+implements **only the policy term `L^CLIP`**. A GNN policy doing
+on-policy RL will usually want an entropy bonus for exploration and
+(if it has a critic head) a value loss, but those are the caller's
+responsibility to add to the training loss — the package just
+exposes the clipped policy surrogate as a composable primitive.
 
 ## Proposed API
 
@@ -148,15 +180,29 @@ loss            = -1/N * sum(per_sample)
 ggml ops needed (must all have working backward):
 - `log_softmax`: build via `ggml_soft_max → ggml_log` with the same
   `relu`-based numerical floor as the current `weighted_cross_entropy`.
-- `ggml_get_rows` for `gather(log_pi, actions)`. Available in ggml.
+- `gather(log_pi, actions)` — **not** a direct `ggml_get_rows` call.
+  `ggml_get_rows(a, b)` on an `a` of shape `(numClasses, batchRows)`
+  selects along the outer (batch) dimension and copies the full
+  `numClasses` inner dimension, which is the wrong axis: we want one
+  scalar per batch row, indexed by the action class. The clean
+  implementation is the same trick the existing
+  `weighted_cross_entropy` uses: build a one-hot mask of the actions
+  and compute `sum_over_classes(log_pi * one_hot_actions)`, which
+  reduces to the per-sample `log π(aᵢ|sᵢ)` with a single
+  `ggml_mul + ggml_sum_rows`. Both ops already have working backward
+  in the fork.
 - `ggml_sub`, `ggml_exp`, `ggml_mul`, `ggml_sum`, `ggml_scale` —
-  standard, all have backward.
+  standard, all have backward in the fork.
 - `clamp(ratio, 1-eps, 1+eps)` — implement the same way as the
   log_softmax floor: two `relu` hinges, both differentiable. Avoid
   `ggml_clamp` directly because its backward isn't implemented in the
   current ggml fork (see `weighted_cross_entropy` for the workaround).
-- `min(a, b)` element-wise — verify ggml has it with backward; if not,
-  implement as `0.5 * (a + b - |a - b|)` with `ggml_abs`.
+- `min(a, b)` element-wise — verified: the fork has no elementwise
+  `ggml_min` / `ggml_max`, so use the `0.5 * (a + b - |a - b|)`
+  identity with `ggml_abs`. `ggml_abs`'s backward is defined via
+  `ggml_sgn` (see `src/ggml.c` `GGML_UNARY_OP_ABS` branch), and
+  `sgn(0) = 0` gives a clean zero subgradient at the non-smooth point
+  — no extra smoothing required.
 
 Direct mode (the test path) is straightforward — same expression in a
 one-shot allocating context.
@@ -179,16 +225,25 @@ one-shot allocating context.
    as a separate `trainPpo()` method on `Gnn`. The straight
    cross-entropy path stays for supervised classification (skynet's
    `test_crusher_policy.sn`-style case).
+4. **Sensible advantages.** PPO assumes the `advantages` tensor is
+   already a reasonable per-sample estimate of `Aᵢ`. In production
+   PPO this is computed via Generalized Advantage Estimation (GAE,
+   λ ≈ 0.95) over a value-function critic, then per-minibatch
+   normalized to mean-zero / unit-variance before being passed in.
+   Skynet's current crusher trainer uses Monte-Carlo returns
+   minus a baseline, which is a coarser estimate but compatible
+   with the same op signature — the loss op doesn't care how the
+   advantages were produced as long as they arrive normalized.
 
 ## Tradeoffs
 
 | | Current weighted CE + clamp | PPO-clipped surrogate |
 |---|---|---|
 | Bounded loss with negative weights | ✓ (via `relu` clamp at `log_softmax ≥ -20`) | ✓ (intrinsic to the surrogate) |
-| Mathematically clean policy gradient | ✗ (loss diverges past the clamp; converges to a clamp-boundary local min) | ✓ (well-defined trust region per call) |
-| Multi-epoch training on the same batch | ⚠️ Safe but doesn't improve much past 1-2 epochs (clamp neutralizes the gradient) | ✓ Safe and the standard practice (4-10 epochs) |
+| Mathematically clean policy gradient | ✗ (loss diverges past the clamp; converges to a clamp-boundary local min) | ✓ (well-defined surrogate per call; soft trust region via clip + optional KL early-stop) |
+| Multi-epoch training on the same batch | ⚠️ Safe but doesn't improve much past 1-2 epochs (clamp neutralizes the gradient) | ✓ Safe and the standard practice (3-10 epochs) |
 | Caller complexity | Existing API, no extra inputs | New input (`oldLogProbs`), forward pass before training, action indices |
-| ggml ops needed | Already implemented | A few more ops (gather, clamp via relu, min) — likely all available |
+| ggml ops needed | Already implemented | A few more ops (one-hot gather, clamp via relu, min via abs) — all verified available in the fork |
 | Implementation cost | Done | Medium (loss op + caller plumbing in `Gnn.train`) |
 | Skynet impact | Just works with existing trainer | Trainer needs to wire in `oldLogProbs` and switch loss kind |
 
