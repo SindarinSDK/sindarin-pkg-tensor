@@ -2238,6 +2238,50 @@ RtTensor *sn_tensor_init_kaiming_seeded(RtTensor *t, long long seed)
     return t;
 }
 
+/* Fill `pt` with small-scale uniform values U(-bound, bound) where
+ * bound = std * sqrt(3) so that the resulting empirical standard
+ * deviation matches the requested `std`. Used for the policy output
+ * layer in PPO actors — Andrychowicz et al. 2021 ("What Matters in
+ * On-Policy Reinforcement Learning") established std=0.01 as the
+ * standard for centring the action distribution near uniform at init,
+ * which prevents the deterministic-policy collapse on imbalanced
+ * action priors observed in skynet Phase 6/6.1/6.2 verification. */
+static void small_scale_fill(TPool *pt, double std, uint64_t *state)
+{
+    float bound = (float)(std * 1.7320508075688772);  /* std * sqrt(3) */
+    for (int64_t i = 0; i < pt->n_elem; i++) {
+        uint64_t r = xorshift64(state);
+        float u = (float)(r >> 40) * (1.0f / 16777216.0f);
+        pt->data[i] = (2.0f * u - 1.0f) * bound;
+    }
+}
+
+/* Unseeded small-scale init. Same lazy-seed strategy as
+ * sn_tensor_init_kaiming. */
+RtTensor *sn_tensor_init_small_scale(RtTensor *t, double std)
+{
+    static uint64_t g_state = 0;
+    if (g_state == 0) {
+        g_state = (uint64_t)time(NULL);
+        if (g_state == 0) g_state = 0x9E3779B97F4A7C15ULL;
+    }
+    small_scale_fill(unwrap(t), std, &g_state);
+    return t;
+}
+
+/* Seeded small-scale init. Produces bit-identical weights for the same
+ * seed across runs. Same warm-up rounds as the Kaiming variant. */
+RtTensor *sn_tensor_init_small_scale_seeded(RtTensor *t, double std, long long seed)
+{
+    uint64_t state = (uint64_t)seed;
+    if (state == 0) state = 0x9E3779B97F4A7C15ULL;
+    xorshift64(&state);
+    xorshift64(&state);
+    xorshift64(&state);
+    small_scale_fill(unwrap(t), std, &state);
+    return t;
+}
+
 /* ======================================================================
  * Device
  * ====================================================================== */

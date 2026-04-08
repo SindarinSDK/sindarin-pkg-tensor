@@ -118,6 +118,19 @@ native struct Tensor as ref =>
   fn initKaimingSeeded(seed: long): void =>
     sn_tensor_init_kaiming_seeded(self, seed)
 
+  # Small-scale uniform init for the policy output layer of an RL actor.
+  # Andrychowicz et al. 2021 ("What Matters in On-Policy Reinforcement
+  # Learning") established std=0.01 as the standard for centring the
+  # initial action distribution near uniform — without this, the policy
+  # can collapse to a deterministic action on the first training round
+  # when the action prior is imbalanced. See skynet Phase 6/6.1/6.2
+  # collapse reports for the empirical motivation.
+  fn initSmallScale(std: double): void =>
+    sn_tensor_init_small_scale(self, std)
+
+  fn initSmallScaleSeeded(std: double, seed: long): void =>
+    sn_tensor_init_small_scale_seeded(self, std, seed)
+
 # ---------------------------------------------------------------------------
 # Native function declarations
 # ---------------------------------------------------------------------------
@@ -161,6 +174,8 @@ native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weigh
 native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double, entropyCoeff: double): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
 native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
+native fn sn_tensor_init_small_scale(t: Tensor, std: double): void
+native fn sn_tensor_init_small_scale_seeded(t: Tensor, std: double, seed: long): void
 native fn sn_gpu_available(): bool
 native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
 native fn sn_model_save(params: Tensor[], path: str): void

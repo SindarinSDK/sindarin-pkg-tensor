@@ -144,14 +144,14 @@ fn probsSum(p: double[]): double =>
     s = s + p[i]
   return s
 
-fn probsDiffer(a: double[], b: double[]): bool =>
+fn probsDiffer(a: double[], b: double[], tol: double): bool =>
   if len(a) != len(b) =>
     return true
   for var i: int = 0; i < len(a); i++ =>
     var d: double = a[i] - b[i]
     if d < 0.0 =>
       d = -d
-    if d > 0.01 =>
+    if d > tol =>
       return true
   return false
 
@@ -206,11 +206,23 @@ fn partA(model: Gnn, label: str): void =>
   # Sanity: the three distinct graphs produce distinct predictions
   # (otherwise the invariance check would pass trivially on uniform
   # outputs).
-  assertTrue(probsDiffer(solo1, solo2),
+  #
+  # Tolerance is label-dependent: with std=0.01 small-scale actor head
+  # init (Andrychowicz et al. 2021 â€” required to prevent collapse on
+  # imbalanced action priors), the pre-train policy is approximately
+  # uniform on every input, so per-graph differences are ~1e-3 not the
+  # ~1e-2 you got from Kaiming init. Tightening pre-train tolerance to
+  # 1e-4 still meaningfully validates "outputs are not bit-identical"
+  # without imposing the old large-difference assumption. Trained model
+  # predictions diverge much further (~0.4) so 0.01 is fine post-train.
+  var differTol: double = 0.01
+  if label == "pre-train" =>
+    differTol = 0.0001
+  assertTrue(probsDiffer(solo1, solo2, differTol),
     $"{label}: solo1 and solo2 predictions actually differ")
-  assertTrue(probsDiffer(solo2, solo3),
+  assertTrue(probsDiffer(solo2, solo3, differTol),
     $"{label}: solo2 and solo3 predictions actually differ")
-  assertTrue(probsDiffer(solo1, solo3),
+  assertTrue(probsDiffer(solo1, solo3, differTol),
     $"{label}: solo1 and solo3 predictions actually differ")
 
   # Batched forward. Fresh graph builders so edge indices aren't
@@ -298,9 +310,9 @@ fn partC(): void =>
   # pad-to-max / per-batch-upload path; we don't care about
   # convergence, only that the model reaches a non-trivial state.
   var labels: double[] = {
-    1.0, 0.0, 0.0, # G1 â † ’ action 0
-    0.0, 1.0, 0.0, # G2 â † ’ action 1
-    0.0, 0.0, 1.0 # G3 â † ’ action 2
+    1.0, 0.0, 0.0, # G1 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 0
+    0.0, 1.0, 0.0, # G2 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 1
+    0.0, 0.0, 1.0 # G3 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 2
   }
   var weights: double[] = {1.0, 1.0, 1.0}
   var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
