@@ -1,0 +1,161 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_negative_weights_no_nan.sn — REINFORCE divergence regression guard
+#
+# Verifies that Gnn.train() does NOT diverge to NaN when the caller passes
+# NEGATIVE per-sample weights — the standard REINFORCE setup where weights
+# are mean-centred normalized advantages and roughly half are below zero.
+#
+# Background: weighted cross-entropy with negative weights is unbounded
+# below — `loss = -1/N * sum(w_i * log_softmax(correct_i))` and a negative
+# w_i flips the inequality so the optimizer minimizes the loss by driving
+# log_softmax toward -inf. Eventually log_softmax underflows, multiplied
+# by zero labels gives NaN, NaN propagates to every weight via the AdamW
+# step, and the model is dead.
+#
+# The fix is in `sn_tensor_weighted_cross_entropy`:
+# `log_sm = ggml_clamp(log_sm, -20, 0)` before the per-class multiply.
+#
+# This test reproduces the divergence pattern that was killing skynet's
+# crusher trainer (cycle 2 onwards): batchSize=numSamples (single batch),
+# 50 epochs, gat-3-layer-32-hidden, mixed-sign weights spanning roughly
+# the same range as a real REINFORCE advantage distribution. Without the
+# clamp this test crashes on the final sanity check (loss is NaN).
+#
+# See docs/issues/ppo-clipped-objective.md for the longer-term proper fix.
+# ===========================================================================
+
+# Helper: build a small heterogeneous graph with the given numNodes,
+# self-loops + chain edges, and class-specific node-0 features.
+fn buildGraph(numNodes: int, classIdx: int, sampleIdx: int): GraphTensors =>
+  var featureDim: int = 4
+  var feats: double[] = {}
+  for var n: int = 0; n < numNodes; n++ =>
+    if n == 0 =>
+      if classIdx == 0 =>
+        feats.push(1.0); feats.push(0.0); feats.push(0.0); feats.push(0.0)
+      else =>
+        feats.push(0.0); feats.push(0.0); feats.push(1.0); feats.push(0.0)
+    else =>
+      var v: double = 0.2 + 0.05 * ((sampleIdx + n) % 5).toDouble()
+      feats.push(0.0); feats.push(v); feats.push(0.0); feats.push(0.0)
+
+  var srcs: int[] = {}
+  var dsts: int[] = {}
+  for var n: int = 0; n < numNodes; n++ =>
+    srcs.push(n); dsts.push(n)
+    if n + 1 < numNodes =>
+      srcs.push(n); dsts.push(n + 1)
+
+  var ne: int = len(srcs)
+  var edgeData: double[] = {}
+  for var i: int = 0; i < ne; i++ =>
+    edgeData.push(srcs[i].toDouble())
+  for var i: int = 0; i < ne; i++ =>
+    edgeData.push(dsts[i].toDouble())
+  var weights: double[] = {}
+  for var i: int = 0; i < ne; i++ =>
+    weights.push(1.0)
+  var batch: double[] = {}
+  for var i: int = 0; i < numNodes; i++ =>
+    batch.push(0.0)
+
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, numNodes, featureDim),
+    edgeIndex: Tensor.fromDoubles(edgeData, 2, ne),
+    edgeWeight: Tensor.fromDoubles(weights, 1, ne),
+    batchIndex: Tensor.fromDoubles(batch, numNodes, 1),
+    numNodes: numNodes, numEdges: ne, featureDim: featureDim
+  }
+
+# Check for NaN by abusing the property that NaN != NaN.
+fn isNan(x: double): bool =>
+  return x != x
+
+fn main(): void =>
+  println("=== test_negative_weights_no_nan ===")
+  println("")
+
+  var featureDim: int = 4
+  var numActions: int = 3
+
+  # 9 graphs with mixed shapes (matches the skynet cycle 2 distribution
+  # that originally triggered the divergence)
+  var trainGraphs: GraphTensors[] = {
+    buildGraph(4, 0, 0),
+    buildGraph(9, 1, 1),
+    buildGraph(4, 2, 2),
+    buildGraph(9, 0, 3),
+    buildGraph(4, 1, 4),
+    buildGraph(9, 2, 5),
+    buildGraph(4, 0, 6),
+    buildGraph(9, 1, 7),
+    buildGraph(4, 2, 8)
+  }
+  # actions 0,1,2,0,1,2,0,1,2
+  var labels: double[] = {
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0,
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0,
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0
+  }
+  # NEGATIVE-MIXED weights — half below zero, half above, similar
+  # magnitude to real REINFORCE advantages after std normalization.
+  var weights: double[] = {
+    -1.10, 0.89, 0.89,
+    -1.10, 0.89, 0.89,
+    -1.10, 0.89, 0.89
+  }
+
+  # Same arch as skynet crusher
+  var config: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 32, numActions: numActions,
+    numLayers: 3, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  # 50 epochs is what skynet was using when the divergence kicked in.
+  # Pre-fix this would have produced loss=NaN (the smoking-gun progression
+  # was -0.6 → -1.1 → -1.5 → ... → -7.9 → -inf → NaN over ~18 epochs).
+  var opt: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  println("  training 50 epochs, batchSize=9 (single batch), negative-weight mix...")
+  var result: TrainResult = model.train(
+    trainGraphs, labels, weights, opt, 50, 9, 0.0, 42l)
+  println($"  final loss = {result.loss}")
+  println("")
+
+  assertTrue(!isNan(result.loss),
+    "loss must be finite (not NaN) after 50 epochs of negative-weight training")
+
+  # Bound the magnitude — even with the clamp the loss can be moderately
+  # negative, but should not exceed the clamp's analytical worst case.
+  # With LOG_SM_FLOOR=-20 and weights bounded at ~1.1, per-sample
+  # contribution is bounded by |w_i| * 20 = 22, batch-averaged ≈ 22.
+  # Pick 50 as a generous safety bound.
+  assertTrue(result.loss > -50.0 && result.loss < 50.0,
+    "loss magnitude must remain bounded")
+
+  # Also verify the model parameters are still finite by running an
+  # inference forward and checking the output probabilities.
+  var probs: double[] = model.forward(trainGraphs[0], false).probs.toDoubles()
+  var anyProbNan: bool = false
+  for var i: int = 0; i < len(probs); i++ =>
+    if isNan(probs[i]) =>
+      anyProbNan = true
+  assertTrue(!anyProbNan,
+    "post-train inference must not produce NaN probabilities")
+  println($"  post-train probs (sample 0): [{probs[0]}, {probs[1]}, {probs[2]}]")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

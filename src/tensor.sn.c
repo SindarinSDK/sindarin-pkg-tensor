@@ -795,69 +795,6 @@ double sn_graph_train_epoch(
         ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
         ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
 
-        /* DEBUG: dump min/max/anyNaN for each host-side buffer this batch */
-        if (batch_idx == 0) {
-            float fmin=1e30f, fmax=-1e30f; int fnan=0;
-            for (long long k = 0; k < features_per_batch; k++) {
-                float v = features_buf[k];
-                if (v != v) fnan = 1;
-                if (v < fmin) fmin = v;
-                if (v > fmax) fmax = v;
-            }
-            float amin=1e30f, amax=-1e30f; int anan=0;
-            for (long long k = 0; k < nodes_per_batch * nodes_per_batch; k++) {
-                float v = adj_buf[k];
-                if (v != v) anan = 1;
-                if (v < amin) amin = v;
-                if (v > amax) amax = v;
-            }
-            float pmin=1e30f, pmax=-1e30f; int pnan=0;
-            for (long long k = 0; k < n_per_batch * nodes_per_batch; k++) {
-                float v = pool_buf[k];
-                if (v != v) pnan = 1;
-                if (v < pmin) pmin = v;
-                if (v > pmax) pmax = v;
-            }
-            float lmin=1e30f, lmax=-1e30f; int lnan=0;
-            for (long long k = 0; k < n_per_batch * labels_per_sample; k++) {
-                float v = labels_buf[k];
-                if (v != v) lnan = 1;
-                if (v < lmin) lmin = v;
-                if (v > lmax) lmax = v;
-            }
-            float wmin=1e30f, wmax=-1e30f; int wnan=0;
-            for (long long k = 0; k < n_per_batch; k++) {
-                float v = weights_buf[k];
-                if (v != v) wnan = 1;
-                if (v < wmin) wmin = v;
-                if (v > wmax) wmax = v;
-            }
-            fprintf(stderr,
-                "[DBG] inputs: feat=[%.4g,%.4g]nan=%d adj=[%.4g,%.4g]nan=%d pool=[%.4g,%.4g]nan=%d lbl=[%.4g,%.4g]nan=%d w=[%.4g,%.4g]nan=%d\n",
-                fmin, fmax, fnan, amin, amax, anan, pmin, pmax, pnan, lmin, lmax, lnan, wmin, wmax, wnan);
-            fflush(stderr);
-
-            /* Dump each PARAM tensor's host pool data — these are what the
-             * loaded model contributed to this train() call. */
-            for (int p = 0; p < g_pool_count; p++) {
-                struct ggml_tensor *gt = g_record_map[p];
-                if (!gt || !(gt->flags & GGML_TENSOR_FLAG_PARAM)) continue;
-                TPool *s = &g_pool[p];
-                if (!s->data || s->n_elem <= 0) continue;
-                float pmin2=1e30f, pmax2=-1e30f; int pnan2=0;
-                for (int64_t k = 0; k < s->n_elem; k++) {
-                    float v = s->data[k];
-                    if (v != v) pnan2 = 1;
-                    if (v < pmin2) pmin2 = v;
-                    if (v > pmax2) pmax2 = v;
-                }
-                fprintf(stderr,
-                    "[DBG] param pool=%d name=%s shape=(%lld,%lld) range=[%.4g,%.4g] nan=%d\n",
-                    p, gt->name, (long long)s->ne[0], (long long)s->ne[1], pmin2, pmax2, pnan2);
-            }
-            fflush(stderr);
-        }
-
         /* Upload the batched adjacency / pool matrix to every tensor in the
          * per-batch registry. Within a single Gnn.train() call all ADJ
          * tensors share the same edgeIndex/edgeWeight + mode (because every
@@ -886,33 +823,6 @@ double sn_graph_train_epoch(
         float batch_loss = 0.0f;
         ggml_backend_tensor_get(g_opt_loss_tensor, &batch_loss, 0, sizeof(float));
         total_loss += (double)batch_loss;
-
-        /* DEBUG: dump batch loss + post-update param magnitudes on first batch */
-        if (batch_idx == 0) {
-            fprintf(stderr, "[DBG] batch 0 loss = %.6g (nan=%d)\n",
-                    (double)batch_loss, batch_loss != batch_loss ? 1 : 0);
-            for (int p = 0; p < g_pool_count; p++) {
-                struct ggml_tensor *gt = g_record_map[p];
-                if (!gt || !(gt->flags & GGML_TENSOR_FLAG_PARAM)) continue;
-                TPool *s = &g_pool[p];
-                if (!s->data || s->n_elem <= 0) continue;
-                /* Read back from backend to see post-update values */
-                if (gt->buffer) {
-                    ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
-                }
-                float pmin3=1e30f, pmax3=-1e30f; int pnan3=0;
-                for (int64_t k = 0; k < s->n_elem; k++) {
-                    float v = s->data[k];
-                    if (v != v) pnan3 = 1;
-                    if (v < pmin3) pmin3 = v;
-                    if (v > pmax3) pmax3 = v;
-                }
-                fprintf(stderr,
-                    "[DBG] post-eval param pool=%d range=[%.4g,%.4g] nan=%d\n",
-                    p, pmin3, pmax3, pnan3);
-            }
-            fflush(stderr);
-        }
     }
 
     free(features_buf);
@@ -1688,17 +1598,34 @@ RtTensor *sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
  * weights : shape (1,          batchRows)  -- per-sample importance weights
  *
  * Math:
- *   per_sample_i = -sum_c (label[i,c] * log_softmax(logits[i,c]))
+ *   per_sample_i = -sum_c (label[i,c] * log_softmax_clamped(logits[i,c]))
  *   loss         = sum_i (weight[i] * per_sample_i) / batchRows
  *
  * Convention: scale by 1/batchRows (not 1/sum(weights)). Weights are
  * relative importance, not effective sample counts. With weights all 1.0,
  * this exactly matches ggml_cross_entropy_loss.
  *
+ * log_softmax floor: log_softmax is clamped to LOG_SM_FLOOR (-20, i.e.
+ * effective minimum probability ~2e-9) before the per-class multiply.
+ * This bounds the loss when callers pass NEGATIVE per-sample weights
+ * (REINFORCE policy gradient with normalized advantages). With negative
+ * weights and an unclamped log_softmax, the cross-entropy is unbounded
+ * below — the optimizer drives log_softmax toward -inf for the chosen
+ * action, eventually overflows to NaN, and poisons every weight via the
+ * AdamW step. The clamp prevents the runaway. The model converges to a
+ * local minimum at the clamp boundary instead of diverging.
+ *
+ * For consumers that need a mathematically clean unbounded objective
+ * with negative weights, see docs/issues/ppo-clipped-objective.md for
+ * the longer-term PPO-clipped surrogate.
+ *
  * Works in both record mode (loss tensor wired into the recorded forward
  * graph for backward in train_step) and direct mode (one-shot eval, used
  * by tests/test_weighted_ce.sn).
  */
+
+#define LOG_SM_FLOOR (-20.0f)
+
 RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
                                            RtTensor *labels_rt,
                                            RtTensor *weights_rt)
@@ -1719,7 +1646,32 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
 
         struct ggml_tensor *softmax    = ggml_soft_max(ctx, gl);
         struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
-        struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm, glb);
+        /* clamp_floor(log_sm, LOG_SM_FLOOR) implemented as
+         *   LOG_SM_FLOOR + relu(log_sm - LOG_SM_FLOOR)
+         * because ggml_clamp has no backward implementation. relu does.
+         * No upper bound needed: log_softmax is naturally <= 0.
+         *
+         * The +20 / -20 constants live in 1-element scalar tensors
+         * allocated in g_param_ctx as INPUTS, with their host data
+         * pre-loaded by sn_graph_input_data. The lazy-init upload loop
+         * in sn_graph_train_epoch (and sn_graph_compute_loss for the
+         * direct test path) copies them onto the backend buffer. We
+         * cannot use ggml_new_f32 here because g_compute_ctx /
+         * g_param_ctx are no_alloc — that helper aborts on no_alloc. */
+        double pos_floor[1] = { (double)(-LOG_SM_FLOOR) };
+        double neg_floor[1] = { (double)( LOG_SM_FLOOR) };
+        SnArray *pos_arr = sn_array_new(sizeof(double), 1);
+        SnArray *neg_arr = sn_array_new(sizeof(double), 1);
+        sn_array_push(pos_arr, &pos_floor[0]);
+        sn_array_push(neg_arr, &neg_floor[0]);
+        RtTensor *pos_rt = sn_graph_input_data(pos_arr, 1, 1);
+        RtTensor *neg_rt = sn_graph_input_data(neg_arr, 1, 1);
+        struct ggml_tensor *pos_t = rec_tensor(pos_rt);
+        struct ggml_tensor *neg_t = rec_tensor(neg_rt);
+        struct ggml_tensor *log_sm_sh  = ggml_add1(ctx, log_sm, pos_t);
+        struct ggml_tensor *log_sm_rl  = ggml_relu(ctx, log_sm_sh);
+        struct ggml_tensor *log_sm_c   = ggml_add1(ctx, log_sm_rl, neg_t);
+        struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm_c, glb);
         struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
         struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, gw);
         struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
@@ -1743,7 +1695,24 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
 
     struct ggml_tensor *softmax    = ggml_soft_max(ctx, tl);
     struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
-    struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm, tlb);
+    /* Same relu-based clamp_floor as the record-mode path. The micro
+     * context is also no_alloc, so we feed the +20 / -20 constants in
+     * via the existing scalar-input + track_input mechanism. The
+     * static float storage lives for the lifetime of run_graph (which
+     * uploads tracked inputs and runs immediately), so simple
+     * stack-local arrays are fine. */
+    static float pos_floor_buf[1] = { -LOG_SM_FLOOR };
+    static float neg_floor_buf[1] = {  LOG_SM_FLOOR };
+    struct ggml_tensor *pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    struct ggml_tensor *neg_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(pos_t);
+    ggml_set_input(neg_t);
+    track_input(pos_t, pos_floor_buf);
+    track_input(neg_t, neg_floor_buf);
+    struct ggml_tensor *log_sm_sh  = ggml_add1(ctx, log_sm, pos_t);
+    struct ggml_tensor *log_sm_rl  = ggml_relu(ctx, log_sm_sh);
+    struct ggml_tensor *log_sm_c   = ggml_add1(ctx, log_sm_rl, neg_t);
+    struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm_c, tlb);
     struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
     struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, tw);
     struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
