@@ -15,6 +15,8 @@
 # Training via ggml-opt (AdamW, SGD with backpropagation).
 # ==============================================================================
 
+import "sindarin-pkg-sdk/src/core/fields"
+
 @link ggml
 @link ggml-base
 @link ggml-cpu
@@ -170,10 +172,11 @@ native fn sn_graph_compute_loss(t: Tensor): double
 # into a consumer-side MetricsClient.
 #
 # Phase M closed the Phase J deviation: the callback now takes the
-# full three-argument form matching the doc spec exactly. StringField
-# is a small local struct (key + value) defined in this file; when
-# sindarin-pkg-sdk grows a canonical StringField it can replace the
-# local form without breaking the callback signature.
+# full three-argument form matching the doc spec exactly. The
+# `StringField` label type comes from the SDK
+# (`sindarin-pkg-sdk/src/core/fields`); a local copy used to live here
+# but was promoted into the SDK to eliminate a cross-package struct
+# name collision (compiler-problems.32 item 51).
 #
 # Emitted metrics in this release:
 # - "train_loss"           per epoch, labels=[{epoch, "E"}]
@@ -193,10 +196,6 @@ native fn sn_graph_compute_loss(t: Tensor): double
 # The callback is deep-copied on registration and survives across
 # multiple train() calls until explicitly cleared. Consumers can filter
 # by metric name and then look up label values by key.
-
-struct StringField =>
-  key: str
-  value: str
 
 native fn sn_graph_set_train_metric_callback(cb: fn(str, double, StringField[]): void): void
 native fn sn_graph_clear_train_metric_callback(): void
