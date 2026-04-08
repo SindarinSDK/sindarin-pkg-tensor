@@ -16,6 +16,7 @@
 # ==============================================================================
 
 import "sindarin-pkg-sdk/src/core/fields"
+import "./tensor/panic"
 
 @link ggml
 @link ggml-base
@@ -387,20 +388,17 @@ struct GraphTensors =>
 # batchIndex   : fromDoubles(data, rows=numNodes, cols=1)
 # ---------------------------------------------------------------------------
 fn batchGraphs(graphs: GraphTensors[]): GraphTensors =>
-  # --- Validation (panic via 1/0 shim until SDK exposes panic()) ---
+  # --- Validation ---
   if len(graphs) == 0 =>
-    var zero: int = 0
-    var _crash: int = 1 / zero
+    panic("batchGraphs: graph list is empty")
 
   var featureDim: int = graphs[0].featureDim
 
   for var k: int = 0; k < len(graphs); k++ =>
     if graphs[k].featureDim != featureDim =>
-      var zero: int = 0
-      var _crash: int = 1 / zero
+      panic($"batchGraphs: graph {k} has featureDim={graphs[k].featureDim}, expected {featureDim} (matching graph 0)")
     if graphs[k].numNodes <= 0 =>
-      var zero: int = 0
-      var _crash: int = 1 / zero
+      panic($"batchGraphs: graph {k} has numNodes={graphs[k].numNodes}; must be > 0")
 
   # --- Compute totals and per-graph node offsets ---
   var totalNodes: int = 0

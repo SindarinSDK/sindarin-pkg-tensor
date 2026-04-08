@@ -1,0 +1,28 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/panic.sn — last-resort crash helper
+# ==============================================================================
+#
+# The tensor package has several invariants whose violation means the
+# caller fed us data we cannot recover from: zero-length graph lists,
+# mismatched feature dims, non-positive node counts. Those used to
+# crash with an inline 3-line `var zero: int = 0 / var _crash: int =
+# 1 / zero` shim scattered across tensor.sn and gnn.sn.
+#
+# This module consolidates the shim into a single helper so call sites
+# read as intent rather than mechanics:
+#
+# if graphs[i].numNodes <= 0 =>
+# panic($"graph {i} has numNodes={graphs[i].numNodes}")
+#
+# Implementation note: the SDK does not (yet) expose `abort()` /
+# `exit()` as a Sindarin entry point, so the crash mechanism stays as
+# an integer division-by-zero that the C runtime turns into SIGFPE.
+# The `println` above it is the human-readable explanation that
+# accompanies the trap. Replace with a real abort() call the moment
+# the SDK exposes one.
+# ==============================================================================
+
+fn panic(msg: str): void =>
+  println($"PANIC: {msg}")
+  var zero: int = 0
+  var _crash: int = 1 / zero

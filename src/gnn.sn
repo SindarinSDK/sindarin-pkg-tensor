@@ -15,6 +15,7 @@
 # ==============================================================================
 
 import "./tensor"
+import "./tensor/panic"
 import "sindarin-pkg-sdk/src/core/random"
 import "sindarin-pkg-sdk/src/core/math"
 
@@ -477,13 +478,9 @@ struct Gnn =>
     # numEdges may vary freely across the training set; padding handles them.
     for var i: int = 1; i < totalSamples; i++ =>
       if graphs[i].featureDim != featureDim =>
-        println($"FATAL Gnn.train: graph {i} has featureDim={graphs[i].featureDim}, expected {featureDim} (matching graph 0). All training graphs must share featureDim.")
-        var zeroF: int = 0
-        var crashF: int = 1 / zeroF
+        panic($"Gnn.train: graph {i} has featureDim={graphs[i].featureDim}, expected {featureDim} (matching graph 0). All training graphs must share featureDim.")
       if graphs[i].numNodes <= 0 =>
-        println($"FATAL Gnn.train: graph {i} has numNodes={graphs[i].numNodes}; must be > 0.")
-        var zeroN: int = 0
-        var crashN: int = 1 / zeroN
+        panic($"Gnn.train: graph {i} has numNodes={graphs[i].numNodes}; must be > 0.")
 
     # --- Compute maxNodes for the padding ceiling.
     var maxNodes: int = graphs[0].numNodes
