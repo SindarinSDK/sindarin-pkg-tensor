@@ -132,27 +132,77 @@ fn main(): void =>
   println($"  final loss = {result.loss}")
   println("")
 
+  # Run the single-batch model's post-train inference + assertions BEFORE
+  # the multi-batch test does its reset(), because reset() wipes the
+  # global tensor pool and would invalidate `model` and `trainGraphs[0]`.
   assertTrue(!isNan(result.loss),
     "loss must be finite (not NaN) after 50 epochs of negative-weight training")
-
-  # Bound the magnitude — even with the clamp the loss can be moderately
-  # negative, but should not exceed the clamp's analytical worst case.
-  # With LOG_SM_FLOOR=-20 and weights bounded at ~1.1, per-sample
-  # contribution is bounded by |w_i| * 20 = 22, batch-averaged ≈ 22.
-  # Pick 50 as a generous safety bound.
   assertTrue(result.loss > -50.0 && result.loss < 50.0,
     "loss magnitude must remain bounded")
-
-  # Also verify the model parameters are still finite by running an
-  # inference forward and checking the output probabilities.
   var probs: double[] = model.forward(trainGraphs[0], false).probs.toDoubles()
   var anyProbNan: bool = false
-  for var i: int = 0; i < len(probs); i++ =>
-    if isNan(probs[i]) =>
+  for var pi: int = 0; pi < len(probs); pi++ =>
+    if isNan(probs[pi]) =>
       anyProbNan = true
   assertTrue(!anyProbNan,
-    "post-train inference must not produce NaN probabilities")
-  println($"  post-train probs (sample 0): [{probs[0]}, {probs[1]}, {probs[2]}]")
+    "single-batch post-train inference must not produce NaN probabilities")
+  println($"  single-batch post-train probs (sample 0): [{probs[0]}, {probs[1]}, {probs[2]}]")
+  println("")
+
+  # --- Multi-batch regression: more samples than batchSize, mixed weights.
+  # This is the path that originally crashed skynet's trainer when the
+  # sample count first crossed batchSize=32. The forward `log(softmax)`
+  # was clamped, but the BACKWARD `1/softmax` was not, so AdamW
+  # eventually wrote NaN params on the final step. The fix in
+  # sn_tensor_weighted_cross_entropy uses log(softmax + eps) which
+  # bounds both forward and backward.
+  println("  multi-batch (35 samples, batchSize=8 → 4 batches/epoch, 4 epochs)...")
+  var multiGraphs: GraphTensors[] = {}
+  var multiLabels: double[] = {}
+  var multiWeights: double[] = {}
+  for var i: int = 0; i < 35; i++ =>
+    var nNodes: int = 4
+    if i % 3 == 0 =>
+      nNodes = 9
+    multiGraphs.push(buildGraph(nNodes, i % 2, i))
+    var cls: int = i % 2
+    if cls == 0 =>
+      multiLabels.push(1.0); multiLabels.push(0.0)
+    else =>
+      multiLabels.push(0.0); multiLabels.push(1.0)
+    var w: double = 0.89
+    if i % 2 == 0 =>
+      w = -1.10
+    multiWeights.push(w)
+
+  var multiCfg: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 32, numActions: 2,
+    numLayers: 3, arch: "gat", dropoutRate: 0.0
+  }
+  var multiModel: Gnn = Gnn.createWithSeed(multiCfg, 7l)
+  var multiOpt: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  var multiResult: TrainResult = multiModel.train(
+    multiGraphs, multiLabels, multiWeights, multiOpt, 4, 8, 0.0, 42l)
+  println($"  multi-batch final loss = {multiResult.loss}")
+
+  # Save → reload → forward to check the SAVED params aren't NaN.
+  # Pre-fix this would crash with NaN inference because the final
+  # AdamW step in the last batch wrote NaN params via the backward
+  # gradient through ggml_log(0).
+  multiModel.save("/tmp/test_neg_weights_multibatch.bin")
+  multiModel.reset()
+  var loadedModel: Gnn = Gnn.create(multiCfg)
+  loadedModel.load("/tmp/test_neg_weights_multibatch.bin")
+  # Build a fresh graph after reset+load — old multiGraphs slots have
+  # NULL data after reset and would crash inference.
+  var checkGraph: GraphTensors = buildGraph(4, 0, 99)
+  var checkProbs: double[] = loadedModel.forward(checkGraph, false).probs.toDoubles()
+  println($"  post-save-reload probs: [{checkProbs[0]}, {checkProbs[1]}]")
+  assertTrue(!isNan(multiResult.loss),
+    "multi-batch loss must be finite")
+  assertTrue(!isNan(checkProbs[0]) && !isNan(checkProbs[1]),
+    "post-reload inference must produce finite probs (no NaN params on disk)")
+  println("")
 
   summary()
 

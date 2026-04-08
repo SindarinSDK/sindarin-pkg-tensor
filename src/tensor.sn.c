@@ -1598,22 +1598,29 @@ RtTensor *sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
  * weights : shape (1,          batchRows)  -- per-sample importance weights
  *
  * Math:
- *   per_sample_i = -sum_c (label[i,c] * log_softmax_clamped(logits[i,c]))
+ *   per_sample_i = -sum_c (label[i,c] * log(softmax(logits[i,c]) + eps))
  *   loss         = sum_i (weight[i] * per_sample_i) / batchRows
  *
  * Convention: scale by 1/batchRows (not 1/sum(weights)). Weights are
  * relative importance, not effective sample counts. With weights all 1.0,
- * this exactly matches ggml_cross_entropy_loss.
+ * this approximately matches ggml_cross_entropy_loss (offset by log(1+eps)
+ * which is negligible for eps ~2e-9).
  *
- * log_softmax floor: log_softmax is clamped to LOG_SM_FLOOR (-20, i.e.
- * effective minimum probability ~2e-9) before the per-class multiply.
- * This bounds the loss when callers pass NEGATIVE per-sample weights
- * (REINFORCE policy gradient with normalized advantages). With negative
- * weights and an unclamped log_softmax, the cross-entropy is unbounded
- * below — the optimizer drives log_softmax toward -inf for the chosen
- * action, eventually overflows to NaN, and poisons every weight via the
- * AdamW step. The clamp prevents the runaway. The model converges to a
- * local minimum at the clamp boundary instead of diverging.
+ * Backward-safe softmax floor (the eps trick): we compute
+ * `log(softmax(x) + eps)` instead of `log(softmax(x))` to bound BOTH the
+ * forward and the backward. eps = LOG_SM_EPS (~2e-9, ≈ exp(-20)) gives:
+ *   forward:  log(softmax + eps) ≥ log(eps) ≈ -20
+ *   backward: d/dx log(softmax + eps) = 1/(softmax + eps) ≤ 1/eps ≈ 5e8
+ *
+ * Why this is necessary for REINFORCE policy gradient with negative
+ * per-sample weights: the unbounded weighted CE drives log_softmax of
+ * the chosen action toward -inf when weight < 0. Even if the FORWARD
+ * loss is clamped (an earlier fix tried this with a relu-based clamp),
+ * the BACKWARD through `ggml_log(softmax)` computes `1/softmax`, which
+ * is +inf when softmax underflows to 0. That infinity propagates to NaN
+ * through downstream ops, the AdamW step writes NaN params, and the
+ * model dies on the very next forward pass. The eps trick caps both
+ * sides of the autograd computation in one move.
  *
  * For consumers that need a mathematically clean unbounded objective
  * with negative weights, see docs/issues/ppo-clipped-objective.md for
@@ -1624,7 +1631,7 @@ RtTensor *sn_tensor_cross_entropy(RtTensor *probs, RtTensor *targets)
  * by tests/test_weighted_ce.sn).
  */
 
-#define LOG_SM_FLOOR (-20.0f)
+#define LOG_SM_EPS (2.0e-9f)
 
 RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
                                            RtTensor *labels_rt,
@@ -1644,34 +1651,23 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
         struct ggml_tensor *glb = rec_tensor(labels_rt);
         struct ggml_tensor *gw  = rec_tensor(weights_rt);
 
-        struct ggml_tensor *softmax    = ggml_soft_max(ctx, gl);
-        struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
-        /* clamp_floor(log_sm, LOG_SM_FLOOR) implemented as
-         *   LOG_SM_FLOOR + relu(log_sm - LOG_SM_FLOOR)
-         * because ggml_clamp has no backward implementation. relu does.
-         * No upper bound needed: log_softmax is naturally <= 0.
-         *
-         * The +20 / -20 constants live in 1-element scalar tensors
-         * allocated in g_param_ctx as INPUTS, with their host data
-         * pre-loaded by sn_graph_input_data. The lazy-init upload loop
-         * in sn_graph_train_epoch (and sn_graph_compute_loss for the
-         * direct test path) copies them onto the backend buffer. We
+        struct ggml_tensor *softmax = ggml_soft_max(ctx, gl);
+
+        /* eps-shifted log: log(softmax + eps).
+         * The eps constant is a 1-element scalar input tensor allocated
+         * in g_param_ctx with its host data pre-loaded by
+         * sn_graph_input_data. The lazy-init upload loop in
+         * sn_graph_train_epoch copies it onto the backend buffer. We
          * cannot use ggml_new_f32 here because g_compute_ctx /
          * g_param_ctx are no_alloc — that helper aborts on no_alloc. */
-        double pos_floor[1] = { (double)(-LOG_SM_FLOOR) };
-        double neg_floor[1] = { (double)( LOG_SM_FLOOR) };
-        SnArray *pos_arr = sn_array_new(sizeof(double), 1);
-        SnArray *neg_arr = sn_array_new(sizeof(double), 1);
-        sn_array_push(pos_arr, &pos_floor[0]);
-        sn_array_push(neg_arr, &neg_floor[0]);
-        RtTensor *pos_rt = sn_graph_input_data(pos_arr, 1, 1);
-        RtTensor *neg_rt = sn_graph_input_data(neg_arr, 1, 1);
-        struct ggml_tensor *pos_t = rec_tensor(pos_rt);
-        struct ggml_tensor *neg_t = rec_tensor(neg_rt);
-        struct ggml_tensor *log_sm_sh  = ggml_add1(ctx, log_sm, pos_t);
-        struct ggml_tensor *log_sm_rl  = ggml_relu(ctx, log_sm_sh);
-        struct ggml_tensor *log_sm_c   = ggml_add1(ctx, log_sm_rl, neg_t);
-        struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm_c, glb);
+        double eps_val[1] = { (double)LOG_SM_EPS };
+        SnArray *eps_arr = sn_array_new(sizeof(double), 1);
+        sn_array_push(eps_arr, &eps_val[0]);
+        RtTensor *eps_rt = sn_graph_input_data(eps_arr, 1, 1);
+        struct ggml_tensor *eps_t      = rec_tensor(eps_rt);
+        struct ggml_tensor *softmax_safe = ggml_add1(ctx, softmax, eps_t);
+        struct ggml_tensor *log_sm     = ggml_log(ctx, softmax_safe);
+        struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm, glb);
         struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
         struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, gw);
         struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
@@ -1693,26 +1689,19 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
     track_input(tlb, plb->data);
     track_input(tw,  pw->data);
 
-    struct ggml_tensor *softmax    = ggml_soft_max(ctx, tl);
-    struct ggml_tensor *log_sm     = ggml_log(ctx, softmax);
-    /* Same relu-based clamp_floor as the record-mode path. The micro
-     * context is also no_alloc, so we feed the +20 / -20 constants in
-     * via the existing scalar-input + track_input mechanism. The
-     * static float storage lives for the lifetime of run_graph (which
-     * uploads tracked inputs and runs immediately), so simple
-     * stack-local arrays are fine. */
-    static float pos_floor_buf[1] = { -LOG_SM_FLOOR };
-    static float neg_floor_buf[1] = {  LOG_SM_FLOOR };
-    struct ggml_tensor *pos_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    struct ggml_tensor *neg_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-    ggml_set_input(pos_t);
-    ggml_set_input(neg_t);
-    track_input(pos_t, pos_floor_buf);
-    track_input(neg_t, neg_floor_buf);
-    struct ggml_tensor *log_sm_sh  = ggml_add1(ctx, log_sm, pos_t);
-    struct ggml_tensor *log_sm_rl  = ggml_relu(ctx, log_sm_sh);
-    struct ggml_tensor *log_sm_c   = ggml_add1(ctx, log_sm_rl, neg_t);
-    struct ggml_tensor *per_class  = ggml_mul(ctx, log_sm_c, tlb);
+    struct ggml_tensor *softmax = ggml_soft_max(ctx, tl);
+
+    /* Same eps-shift as the record path. The micro context is no_alloc,
+     * so we feed eps in via the existing scalar-input + track_input
+     * mechanism. The static float storage lives for the lifetime of
+     * run_graph (which uploads tracked inputs and runs immediately). */
+    static float eps_buf[1] = { LOG_SM_EPS };
+    struct ggml_tensor *eps_t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(eps_t);
+    track_input(eps_t, eps_buf);
+    struct ggml_tensor *softmax_safe = ggml_add1(ctx, softmax, eps_t);
+    struct ggml_tensor *log_sm    = ggml_log(ctx, softmax_safe);
+    struct ggml_tensor *per_class = ggml_mul(ctx, log_sm, tlb);
     struct ggml_tensor *per_sample = ggml_sum_rows(ctx, per_class);
     struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, tw);
     struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
