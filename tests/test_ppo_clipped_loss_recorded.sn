@@ -43,7 +43,7 @@ fn case1(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -64,7 +64,7 @@ fn case2(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -85,7 +85,7 @@ fn case3(): void =>
   var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -106,7 +106,7 @@ fn case4(): void =>
   var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -130,7 +130,7 @@ fn case5(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0, -1.0}, 2, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()

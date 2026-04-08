@@ -158,7 +158,7 @@ native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weigh
 # Returns a scalar loss tensor. Works in both direct and record modes; the
 # record-mode path is driven by Gnn.trainPpo() for multi-epoch RL training
 # on the same batch without the weighted-CE divergence pathology.
-native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double): Tensor
+native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double, entropyCoeff: double): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
 native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
 native fn sn_gpu_available(): bool

@@ -142,8 +142,11 @@ static void ensure_backend(void)
  * computes it on the backend, copies the result into the pool, and frees.
  * ====================================================================== */
 
-/* Context size generous enough for any single-op graph */
-#define GRAPH_CTX_SIZE (16 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
+/* Context size generous enough for any single-op graph. The PPO clipped loss
+ * direct-mode path is the largest single op currently — bumped from 16 to 32
+ * tensors when the entropy bonus added 4 more ggml ops to that op (record-mode
+ * uses g_record_ctx, sized separately). */
+#define GRAPH_CTX_SIZE (32 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
 
 /* Pre-allocated zero'd buffer for micro-graph contexts.
  * Newer ggml versions assert tensor->buffer == NULL before allocation.
@@ -2018,7 +2021,8 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
                                      RtTensor *old_log_probs_rt,
                                      RtTensor *actions_one_hot_rt,
                                      RtTensor *advantages_rt,
-                                     double    epsilon)
+                                     double    epsilon,
+                                     double    entropy_coeff)
 {
     TPool *pl   = unwrap(logits_rt);
     TPool *polp = unwrap(old_log_probs_rt);
@@ -2030,6 +2034,17 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
     const float inv_neg_n = -1.0f / (float)(batchRows > 0 ? batchRows : 1);
     const float eps_hi = 1.0f + (float)epsilon;
     const float eps_lo = 1.0f - (float)epsilon;
+    /* Entropy bonus: loss_total = loss_clipped - entropy_coeff * mean(H(p))
+     * where H(p) = -Σ_classes p log p (per sample). To minimize loss_total
+     * via gradient descent and INCREASE entropy, we add
+     *   +entropy_coeff * mean(Σ p log p)   (= -entropy_coeff * mean(H))
+     * to the existing clipped loss. mean is over batchRows samples; the
+     * inner Σ is over numClasses, computed as ggml_sum over the full
+     * (numClasses, batchRows) p_log_p tensor then scaled by 1/batchRows.
+     * Set entropy_coeff = 0.0 to disable (matches pre-entropy behaviour).
+     * Without this term PPO collapses to a deterministic policy on
+     * datasets dominated by one class — see Phase 6 report 2026-04-08. */
+    const float entropy_scale = (float)(entropy_coeff / (double)(batchRows > 0 ? batchRows : 1));
 
     if (g_record_mode) {
         struct ggml_context *ctx = g_record_ctx;
@@ -2073,7 +2088,15 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
         struct ggml_tensor *per_sample   = ggml_scale(ctx, min_two_x, 0.5f);
 
         struct ggml_tensor *summed       = ggml_sum(ctx, per_sample);
-        struct ggml_tensor *loss         = ggml_scale(ctx, summed, inv_neg_n);
+        struct ggml_tensor *clipped_loss = ggml_scale(ctx, summed, inv_neg_n);
+
+        /* Entropy bonus term — see comment near function top. softmax and
+         * log_pi (= log(softmax + LOG_SM_EPS)) are already in scope. */
+        struct ggml_tensor *p_log_p      = ggml_mul(ctx, softmax, log_pi);
+        struct ggml_tensor *plp_sum      = ggml_sum(ctx, p_log_p);
+        struct ggml_tensor *entropy_term = ggml_scale(ctx, plp_sum, entropy_scale);
+
+        struct ggml_tensor *loss         = ggml_add(ctx, clipped_loss, entropy_term);
         ggml_set_name(loss, "ppo_clipped_loss");
         return rec_wrap(loss, 1, 1);
     }
@@ -2119,7 +2142,14 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
     struct ggml_tensor *per_sample   = ggml_scale(ctx, min_two_x, 0.5f);
 
     struct ggml_tensor *summed       = ggml_sum(ctx, per_sample);
-    struct ggml_tensor *loss         = ggml_scale(ctx, summed, inv_neg_n);
+    struct ggml_tensor *clipped_loss = ggml_scale(ctx, summed, inv_neg_n);
+
+    /* Entropy bonus term — direct-mode mirror of the record-mode branch. */
+    struct ggml_tensor *p_log_p      = ggml_mul(ctx, softmax, log_pi);
+    struct ggml_tensor *plp_sum      = ggml_sum(ctx, p_log_p);
+    struct ggml_tensor *entropy_term = ggml_scale(ctx, plp_sum, entropy_scale);
+
+    struct ggml_tensor *loss         = ggml_add(ctx, clipped_loss, entropy_term);
     ggml_set_output(loss);
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);

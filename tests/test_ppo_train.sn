@@ -139,7 +139,7 @@ fn main(): void =>
   # epochs = 4, batchSize = 3
   var result: TrainResult = model.trainPpo(
     graphs, actions, advantages, opt,
-    4, 3, epsilon, 42l)
+    4, 3, epsilon, 0.0, 42l)
 
   println($"  final loss = {result.loss}")
   println($"  accuracy   = {result.accuracy}")

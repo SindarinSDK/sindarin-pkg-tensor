@@ -361,7 +361,7 @@ struct Gnn =>
     # as empty / zero placeholders.
     var emptyOldLogProbs: double[] = {}
     return self.trainCore(graphs, labels, weights, optimizer, epochs,
-      batchSize, valSplit, seed, "weighted_ce", emptyOldLogProbs, 0.0)
+      batchSize, valSplit, seed, "weighted_ce", emptyOldLogProbs, 0.0, 0.0)
 
   # On-policy PPO-clipped training (Schulman et al. 2017). Caller-visible
   # contract parallels train() but swaps two things:
@@ -396,7 +396,8 @@ struct Gnn =>
   # of per-epoch driver. See docs/issues/ppo-clipped-objective.md.
   fn trainPpo(graphs: GraphTensors[], actions: double[],
     advantages: double[], optimizer: Optimizer, epochs: int,
-    batchSize: int, epsilon: double, seed: long): TrainResult =>
+    batchSize: int, epsilon: double, entropyCoeff: double,
+    seed: long): TrainResult =>
     var numClasses: int = self.config.numActions
     var total: int = len(graphs)
     var oldLogProbsHost: double[] = {}
@@ -418,7 +419,7 @@ struct Gnn =>
         p = 0.000000002
       oldLogProbsHost.push(log(p))
     return self.trainCore(graphs, actions, advantages, optimizer, epochs,
-      batchSize, 0.0, seed, "ppo", oldLogProbsHost, epsilon)
+      batchSize, 0.0, seed, "ppo", oldLogProbsHost, epsilon, entropyCoeff)
 
   # Shared training implementation for train() and trainPpo(). The only
   # places this method branches on lossKind are:
@@ -436,7 +437,8 @@ struct Gnn =>
   fn trainCore(graphs: GraphTensors[], labels: double[], weights: double[],
     optimizer: Optimizer, epochs: int, batchSize: int,
     valSplit: double, seed: long, lossKind: str,
-    oldLogProbsHost: double[], epsilon: double): TrainResult =>
+    oldLogProbsHost: double[], epsilon: double,
+    entropyCoeff: double): TrainResult =>
 
     if len(graphs) == 0 || epochs <= 0 || batchSize <= 0 =>
       var emptyD: double[] = {}
@@ -695,7 +697,7 @@ struct Gnn =>
         initOldLogProbs.push(0.0)
       oldLogProbsInput = sn_graph_input_data(initOldLogProbs, batchSize, 1)
       loss = sn_tensor_ppo_clipped_loss(
-        output.logits, oldLogProbsInput, labelsInput, weightsInput, epsilon)
+        output.logits, oldLogProbsInput, labelsInput, weightsInput, epsilon, entropyCoeff)
     else =>
       loss = sn_tensor_weighted_cross_entropy(
         output.logits, labelsInput, weightsInput)
