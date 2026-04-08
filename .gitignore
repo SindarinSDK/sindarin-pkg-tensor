@@ -3,3 +3,11 @@ build/
 libs/
 bin/
 *.exe
+
+# Claude Code per-project config (hooks, settings, MCP servers)
+.claude/
+.mcp.json
+
+# Core dumps from ggml aborts / test crashes
+core
+core.*
