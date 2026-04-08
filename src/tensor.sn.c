@@ -224,6 +224,45 @@ static struct ggml_tensor   *g_opt_features_tensor  = NULL;
 static struct ggml_tensor   *g_opt_labels_tensor    = NULL;
 static struct ggml_tensor   *g_opt_weights_tensor   = NULL;
 
+/* Per-batch upload registry — tensors whose VALUES change per minibatch.
+ *
+ * Used for heterogeneous graph batching: when the caller's training set has
+ * graphs with variable numNodes/numEdges, the dense adjacency and pooling
+ * matrices baked into the static recorded graph cannot stay constant. Each
+ * call to sn_tensor_sparse_aggregate / sn_tensor_mean_pool in record mode
+ * registers its output ggml input tensor here, and sn_graph_train_epoch
+ * walks the registry every batch to upload freshly assembled host buffers.
+ *
+ * See docs/issues/heterogeneous-graph-batching.md for the rationale. */
+#define PB_KIND_ADJ  1
+#define PB_KIND_POOL 2
+#define PB_MODE_SUM            0
+#define PB_MODE_SUM_NORMALIZED 1
+#define PB_MODE_MEAN           2
+
+#define MAX_PER_BATCH_TENSORS 32
+static int g_pb_pool_idx[MAX_PER_BATCH_TENSORS]; /* pool slot of the registered ggml input tensor */
+static int g_pb_kind[MAX_PER_BATCH_TENSORS];     /* PB_KIND_ADJ | PB_KIND_POOL */
+static int g_pb_mode[MAX_PER_BATCH_TENSORS];     /* PB_MODE_* (ADJ only; POOL ignores) */
+static int g_pb_count = 0;
+
+static void track_per_batch(int pool_idx, int kind, int mode) {
+    if (g_pb_count >= MAX_PER_BATCH_TENSORS) {
+        fprintf(stderr, "per-batch tensor registry full (max %d)\n", MAX_PER_BATCH_TENSORS);
+        abort();
+    }
+    g_pb_pool_idx[g_pb_count] = pool_idx;
+    g_pb_kind[g_pb_count]     = kind;
+    g_pb_mode[g_pb_count]     = mode;
+    g_pb_count++;
+}
+
+static int parse_agg_mode(const char *mode) {
+    if (mode && strcmp(mode, "sum_normalized") == 0) return PB_MODE_SUM_NORMALIZED;
+    if (mode && strcmp(mode, "mean") == 0)           return PB_MODE_MEAN;
+    return PB_MODE_SUM;
+}
+
 void sn_graph_begin(void) {
     ensure_backend();
     g_pool_count_before_record = g_pool_count;
@@ -246,6 +285,10 @@ void sn_graph_begin(void) {
     g_opt_features_tensor  = NULL;
     g_opt_labels_tensor    = NULL;
     g_opt_weights_tensor   = NULL;
+
+    /* Reset per-batch upload registry — tensors get re-registered as the
+     * record-mode forward pass walks the layers. */
+    g_pb_count = 0;
 }
 
 void sn_graph_end(void) {
@@ -263,6 +306,7 @@ void sn_graph_end(void) {
     g_record_ctx = NULL;
     memset(g_record_map, 0, sizeof(g_record_map));
     g_record_mode = false;
+    g_pb_count = 0;
 
     /* Reclaim pool slots allocated during recording */
     for (int i = g_pool_count_before_record; i < g_pool_count; i++) {
@@ -544,13 +588,16 @@ double sn_graph_train_epoch(
     RtTensor *features_rt,
     RtTensor *labels_rt,
     RtTensor *weights_rt,
-    SnArray  *features_host,    /* total_samples * features_per_sample doubles */
-    SnArray  *labels_host,      /* total_samples * labels_per_sample doubles */
-    SnArray  *weights_host,     /* total_samples doubles, one weight per sample */
-    SnArray  *batch_perm,       /* total_samples doubles (integer-valued permutation) */
-    long long features_per_sample,
+    SnArray  *features_host,         /* total_samples * max_nodes * feature_dim doubles, zero-padded */
+    SnArray  *labels_host,           /* total_samples * labels_per_sample doubles */
+    SnArray  *weights_host,          /* total_samples doubles, one weight per sample */
+    SnArray  *adj_host,              /* total_samples * max_nodes * max_nodes doubles, zero-padded */
+    SnArray  *real_node_count_host,  /* total_samples doubles (per-sample real node count) */
+    SnArray  *batch_perm,            /* total_samples doubles (integer-valued permutation) */
+    long long feature_dim,
     long long labels_per_sample,
     long long n_per_batch,
+    long long max_nodes_per_graph,
     char     *optimizer_str,
     double    lr,
     double    beta1,
@@ -565,6 +612,12 @@ double sn_graph_train_epoch(
     struct ggml_tensor *labels   = rec_tensor(labels_rt);
     struct ggml_tensor *weights  = rec_tensor(weights_rt);
     if (!loss || !features || !labels || !weights) return -1.0;
+
+    /* Batched padded sizes — every batch lives in a tensor of these dims. */
+    const long long nodes_per_batch    = n_per_batch * max_nodes_per_graph;
+    const long long features_per_node  = feature_dim;
+    const long long features_per_batch = nodes_per_batch * features_per_node;
+    const long long adj_per_sample     = max_nodes_per_graph * max_nodes_per_graph;
 
     /* Update optimizer params (the callback reads from g_opt_params) */
     g_opt_params = ggml_opt_get_default_optimizer_params(NULL);
@@ -633,37 +686,103 @@ double sn_graph_train_epoch(
     long long n_batches     = total_samples / n_per_batch;
     if (n_batches == 0) return 0.0;
 
-    /* Per-batch scratch buffers — sized from the tensor shapes, since
-     * each batch fills the entire input tensor. */
-    size_t features_bytes = ggml_nbytes(features);
+    /* Per-batch scratch buffers — sized from the (padded) batched shape.
+     *
+     *  features_buf : (n_per_batch * max_nodes) * feature_dim floats
+     *  adj_buf      : (n_per_batch * max_nodes) * (n_per_batch * max_nodes) floats — block-diagonal
+     *  pool_buf     : n_per_batch * (n_per_batch * max_nodes) floats — real-count weighted
+     *  labels_buf   : n_per_batch * labels_per_sample floats
+     *  weights_buf  : n_per_batch floats
+     */
+    size_t features_bytes = (size_t)features_per_batch * sizeof(float);
+    size_t adj_bytes      = (size_t)nodes_per_batch * (size_t)nodes_per_batch * sizeof(float);
+    size_t pool_bytes     = (size_t)n_per_batch * (size_t)nodes_per_batch * sizeof(float);
     size_t labels_bytes   = ggml_nbytes(labels);
     size_t weights_bytes  = ggml_nbytes(weights);
 
-    float *features_buf = (float *)malloc(features_bytes);
+    float *features_buf = (float *)calloc((size_t)features_per_batch, sizeof(float));
+    float *adj_buf      = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
+    float *pool_buf     = (float *)calloc((size_t)n_per_batch * (size_t)nodes_per_batch, sizeof(float));
     float *labels_buf   = (float *)malloc(labels_bytes);
     float *weights_buf  = (float *)malloc(weights_bytes);
+
+    /* Sanity-check the recorded tensors actually have the expected padded shape.
+     * If they don't, the caller built the template with the wrong dimensions
+     * and the per-batch upload will overrun. Bail out instead of corrupting memory. */
+    if ((long long)features->ne[1] != nodes_per_batch ||
+        (long long)features->ne[0] != feature_dim) {
+        fprintf(stderr,
+                "sn_graph_train_epoch: features shape (%lld x %lld) != expected (%lld x %lld)\n",
+                (long long)features->ne[0], (long long)features->ne[1],
+                feature_dim, nodes_per_batch);
+        free(features_buf); free(adj_buf); free(pool_buf);
+        free(labels_buf); free(weights_buf);
+        return -1.0;
+    }
 
     double total_loss = 0.0;
 
     for (long long batch_idx = 0; batch_idx < n_batches; batch_idx++) {
-        /* Build this batch's host buffers by indexing through the permutation */
+        /* Zero the assembled buffers for this batch (block-diagonal layout
+         * means most cells are padding zeros). */
+        memset(features_buf, 0, features_bytes);
+        memset(adj_buf,      0, adj_bytes);
+        memset(pool_buf,     0, pool_bytes);
+
+        /* For each sample slot in the batch, copy: padded features, the
+         * sample's per-graph adjacency block at the right diagonal offset,
+         * and the sample's pool row weighted by its REAL node count. */
         for (long long i = 0; i < n_per_batch; i++) {
             double *perm_val = (double *)sn_array_get(batch_perm, batch_idx * n_per_batch + i);
             long long sample_idx = (long long)(*perm_val);
 
-            /* Features for this sample (features_per_sample doubles) */
-            for (long long j = 0; j < features_per_sample; j++) {
-                double *v = (double *)sn_array_get(features_host, sample_idx * features_per_sample + j);
-                features_buf[i * features_per_sample + j] = (float)(*v);
+            /* --- Padded features.
+             * Source slice: features_host[sample_idx * max_nodes * feature_dim ..
+             *                              (sample_idx+1) * max_nodes * feature_dim]
+             * Destination slice: features_buf[(i * max_nodes) * feature_dim ..
+             *                                  ((i+1) * max_nodes) * feature_dim]
+             * Source is already zero-padded by Gnn.train(), so we just copy. */
+            const long long src_feat_base = sample_idx * max_nodes_per_graph * feature_dim;
+            const long long dst_feat_base = i * max_nodes_per_graph * feature_dim;
+            for (long long j = 0; j < max_nodes_per_graph * feature_dim; j++) {
+                double *v = (double *)sn_array_get(features_host, src_feat_base + j);
+                features_buf[dst_feat_base + j] = (float)(*v);
             }
 
-            /* Labels for this sample (labels_per_sample doubles) */
+            /* --- Block-diagonal adjacency.
+             * Each sample contributes a (max_nodes x max_nodes) block at
+             * row offset (i * max_nodes), column offset (i * max_nodes).
+             * The host adjacency for sample_idx is laid out row-major as a
+             * (max_nodes x max_nodes) slice and is already zero beyond the
+             * sample's real node count. */
+            const long long src_adj_base = sample_idx * adj_per_sample;
+            const long long row_off      = i * max_nodes_per_graph;
+            for (long long r = 0; r < max_nodes_per_graph; r++) {
+                for (long long c = 0; c < max_nodes_per_graph; c++) {
+                    double *v = (double *)sn_array_get(adj_host, src_adj_base + r * max_nodes_per_graph + c);
+                    adj_buf[(row_off + r) * nodes_per_batch + (row_off + c)] = (float)(*v);
+                }
+            }
+
+            /* --- Pool matrix row for graph i.
+             * pool_buf[i, i*max_nodes + k] = 1 / real_count[sample_idx]
+             * for k in [0, real_count[sample_idx]); zero elsewhere.
+             * Padded slots stay zero so they're excluded from the per-graph mean. */
+            double *rc_v = (double *)sn_array_get(real_node_count_host, sample_idx);
+            long long real_count = (long long)(*rc_v);
+            if (real_count <= 0) real_count = 1; /* defensive — shouldn't happen */
+            float inv = 1.0f / (float)real_count;
+            for (long long k = 0; k < real_count; k++) {
+                pool_buf[i * nodes_per_batch + (i * max_nodes_per_graph + k)] = inv;
+            }
+
+            /* --- Labels for this sample (labels_per_sample doubles) */
             for (long long j = 0; j < labels_per_sample; j++) {
                 double *v = (double *)sn_array_get(labels_host, sample_idx * labels_per_sample + j);
                 labels_buf[i * labels_per_sample + j] = (float)(*v);
             }
 
-            /* One weight per sample */
+            /* --- One weight per sample */
             double *w = (double *)sn_array_get(weights_host, sample_idx);
             weights_buf[i] = (float)(*w);
         }
@@ -671,10 +790,31 @@ double sn_graph_train_epoch(
         /* Allocate the OPT graph for this batch (cached after first call) */
         ggml_opt_alloc(g_opt_ctx, /*backward =*/ true);
 
-        /* Upload the batch's input data to the backend buffers */
+        /* Upload the batch's features/labels/weights to the backend buffers */
         ggml_backend_tensor_set(g_opt_features_tensor, features_buf, 0, features_bytes);
         ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
         ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
+
+        /* Upload the batched adjacency / pool matrix to every tensor in the
+         * per-batch registry. Within a single Gnn.train() call all ADJ
+         * tensors share the same edgeIndex/edgeWeight + mode (because every
+         * layer's `aggregate()` is called with the same args), so they all
+         * receive the same buffer; same story for the (single) POOL tensor. */
+        for (int r = 0; r < g_pb_count; r++) {
+            int pool_idx = g_pb_pool_idx[r];
+            struct ggml_tensor *gt = g_record_map[pool_idx];
+            if (!gt || !gt->buffer) continue;
+
+            if (g_pb_kind[r] == PB_KIND_ADJ) {
+                size_t want = adj_bytes;
+                size_t have = ggml_nbytes(gt);
+                ggml_backend_tensor_set(gt, adj_buf, 0, want < have ? want : have);
+            } else if (g_pb_kind[r] == PB_KIND_POOL) {
+                size_t want = pool_bytes;
+                size_t have = ggml_nbytes(gt);
+                ggml_backend_tensor_set(gt, pool_buf, 0, want < have ? want : have);
+            }
+        }
 
         /* Run forward + backward + AdamW step (NULL result — we read loss directly) */
         ggml_opt_eval(g_opt_ctx, NULL);
@@ -686,6 +826,8 @@ double sn_graph_train_epoch(
     }
 
     free(features_buf);
+    free(adj_buf);
+    free(pool_buf);
     free(labels_buf);
     free(weights_buf);
 
@@ -1135,56 +1277,42 @@ RtTensor *sn_tensor_mean_pool(RtTensor *node_embeddings, RtTensor *batch_index)
     int64_t feat_dim  = px->ne[0];
 
     if (g_record_mode) {
-        /* Differentiable mean pool using a pooling matrix built from batch_index.
+        /* Differentiable mean pool using a pooling matrix.
          *
-         * When each node is its own graph (batch_index = [0,1,...,N-1]),
-         * the pooling matrix is identity → mean pool is identity.
-         * This is the standard training case (1 sample = 1 node = 1 graph).
+         * Heterogeneous-batching note: the pooling matrix VALUES are no
+         * longer baked into the static graph. We allocate the pool tensor
+         * with the (batchSize x num_nodes) shape and register it with the
+         * per-batch upload registry. sn_graph_train_epoch rebuilds it each
+         * batch using the REAL per-sample node counts so padded slots get
+         * weight 0 and the per-graph mean uses the right denominator. The
+         * `batch_index` argument fixes the shape but its values matter only
+         * for shape derivation. See docs/issues/heterogeneous-graph-batching.md.
          *
-         * For the general case (multiple nodes per graph), build
-         * P[num_graphs, num_nodes] and compute result = P × features
-         * via ggml_mul_mat(features_T, P) → [feat_dim, num_graphs]. */
+         * The previous identity short-circuit (skip pool entirely when each
+         * node is its own graph) is GONE — same reasoning as in
+         * sn_tensor_sparse_aggregate. Regime A consumers pay one identity
+         * matmul; in exchange the topology contract is uniform. */
 
-        /* Determine num_graphs from batch_index */
+        /* Determine num_graphs from batch_index template (used only to
+         * derive the static pool_mat row count). */
         int64_t num_graphs = 1;
         for (int64_t i = 0; i < pb->n_elem; i++) {
             int64_t b = (int64_t)pb->data[i];
             if (b + 1 > num_graphs) num_graphs = b + 1;
         }
 
-        /* Identity check: num_graphs == num_nodes and batch[i] == i for all i.
-         * Mean pool of 1-node graphs is identity — skip to preserve gradient flow
-         * and avoid non-contiguous backward through transpose. */
-        if (num_graphs == num_nodes) {
-            int is_identity = 1;
-            for (int64_t i = 0; i < num_nodes && i < pb->n_elem; i++) {
-                if ((int64_t)pb->data[i] != i) { is_identity = 0; break; }
-            }
-            if (is_identity) {
-                return node_embeddings;
-            }
-        }
-
-        /* General case: build pooling matrix on host */
+        /* Allocate the pool tensor with zero data — first batch upload overwrites. */
         int pool_idx = pool_alloc(num_nodes, num_graphs, 2);
         TPool *pool_mat = &g_pool[pool_idx];
         memset(pool_mat->data, 0, (size_t)(num_graphs * num_nodes) * sizeof(float));
 
-        float *count = (float *)calloc((size_t)num_graphs, sizeof(float));
-        for (int64_t n = 0; n < num_nodes && n < pb->n_elem; n++)
-            count[(int64_t)pb->data[n]] += 1.0f;
-        for (int64_t n = 0; n < num_nodes && n < pb->n_elem; n++) {
-            int64_t g = (int64_t)pb->data[n];
-            float c = count[g] > 0.0f ? count[g] : 1.0f;
-            pool_mat->data[g * num_nodes + n] = 1.0f / c;
-        }
-        free(count);
-
-        /* Create ggml tensor for pooling matrix in param context */
         struct ggml_tensor *gpool = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_graphs);
         ggml_set_name(gpool, "pool_mat");
         ggml_set_input(gpool);
         g_record_map[pool_idx] = gpool;
+
+        /* Register for per-batch upload. */
+        track_per_batch(pool_idx, PB_KIND_POOL, 0);
 
         /* Transpose features INSIDE the graph (not on host) so per-batch
          * uploads of node_embeddings are reflected in the recorded graph.
@@ -1267,58 +1395,38 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
     int64_t num_nodes = px->ne[1];
     int64_t feat_dim  = px->ne[0];
 
-    /* In record mode, build dense adjacency matrix for differentiable aggregation */
+    /* In record mode, build dense adjacency matrix for differentiable aggregation.
+     *
+     * Heterogeneous-batching note: the adjacency VALUES are no longer baked
+     * into the static graph at record time. Instead we register the adjacency
+     * tensor with the per-batch upload registry, and sn_graph_train_epoch
+     * rebuilds + uploads the batched block-diagonal adjacency for each batch.
+     * This is what lets training handle graphs with variable numNodes/numEdges
+     * inside one train() call. The `edge_index` and `edge_weight` arguments
+     * passed here describe the FIRST batch only — they fix the SHAPE of the
+     * recorded graph but not the values. See docs/issues/heterogeneous-graph-batching.md.
+     *
+     * The previous "identity short-circuit" optimization (skip adj entirely
+     * when adjacency is exactly I) is GONE: it depended on the template
+     * adjacency being representative of every batch, which is false now.
+     * Regime A consumers (every graph is a single self-looping node) pay
+     * one identity matmul per layer for the simplification — small price. */
     if (g_record_mode) {
-        int64_t ne = (pei->ne[1] == 2) ? pei->ne[0] : pei->ne[1];
-
-        /* Build adjacency matrix on host */
+        /* Allocate the adjacency tensor in g_param_ctx with the batched
+         * (num_nodes x num_nodes) shape. Data is left as zeros — the first
+         * batch upload in sn_graph_train_epoch overwrites it. */
         int adj_idx = pool_alloc(num_nodes, num_nodes, 2);
         TPool *adj = &g_pool[adj_idx];
         memset(adj->data, 0, (size_t)(num_nodes * num_nodes) * sizeof(float));
-        float *cnt = NULL;
-        if (strcmp(mode, "mean") == 0 || strcmp(mode, "sum_normalized") == 0)
-            cnt = (float *)calloc((size_t)num_nodes, sizeof(float));
-        for (int64_t i = 0; i < ne; i++) {
-            int64_t s, d;
-            if (pei->ne[1] == 2) { s = (int64_t)pei->data[i]; d = (int64_t)pei->data[ne + i]; }
-            else { s = (int64_t)pei->data[i*2]; d = (int64_t)pei->data[i*2+1]; }
-            if (s < num_nodes && d < num_nodes) {
-                adj->data[d * num_nodes + s] += pew->data[i];
-                if (cnt) cnt[d] += 1.0f;
-            }
-        }
-        if (cnt) {
-            for (int64_t n = 0; n < num_nodes; n++) {
-                float c = cnt[n] > 0 ? cnt[n] : 1.0f;
-                for (int64_t s = 0; s < num_nodes; s++) adj->data[n*num_nodes+s] /= c;
-            }
-            free(cnt);
-        }
-
-        /* Identity check: if adjacency is identity matrix (self-loops only,
-         * weight 1.0 each), aggregate is identity — skip to preserve gradient
-         * flow and avoid non-contiguous backward through transpose. */
-        int is_identity = (ne == num_nodes) ? 1 : 0;
-        if (is_identity) {
-            for (int64_t n = 0; n < num_nodes && is_identity; n++) {
-                for (int64_t m = 0; m < num_nodes; m++) {
-                    float expected = (n == m) ? 1.0f : 0.0f;
-                    if (adj->data[n * num_nodes + m] != expected) { is_identity = 0; break; }
-                }
-            }
-        }
-        if (is_identity) {
-            /* Adjacency is I — aggregate returns input unchanged */
-            free(adj->data); adj->data = NULL;
-            g_pool_count--; /* reclaim the adj slot */
-            return features;
-        }
 
         struct ggml_tensor *gadj = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, num_nodes, num_nodes);
         ggml_set_name(gadj, "adj");
         ggml_set_input(gadj);
-        /* Data uploaded after ggml_backend_alloc_ctx_tensors */
         g_record_map[adj_idx] = gadj;
+
+        /* Register for per-batch upload. The mode determines how
+         * sn_graph_train_epoch normalizes the assembled adjacency. */
+        track_per_batch(adj_idx, PB_KIND_ADJ, parse_agg_mode(mode));
 
         /* Transpose features INSIDE the graph (not on host) so per-batch
          * uploads of `features` are reflected in the recorded graph.

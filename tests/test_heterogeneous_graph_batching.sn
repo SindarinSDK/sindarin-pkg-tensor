@@ -1,0 +1,224 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_heterogeneous_graph_batching.sn â€” Regime C regression guard
+#
+# Verifies that Gnn.train() handles graphs with VARIABLE numNodes and
+# VARIABLE numEdges within a SINGLE multi-batch train() call. Before the
+# pad-to-max + per-batch-upload work this test would have crashed in the
+# topology precondition assertion at gnn.sn:343-346 (the deliberate 1/0
+# panic when graphs[i].numEdges != edgesPerGraph during multi-batch
+# training).
+#
+# Regime A (every graph is single-node) and Regime B (every graph has
+# identical topology) are covered by other tests:
+# - test_train_epoch_smoke.sn       â€” Regime A, by-hand model
+# - test_train_save_infer.sn        â€” Regime A, full Gnn pipeline
+# - test_real_graph_topology.sn     â€” Regime B, single batch
+# - test_crusher_policy.sn          â€” Regime A, single-node observations
+#
+# This test is the only coverage we have for Regime C (heterogeneous
+# multi-batch). Do not delete it. See
+# docs/issues/heterogeneous-graph-batching.md for the full rationale.
+#
+# Setup:
+# * 6 graphs across 2 classes, multi-batch training (totalSamples=6,
+# batchSize=2 â†’ 3 batches, the multi-batch path is exercised).
+# * Each graph has DIFFERENT numNodes (3, 4, 5) and DIFFERENT numEdges
+# (mix of chain edges + self-loops). The pad-to-max upload pipeline
+# must not corrupt feature/adj/pool routing across these shapes.
+# * Class is encoded by node 0's feature vector:
+# Class 0: node 0 = [1, 0, 0, 0]
+# Class 1: node 0 = [0, 0, 1, 0]
+# All other nodes are uniform [0, 1, 0, 0]. With sum_normalized GCN,
+# after one round of message passing every node sees a class-specific
+# mix in its hidden state, which the pooled embedding propagates to
+# the classifier.
+# * Topologies vary INDEPENDENTLY of class so the network cannot use
+# edge count or node count as a shortcut.
+#
+# Pass criteria after 300 epochs:
+# * Each class-0 graph predicts class 0 with prob > class 1
+# * Each class-1 graph predicts class 1 with prob > class 0
+# * Average correct-class probability across all 6 graphs > 0.7
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Push edges as (sources..., destinations...) to a flat double[] in the
+# layout fromDoubles(data, rows=2, cols=numEdges) expects.
+fn buildEdgeFlat(srcs: int[], dsts: int[]): double[] =>
+  var out: double[] = {}
+  for var i: int = 0; i < len(srcs); i++ =>
+    out.push(srcs[i].toDouble())
+  for var i: int = 0; i < len(dsts); i++ =>
+    out.push(dsts[i].toDouble())
+  return out
+
+# Build a graph with the given numNodes, edge list, and class label.
+# featureDim = 4. Node 0's feature is determined by classLabel; all
+# other nodes get [0, 1, 0, 0].
+fn buildGraph(numNodes: int, srcs: int[], dsts: int[], classLabel: int): GraphTensors =>
+  var featureDim: int = 4
+  var feats: double[] = {}
+  for var n: int = 0; n < numNodes; n++ =>
+    if n == 0 =>
+      if classLabel == 0 =>
+        feats.push(1.0); feats.push(0.0); feats.push(0.0); feats.push(0.0)
+      else =>
+        feats.push(0.0); feats.push(0.0); feats.push(1.0); feats.push(0.0)
+    else =>
+      feats.push(0.0); feats.push(1.0); feats.push(0.0); feats.push(0.0)
+
+  var ne: int = len(srcs)
+  var edges: double[] = buildEdgeFlat(srcs, dsts)
+  var weights: double[] = {}
+  for var i: int = 0; i < ne; i++ =>
+    weights.push(1.0)
+  var batch: double[] = {}
+  for var i: int = 0; i < numNodes; i++ =>
+    batch.push(0.0)
+
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, numNodes, featureDim),
+    edgeIndex: Tensor.fromDoubles(edges, 2, ne),
+    edgeWeight: Tensor.fromDoubles(weights, 1, ne),
+    batchIndex: Tensor.fromDoubles(batch, numNodes, 1),
+    numNodes: numNodes, numEdges: ne, featureDim: featureDim
+  }
+
+# ---------------------------------------------------------------------------
+# Main test
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_heterogeneous_graph_batching ===")
+  println("")
+
+  var featureDim: int = 4
+  var numActions: int = 2
+
+  # Six graphs with VARYING numNodes and VARYING numEdges. Topology and
+  # node count are uncorrelated with class â€” only node 0's features encode
+  # the class. Pre-fix this would have crashed in the multi-batch
+  # numEdges precondition because numEdges differs across graphs.
+  #
+  # Graph 0: 3 nodes, chain 0â†’1â†’2 + self-loop on 0     â†’ class 0   (4 edges)
+  # Graph 1: 3 nodes, chain 0â†’1â†’2 + 1â†’0                â†’ class 1   (3 edges)
+  # Graph 2: 4 nodes, self-loops only                  â†’ class 0   (4 edges)
+  # Graph 3: 5 nodes, chain 0â†’1â†’2â†’3â†’4 + self-loop on 4 â†’ class 1   (5 edges)
+  # Graph 4: 5 nodes, star 0â†”{1,2,3,4}                 â†’ class 0   (8 edges)
+  # Graph 5: 4 nodes, chain 0â†’1â†’2â†’3 + 0â†’3              â†’ class 1   (4 edges)
+  var g0Srcs: int[] = {0, 0, 1}; var g0Dsts: int[] = {0, 1, 2}
+  var g0: GraphTensors = buildGraph(3, g0Srcs, g0Dsts, 0)
+
+  var g1Srcs: int[] = {0, 1, 1}; var g1Dsts: int[] = {1, 2, 0}
+  var g1: GraphTensors = buildGraph(3, g1Srcs, g1Dsts, 1)
+
+  var g2Srcs: int[] = {0, 1, 2, 3}; var g2Dsts: int[] = {0, 1, 2, 3}
+  var g2: GraphTensors = buildGraph(4, g2Srcs, g2Dsts, 0)
+
+  var g3Srcs: int[] = {0, 1, 2, 3, 4}; var g3Dsts: int[] = {1, 2, 3, 4, 4}
+  var g3: GraphTensors = buildGraph(5, g3Srcs, g3Dsts, 1)
+
+  var g4Srcs: int[] = {0, 0, 0, 0, 1, 2, 3, 4}
+  var g4Dsts: int[] = {1, 2, 3, 4, 0, 0, 0, 0}
+  var g4: GraphTensors = buildGraph(5, g4Srcs, g4Dsts, 0)
+
+  var g5Srcs: int[] = {0, 1, 2, 0}; var g5Dsts: int[] = {1, 2, 3, 3}
+  var g5: GraphTensors = buildGraph(4, g5Srcs, g5Dsts, 1)
+
+  var trainGraphs: GraphTensors[] = {g0, g1, g2, g3, g4, g5}
+  var trainLabels: double[] = {
+    1.0, 0.0, # graph 0 â € ” class 0
+    0.0, 1.0, # graph 1 â € ” class 1
+    1.0, 0.0, # graph 2 â € ” class 0
+    0.0, 1.0, # graph 3 â € ” class 1
+    1.0, 0.0, # graph 4 â € ” class 0
+    0.0, 1.0 # graph 5 â € ” class 1
+  }
+  var trainWeights: double[] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
+
+  # Architecture: small GCN, 2 layers. GCN's "sum_normalized" mode
+  # exercises the host-side per-row normalization path with variable
+  # in-degree counts.
+  var config: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 16, numActions: numActions,
+    numLayers: 2, arch: "gcn", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 7l)
+
+  # --- Pre-train predictions ----------------------------------------------
+  var preCp: long = model.checkpoint()
+  var preProbs: double[][] = {}
+  for var i: int = 0; i < len(trainGraphs); i++ =>
+    preProbs.push(model.forward(trainGraphs[i], false).probs.toDoubles())
+  model.restore(preCp)
+
+  println("  pre-train probs:")
+  for var i: int = 0; i < len(trainGraphs); i++ =>
+    println($"    g{i} (n={trainGraphs[i].numNodes}, e={trainGraphs[i].numEdges}): [{preProbs[i][0]}, {preProbs[i][1]}]")
+  println("")
+
+  # --- Train with multi-batch (totalSamples > batchSize) ------------------
+  # totalSamples = 6, batchSize = 2 â†’ 3 batches per epoch. Pre-fix this
+  # would have crashed in the gnn.sn:343 multi-batch numEdges assertion.
+  var opt: Optimizer = Optimizer.adamw(0.05, 0.0)
+  println("  training 300 epochs, batchSize=2 (3 batches per epoch)...")
+  var result: TrainResult = model.train(
+    trainGraphs, trainLabels, trainWeights,
+    opt, 300, 2, 0.0, 42l)
+  println($"  train done loss={result.loss}")
+  println("")
+
+  # --- Post-train predictions ---------------------------------------------
+  var postProbs: double[][] = {}
+  for var i: int = 0; i < len(trainGraphs); i++ =>
+    postProbs.push(model.forward(trainGraphs[i], false).probs.toDoubles())
+
+  println("  post-train probs:")
+  for var i: int = 0; i < len(trainGraphs); i++ =>
+    println($"    g{i} (n={trainGraphs[i].numNodes}, e={trainGraphs[i].numEdges}): [{postProbs[i][0]}, {postProbs[i][1]}]")
+  println("")
+
+  # --- Assertions ---------------------------------------------------------
+  # 1. Sparse-class graphs (indices 0, 2, 4) should each prefer class 0
+  # over class 1 by at least a small margin.
+  assertTrue(postProbs[0][0] > postProbs[0][1],
+    "graph 0 (sparse, n=3) should predict class 0 over class 1")
+  assertTrue(postProbs[2][0] > postProbs[2][1],
+    "graph 2 (sparse, n=5) should predict class 0 over class 1")
+  assertTrue(postProbs[4][0] > postProbs[4][1],
+    "graph 4 (sparse, n=4) should predict class 0 over class 1")
+
+  # 2. Dense-class graphs (indices 1, 3, 5) should each prefer class 1
+  # over class 0 by at least a small margin.
+  assertTrue(postProbs[1][1] > postProbs[1][0],
+    "graph 1 (dense, n=3) should predict class 1 over class 0")
+  assertTrue(postProbs[3][1] > postProbs[3][0],
+    "graph 3 (dense, n=5) should predict class 1 over class 0")
+  assertTrue(postProbs[5][1] > postProbs[5][0],
+    "graph 5 (dense, n=4) should predict class 1 over class 0")
+
+  # 3. Average separation: across all 6 graphs, the predicted prob of
+  # the correct class should average above 0.6.
+  var totalCorrect: double = 0.0
+  for var i: int = 0; i < len(trainGraphs); i++ =>
+    var correctIdx: int = 0
+    if i == 1 || i == 3 || i == 5 =>
+      correctIdx = 1
+    totalCorrect = totalCorrect + postProbs[i][correctIdx]
+  var avgCorrect: double = totalCorrect / len(trainGraphs).toDouble()
+  println($"  avg correct-class probability: {avgCorrect}")
+  assertTrue(avgCorrect > 0.6,
+    "average correct-class probability should exceed 0.6 after training")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

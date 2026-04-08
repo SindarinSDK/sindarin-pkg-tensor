@@ -169,11 +169,22 @@ native fn sn_graph_train_ndata(): int
 # epoch's worth of minibatches with manual data uploads, and returns the
 # average per-batch loss. Caller owns the permutation array (shuffled by
 # the caller per epoch for deterministic-but-shuffled training).
+#
+# Heterogeneous-batching contract:
+# featuresHost     : totalSamples * maxNodesPerGraph * featureDim doubles, zero-padded
+# adjHost          : totalSamples * maxNodesPerGraph * maxNodesPerGraph doubles, zero-padded,
+# with the layer's normalization mode already applied at host build time
+# realNodeCountHost: totalSamples doubles (one per sample, the REAL node count)
+# maxNodesPerGraph : the padding ceiling — max(numNodes) over the training set
+# The recorded forward graph must have been built against a (batchSize * maxNodesPerGraph)-node
+# template. See docs/issues/heterogeneous-graph-batching.md.
 native fn sn_graph_train_epoch(
   loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
   featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  adjHost: double[], realNodeCountHost: double[],
   batchPerm: double[],
-  featuresPerSample: int, labelsPerSample: int, nPerBatch: int,
+  featureDim: int, labelsPerSample: int, nPerBatch: int,
+  maxNodesPerGraph: int,
   optimizer: str,
   lr: double, beta1: double, beta2: double, eps: double, wd: double): double
 

@@ -27,26 +27,34 @@
    Separate from B1; tracked but not yet fixed.
 3. **Steps 2c.4 onwards** — `TrainResult` diagnostics, `predictBatch` /
    `distributionDivergence`, metric callback API, release tagging.
-4. **Heterogeneous-graph batching** (deferred — see
-   `docs/issues/heterogeneous-graph-batching.md`): the static-topology
-   design fundamentally limits `Gnn.train()` to graphs that share
-   `numNodes`/`featureDim` (and `numEdges` for multi-batch). A runtime
-   assertion now catches violations, but extending the package to real
-   variable-shape GNN workloads (molecules, social graphs, RL with
-   variable-arity environments) requires an architectural change.
+4. ~~**Heterogeneous-graph batching**~~ **DONE.** `Gnn.train()` now
+   handles graphs with variable `numNodes` and variable `numEdges`
+   inside a single multi-batch call via pad-to-max + per-batch upload
+   of features, dense adjacency, and pool matrix. The `numNodes` and
+   `numEdges` precondition assertions are gone; the only remaining
+   shape constraint is uniform `featureDim`. See
+   `docs/issues/heterogeneous-graph-batching.md` for the implementation
+   write-up. Regression guard:
+   `tests/test_heterogeneous_graph_batching.sn`.
 
 ## Skynet unblock status
 
-**The skynet crusher domain is functionally unblocked** by the work landed
-so far. Every "graph" in the crusher use case is a single-node graph (one
-state observation = one node), which trips the identity short-circuit in
-`sparse_aggregate` and `mean_pool` and bypasses the multi-node code path
-entirely. `test_crusher_policy.sn` passes 15/15 with the new `Gnn.train()`
-signature.
+**Skynet crusher is fully unblocked.** Earlier revisions of this
+section claimed crusher was "single-node graphs by construction" — that
+was wrong. The crusher pipeline builds graphs on demand from the
+orchestrator's per-cycle observation poll (`pollObservations(...,
+50)`), so persisted graphs span a wide distribution of node counts (3
+to dozens) and edge counts. A live DB sample after 2 minutes of
+runtime showed graphs with `(nodes, edges)` of `(4, 6)`, `(9, 36)`,
+`(3, 3)`, `(8, 28)`, … — squarely in Regime C of the
+heterogeneous-graph-batching doc.
 
-The multi-node convergence bug only matters when a consumer wants to train
-on graphs with non-trivial edge structure. That's a future requirement,
-not a blocker for the immediate skynet unblock.
+Skynet hit the multi-batch precondition assertion the moment its trainer
+started training on real graphs. The pad-to-max + per-batch upload work
+in `Gnn.train()` resolves this. The skynet trainer's old
+`usableSamples` divisibility workaround is gone (`skynet/src/trainer/trainer.sn`).
+`test_crusher_policy.sn` and `test_heterogeneous_graph_batching.sn`
+both pass.
 
 ## Why this document exists
 
