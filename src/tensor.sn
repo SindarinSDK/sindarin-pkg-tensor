@@ -143,6 +143,22 @@ native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWe
 native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attSrc: Tensor, attDst: Tensor): Tensor
 native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
 native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weights: Tensor): Tensor
+
+# PPO-clipped surrogate loss (Schulman et al. 2017) — the long-term fix for
+# the weighted-CE unboundedness documented in docs/issues/ppo-clipped-objective.md.
+#
+# Shapes (same convention as weighted_cross_entropy):
+# logits        : (numClasses, batchRows) — current policy π_θ logits
+# oldLogProbs   : (1,          batchRows) — log π_old(a_i|s_i), DETACHED
+# (caller computes with a
+# pre-train forward pass)
+# actionsOneHot : (numClasses, batchRows) — one-hot mask of chosen actions
+# advantages    : (1,          batchRows) — A_i (already normalized)
+# epsilon       : clip range (typically 0.2)
+# Returns a scalar loss tensor. Works in both direct and record modes; the
+# record-mode path is driven by Gnn.trainPpo() for multi-epoch RL training
+# on the same batch without the weighted-CE divergence pathology.
+native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
 native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
 native fn sn_gpu_available(): bool
@@ -218,6 +234,24 @@ native fn sn_graph_emit_train_metric(name: str, value: double, labels: StringFie
 native fn sn_graph_train_epoch(
   loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
   featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  adjHost: double[], realNodeCountHost: double[],
+  batchPerm: double[],
+  featureDim: int, labelsPerSample: int, nPerBatch: int,
+  maxNodesPerGraph: int,
+  optimizer: str,
+  lr: double, beta1: double, beta2: double, eps: double, wd: double): double
+
+# PPO variant of sn_graph_train_epoch. Adds the detached oldLogProbs
+# tensor + host buffer (one log π_old(a_i|s_i) per sample) on top of the
+# weighted-CE contract. Both share a single C-level implementation in
+# tensor.sn.c (sn_graph_train_epoch_impl); the two native fns are thin
+# wrappers over that shared impl — no duplicated per-batch code path.
+# See docs/issues/ppo-clipped-objective.md for the design note.
+native fn sn_graph_train_epoch_ppo(
+  loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
+  oldLogProbs: Tensor,
+  featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  oldLogProbsHost: double[],
   adjHost: double[], realNodeCountHost: double[],
   batchPerm: double[],
   featureDim: int, labelsPerSample: int, nPerBatch: int,

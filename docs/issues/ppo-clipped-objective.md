@@ -1,6 +1,28 @@
 # PPO-clipped surrogate objective
 
-## Status: PROPOSED — not implemented; tracked as the proper long-term fix
+## Status: IMPLEMENTED
+
+Landed as a full three-phase change:
+
+- **Loss op** — `sn_tensor_ppo_clipped_loss(logits, oldLogProbs, actionsOneHot, advantages, epsilon)` in `src/tensor.sn.c` with both record and direct mode paths. Declared in `src/tensor.sn`.
+- **Training path** — `Gnn.trainPpo(graphs, actions, advantages, optimizer, epochs, batchSize, epsilon, seed)` in `src/gnn.sn`. Computes `oldLogProbs` via a pre-train non-record forward pass, then delegates to the same private `Gnn.trainCore` helper that the weighted-CE `Gnn.train` uses — no duplicated code path. The per-epoch driver `sn_graph_train_epoch_ppo` is a thin wrapper over the existing `sn_graph_train_epoch_impl`; both loss kinds share the host-buffer assembly, block-diagonal adjacency, pool-matrix and attention-mask uploads, and the param read-back loop.
+- **Tests** — `tests/test_ppo_clipped_loss.sn` (direct-mode math), `tests/test_ppo_clipped_loss_recorded.sn` (record-mode graph path), `tests/test_ppo_train.sn` (end-to-end training integration with mixed-sign advantages asserting boundedness, policy movement, and JSD-measurable distribution shift).
+
+### Implementation notes that differ from the original proposal below
+
+1. **Action shape resolution.** The API sketch below says `actions: Tensor (1, batchRows)` holding integer class indices; the implementation sketch then describes a one-hot gather via `ggml_mul + ggml_sum_rows`. In a static recorded graph the C op cannot convert dynamic integer indices into a one-hot at record time — the topology is baked once at `sn_graph_begin`. The implementation accepts `actionsOneHot: Tensor (numClasses, batchRows)` directly. This lets callers reuse their existing supervised labels buffer unchanged when opting into PPO, and matches the doc's own one-hot-gather implementation sketch.
+
+2. **`ggml_scale_bias` instead of input-scalar + `ggml_add1`.** The sketch describes the `log_softmax` eps floor using the same scalar-input pattern as `sn_tensor_weighted_cross_entropy`. The implementation uses `ggml_scale_bias(softmax, 1.0, LOG_SM_EPS)` — which computes `1*softmax + LOG_SM_EPS` — because it needs no extra input tensor in `g_param_ctx`, collapses two ops into one, and has a verified backward (the backward of `GGML_OP_SCALE` reads only the `s` parameter from `op_params[0]`, so the bias drops out of the gradient correctly). The same shortcut is used for the two clip bounds (`ratio − (1+ε)` and `(1−ε) − ratio_hi`).
+
+3. **Scoped to the policy term only, as proposed.** No value-function loss (`L^VF`), no entropy bonus (`S[π_θ]`). Consumers that need a critic head or exploration pressure layer those on top of the loss op themselves.
+
+4. **`Gnn.trainPpo` vs extending `Gnn.train`.** The decision went to a separate method to avoid risking regressions in the well-tested supervised path. Existing `Gnn.train()` is unchanged to the caller; internally it now forwards to `Gnn.trainCore(..., "weighted_ce", {}, 0.0)` and `Gnn.trainPpo` forwards to `Gnn.trainCore(..., "ppo", oldLogProbsHost, epsilon)`. `trainCore` branches in exactly two places — the loss op construction and the `sn_graph_train_epoch_* ` call — and is otherwise identical for both loss kinds.
+
+The rest of this document is the original design note, retained verbatim for historical context.
+
+---
+
+## Status (pre-implementation): PROPOSED — not implemented; tracked as the proper long-term fix
 
 ## TL;DR
 

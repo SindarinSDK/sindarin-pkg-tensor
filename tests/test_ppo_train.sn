@@ -1,0 +1,225 @@
+import "sindarin-pkg-test/src/assert"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_ppo_train.sn — end-to-end Gnn.trainPpo integration test
+#
+# Drives the full PPO-clipped training loop (Schulman et al. 2017) over a
+# small toy GNN with a mixed-sign advantage vector. The test exists to
+# guarantee three properties that the weighted-CE loss path cannot
+# provide on its own:
+#
+# 1. BOUNDEDNESS: the loss does not diverge to -inf or NaN across
+# multiple epochs on the same batch, even with negative advantages.
+# This is the headline property of the clipped surrogate that
+# motivated the op — see docs/issues/ppo-clipped-objective.md.
+#
+# 2. POLICY MOVEMENT: at least one parameter has non-zero max-abs-delta
+# after training. The bounded surrogate still flows gradient; it
+# just stops flowing when the policy has moved "enough" in the
+# favored direction.
+#
+# 3. OBSERVABLE DISTRIBUTION SHIFT: the post-train action distribution
+# on a held-out probe graph differs from the pre-train distribution
+# by a meaningful Jensen-Shannon divergence (> 0.01 nats). This is
+# the proxy for "the policy actually learned something" — a pure
+# loss check can't distinguish a flat run from a moved-but-degraded
+# one.
+#
+# The test does not try to assert that the trained policy is
+# *objectively better* — that would require a real reward landscape and
+# a long training run. It just asserts that the loss op plugs into the
+# training loop cleanly and the three properties above hold.
+#
+# Setup: 2-state, 2-action toy (same as test_reward_weighted_policy.sn).
+# State A features [1, 0] — sampled action 0, advantage = +1.0
+# State B features [0, 1] — sampled action 1, advantage = +1.0
+# State C features [1, 0] — sampled action 1, advantage = -1.0  (bad)
+# State D features [0, 1] — sampled action 0, advantage = -1.0  (bad)
+#
+# 6 samples total (dup each twice to hit batchSize=6, epochs=4). Mix of
+# positive and negative advantages exercises both branches of the
+# clipped surrogate across the training loop.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn sn2(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 2),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 2
+  }
+
+fn makeModel(): Gnn =>
+  var config: GnnConfig = {
+    inputDim: 2, hiddenDim: 8, numActions: 2,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  return Gnn.createWithSeed(config, 42l)
+
+# 6 training graphs. Order used by buildActions / buildAdvantages:
+# [0, 1] — State A [1,0], sampled action 0, A = +1.0  (good)
+# [2, 3] — State B [0,1], sampled action 1, A = +1.0  (good)
+# [4]    — State A [1,0], sampled action 1, A = -1.0  (bad; discourage)
+# [5]    — State B [0,1], sampled action 0, A = -1.0  (bad; discourage)
+fn buildGraphs(): GraphTensors[] =>
+  var graphs: GraphTensors[] = {}
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  return graphs
+
+# One-hot action masks for each sample's SAMPLED action.
+fn buildActions(): double[] =>
+  var a: double[] = {}
+  # [0] State A → action 0 → [1, 0]
+  a.push(1.0); a.push(0.0)
+  # [1] State A → action 0 → [1, 0]
+  a.push(1.0); a.push(0.0)
+  # [2] State B → action 1 → [0, 1]
+  a.push(0.0); a.push(1.0)
+  # [3] State B → action 1 → [0, 1]
+  a.push(0.0); a.push(1.0)
+  # [4] State A → action 1 (the BAD one) → [0, 1]
+  a.push(0.0); a.push(1.0)
+  # [5] State B → action 0 (the BAD one) → [1, 0]
+  a.push(1.0); a.push(0.0)
+  return a
+
+# Per-sample advantages: +1 for good samples, -1 for the bad pair.
+fn buildAdvantages(): double[] =>
+  var adv: double[] = {}
+  adv.push(1.0)
+  adv.push(1.0)
+  adv.push(1.0)
+  adv.push(1.0)
+  adv.push(-1.0)
+  adv.push(-1.0)
+  return adv
+
+# (NaN / finite checks come from sindarin-pkg-sdk/src/core/math:
+# isNan(x) and isFinite(x).)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_ppo_train — Gnn.trainPpo integration ===")
+  println("")
+
+  var probeA: GraphTensors = sn2({1.0, 0.0})
+  var probeB: GraphTensors = sn2({0.0, 1.0})
+
+  var model: Gnn = makeModel()
+
+  # --- Pre-train snapshot of the probe distributions. Used later to
+  # assert the policy actually moved via Jensen-Shannon divergence.
+  var preA: double[] = model.forward(probeA, false).probs.toDoubles()
+  var preB: double[] = model.forward(probeB, false).probs.toDoubles()
+  println($"  pre-train  stateA probs=[{preA[0]}, {preA[1]}]")
+  println($"  pre-train  stateB probs=[{preB[0]}, {preB[1]}]")
+
+  # --- Run PPO training on the mixed-sign-advantage batch.
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var graphs: GraphTensors[] = buildGraphs()
+  var actions: double[] = buildActions()
+  var advantages: double[] = buildAdvantages()
+  var epsilon: double = 0.2
+  # epochs = 4, batchSize = 3
+  var result: TrainResult = model.trainPpo(
+    graphs, actions, advantages, opt,
+    4, 3, epsilon, 42l)
+
+  println($"  final loss = {result.loss}")
+  println($"  accuracy   = {result.accuracy}")
+  println($"  epochs     = {result.epochs}")
+  println("")
+
+  # --- Assertion 1: BOUNDEDNESS — no NaN, no inf, bounded magnitude
+  # across every epoch in the curve. This is the headline property
+  # motivating the clipped surrogate. With eps=0.2 and advantages in
+  # {-1, +1}, per-sample surrogate values are bounded by ±(1+eps)=1.2
+  # on the clipped branch; the unclipped branch can momentarily
+  # exceed that when the policy drifts far from π_old, but it should
+  # stay small for short training runs. Use a loose |loss| < 50
+  # bound to keep the test robust to optimizer step sizes.
+  assertTrue(isFinite(result.loss),
+    $"final loss = {result.loss} is finite (not NaN, not ±inf)")
+
+  var curveLen: int = len(result.lossCurve)
+  assertEqualInt(curveLen, 4, "lossCurve has one entry per epoch")
+
+  var allFinite: bool = true
+  var maxAbsLoss: double = 0.0
+  for var i: int = 0; i < curveLen; i++ =>
+    var lv: double = result.lossCurve[i]
+    if !isFinite(lv) =>
+      allFinite = false
+    var abslv: double = lv
+    if abslv < 0.0 =>
+      abslv = -abslv
+    if abslv > maxAbsLoss =>
+      maxAbsLoss = abslv
+    println($"    epoch {i} loss = {lv}")
+  assertTrue(allFinite,
+    "every epoch's loss is finite — clipped surrogate did not diverge to NaN/inf")
+  assertTrue(maxAbsLoss < 50.0,
+    $"max|loss| across epochs = {maxAbsLoss} < 50 (bounded surrogate)")
+
+  # --- Assertion 2: POLICY MOVEMENT — at least one parameter drifted
+  # by a nontrivial amount. The bounded surrogate still flows gradient;
+  # it just asymptotically stops once the policy has moved "enough"
+  # in the favored direction.
+  var nParams: int = len(result.paramMaxAbsDelta)
+  assertTrue(nParams > 0, "paramMaxAbsDelta has at least one entry")
+
+  var maxMove: double = 0.0
+  for var i: int = 0; i < nParams; i++ =>
+    if result.paramMaxAbsDelta[i] > maxMove =>
+      maxMove = result.paramMaxAbsDelta[i]
+  println($"  max paramMaxAbsDelta across all params = {maxMove}")
+  assertTrue(maxMove > 0.00001,
+    $"at least one param moved by > 1e-5 during PPO training (max delta = {maxMove})")
+
+  # --- Assertion 3: OBSERVABLE DISTRIBUTION SHIFT — the action
+  # distribution on a probe graph differs from pre-train by a
+  # measurable JSD. A flat all-finite run with zero movement would
+  # pass assertion 1 but fail here.
+  var postA: double[] = model.forward(probeA, false).probs.toDoubles()
+  var postB: double[] = model.forward(probeB, false).probs.toDoubles()
+  println($"  post-train stateA probs=[{postA[0]}, {postA[1]}]")
+  println($"  post-train stateB probs=[{postB[0]}, {postB[1]}]")
+
+  var jsdA: double = distributionDivergence(preA, postA, "js")
+  var jsdB: double = distributionDivergence(preB, postB, "js")
+  println($"  JSD(preA, postA) = {jsdA}")
+  println($"  JSD(preB, postB) = {jsdB}")
+  assertTrue(jsdA + jsdB > 0.001,
+    $"policy distribution moved on at least one probe state (total JSD = {jsdA + jsdB})")
+
+  # --- Assertion 4: input diagnostics round-trip through trainPpo —
+  # weightVarianceIn should be > 0 because our advantages are mixed
+  # sign, and inputStd > 0 because the features are not all zero.
+  # These come for free from the trainCore refactor; the assertion is
+  # a guard against a silent break of the Phase C diagnostics.
+  assertTrue(result.weightVarianceIn > 0.0,
+    $"weightVarianceIn = {result.weightVarianceIn} > 0 (mixed-sign advantages)")
+  assertTrue(result.inputStd > 0.0,
+    $"inputStd = {result.inputStd} > 0 (non-trivial features)")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

@@ -223,6 +223,12 @@ static struct ggml_tensor   *g_opt_loss_tensor      = NULL;
 static struct ggml_tensor   *g_opt_features_tensor  = NULL;
 static struct ggml_tensor   *g_opt_labels_tensor    = NULL;
 static struct ggml_tensor   *g_opt_weights_tensor   = NULL;
+/* PPO-only: the 5th per-batch input tensor holding
+ * log π_old(a_i|s_i), one scalar per sample. NULL in weighted-CE mode;
+ * set on the first call to sn_graph_train_epoch_ppo within a
+ * begin/end cycle. See sn_tensor_ppo_clipped_loss in this file and
+ * docs/issues/ppo-clipped-objective.md. */
+static struct ggml_tensor   *g_opt_old_log_probs_tensor = NULL;
 
 /* Per-batch upload registry — tensors whose VALUES change per minibatch.
  *
@@ -281,13 +287,14 @@ void sn_graph_begin(void) {
     g_record_mode = true;
 
     /* Reset epoch-loop training state — fresh per begin/end cycle */
-    g_opt_ctx              = NULL;
-    g_opt_sched            = NULL;
-    g_opt_param_buf        = NULL;
-    g_opt_loss_tensor      = NULL;
-    g_opt_features_tensor  = NULL;
-    g_opt_labels_tensor    = NULL;
-    g_opt_weights_tensor   = NULL;
+    g_opt_ctx                  = NULL;
+    g_opt_sched                = NULL;
+    g_opt_param_buf            = NULL;
+    g_opt_loss_tensor          = NULL;
+    g_opt_features_tensor      = NULL;
+    g_opt_labels_tensor        = NULL;
+    g_opt_weights_tensor       = NULL;
+    g_opt_old_log_probs_tensor = NULL;
 
     /* Reset per-batch upload registry — tensors get re-registered as the
      * record-mode forward pass walks the layers. */
@@ -299,10 +306,11 @@ void sn_graph_end(void) {
     if (g_opt_ctx)       { ggml_opt_free(g_opt_ctx);                  g_opt_ctx       = NULL; }
     if (g_opt_sched)     { ggml_backend_sched_free(g_opt_sched);      g_opt_sched     = NULL; }
     if (g_opt_param_buf) { ggml_backend_buffer_free(g_opt_param_buf); g_opt_param_buf = NULL; }
-    g_opt_loss_tensor     = NULL;
-    g_opt_features_tensor = NULL;
-    g_opt_labels_tensor   = NULL;
-    g_opt_weights_tensor  = NULL;
+    g_opt_loss_tensor          = NULL;
+    g_opt_features_tensor      = NULL;
+    g_opt_labels_tensor        = NULL;
+    g_opt_weights_tensor       = NULL;
+    g_opt_old_log_probs_tensor = NULL;
 
     if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
     if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }
@@ -475,32 +483,50 @@ void sn_graph_emit_train_metric(char *name, double value, SnArray *labels)
 }
 
 /* ======================================================================
- * Per-epoch training driver
+ * Per-epoch training driver — shared implementation.
  *
- * The training entry point used by Gnn.train(). Key design points:
+ * The training entry point used by Gnn.train() (via sn_graph_train_epoch)
+ * AND by Gnn.trainPpo() (via sn_graph_train_epoch_ppo). Key design points:
  *
  *   - Uses ggml_opt with loss_type=GGML_OPT_LOSS_TYPE_SUM and a
  *     pre-built loss tensor as `outputs`. ggml_sum of a scalar is
  *     identity, so the entire loss expression flows through unchanged
  *     and backward propagates correctly.
  *   - Drives the per-batch loop manually via ggml_opt_alloc/eval, with
- *     three input uploads per batch (features, labels, weights).
+ *     three OR four input uploads per batch:
+ *         weighted CE: features, labels, weights
+ *         PPO:         features, labels (= actionsOneHot), weights (= advantages),
+ *                      oldLogProbs
  *   - Lazy-initializes the opt context on the first call within a
  *     sn_graph_begin/end cycle and reuses it across epochs. The state
  *     is freed in sn_graph_end.
+ *
+ * The PPO variant adds ONE extra per-batch host buffer (log π_old(a_i|s_i),
+ * one scalar per sample) and ONE extra ggml input tensor upload. Everything
+ * else — host buffer assembly, padded feature copy, block-diagonal adj,
+ * pool matrix, attention mask, param readback — is identical between the
+ * two loss kinds and lives here, shared.
+ *
+ * `old_log_probs_rt` and `old_log_probs_host` are both NULL for the
+ * weighted-CE path and both non-NULL for the PPO path. The two must match
+ * (either both NULL or both non-NULL); mixing is undefined. A caller that
+ * switches loss kinds mid-begin/end cycle will trip the tensor-identity
+ * sanity check below.
  *
  * Caller is responsible for shuffling: pass a permutation of sample
  * indices in `batch_perm` (one entry per training sample). Per-epoch
  * shuffling means re-shuffling the permutation between calls.
  * ====================================================================== */
-double sn_graph_train_epoch(
+static double sn_graph_train_epoch_impl(
     RtTensor *loss_rt,
     RtTensor *features_rt,
     RtTensor *labels_rt,
     RtTensor *weights_rt,
+    RtTensor *old_log_probs_rt,     /* PPO only; NULL for weighted CE */
     SnArray  *features_host,         /* total_samples * max_nodes * feature_dim doubles, zero-padded */
     SnArray  *labels_host,           /* total_samples * labels_per_sample doubles */
     SnArray  *weights_host,          /* total_samples doubles, one weight per sample */
+    SnArray  *old_log_probs_host,    /* total_samples doubles, one per sample; PPO only; NULL for weighted CE */
     SnArray  *adj_host,              /* total_samples * max_nodes * max_nodes doubles, zero-padded */
     SnArray  *real_node_count_host,  /* total_samples doubles (per-sample real node count) */
     SnArray  *batch_perm,            /* total_samples doubles (integer-valued permutation) */
@@ -522,6 +548,13 @@ double sn_graph_train_epoch(
     struct ggml_tensor *labels   = rec_tensor(labels_rt);
     struct ggml_tensor *weights  = rec_tensor(weights_rt);
     if (!loss || !features || !labels || !weights) return -1.0;
+
+    /* PPO: resolve the optional 5th input tensor. */
+    struct ggml_tensor *old_log_probs = NULL;
+    if (old_log_probs_rt) {
+        old_log_probs = rec_tensor(old_log_probs_rt);
+        if (!old_log_probs) return -1.0;
+    }
 
     /* Batched padded sizes — every batch lives in a tensor of these dims. */
     const long long nodes_per_batch    = n_per_batch * max_nodes_per_graph;
@@ -575,20 +608,24 @@ double sn_graph_train_epoch(
         opt_params_s.get_opt_pars_ud = NULL;
         opt_params_s.optimizer       = opt_type;
 
-        g_opt_ctx              = ggml_opt_init(opt_params_s);
+        g_opt_ctx                  = ggml_opt_init(opt_params_s);
         /* Use ggml_opt_loss() — the loss tensor that ggml_opt_build creates
          * in ctx_static (with a real buffer). The original `loss` we built
          * lives in g_compute_ctx (no_alloc) and has no buffer to read from. */
-        g_opt_loss_tensor      = ggml_opt_loss(g_opt_ctx);
-        g_opt_features_tensor  = features;
-        g_opt_labels_tensor    = labels;
-        g_opt_weights_tensor   = weights;
+        g_opt_loss_tensor          = ggml_opt_loss(g_opt_ctx);
+        g_opt_features_tensor      = features;
+        g_opt_labels_tensor        = labels;
+        g_opt_weights_tensor       = weights;
+        g_opt_old_log_probs_tensor = old_log_probs; /* NULL in weighted-CE mode */
     }
 
-    /* Sanity check: caller must use the same tensors as the init call */
+    /* Sanity check: caller must use the same tensors as the init call.
+     * Includes the optional PPO slot — switching loss kinds mid-cycle
+     * (weighted CE → PPO or vice versa) is not supported and trips here. */
     if (features != g_opt_features_tensor ||
         labels   != g_opt_labels_tensor   ||
-        weights  != g_opt_weights_tensor) {
+        weights  != g_opt_weights_tensor  ||
+        old_log_probs != g_opt_old_log_probs_tensor) {
         return -1.0;
     }
 
@@ -604,18 +641,21 @@ double sn_graph_train_epoch(
      *  labels_buf   : n_per_batch * labels_per_sample floats
      *  weights_buf  : n_per_batch floats
      */
-    size_t features_bytes = (size_t)features_per_batch * sizeof(float);
-    size_t adj_bytes      = (size_t)nodes_per_batch * (size_t)nodes_per_batch * sizeof(float);
-    size_t pool_bytes     = (size_t)n_per_batch * (size_t)nodes_per_batch * sizeof(float);
-    size_t labels_bytes   = ggml_nbytes(labels);
-    size_t weights_bytes  = ggml_nbytes(weights);
+    size_t features_bytes      = (size_t)features_per_batch * sizeof(float);
+    size_t adj_bytes           = (size_t)nodes_per_batch * (size_t)nodes_per_batch * sizeof(float);
+    size_t pool_bytes          = (size_t)n_per_batch * (size_t)nodes_per_batch * sizeof(float);
+    size_t labels_bytes        = ggml_nbytes(labels);
+    size_t weights_bytes       = ggml_nbytes(weights);
+    /* PPO: old_log_probs is (1, n_per_batch); one scalar per sample. */
+    size_t old_log_probs_bytes = old_log_probs ? ggml_nbytes(old_log_probs) : 0;
 
-    float *features_buf = (float *)calloc((size_t)features_per_batch, sizeof(float));
-    float *adj_buf      = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
-    float *att_mask_buf = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
-    float *pool_buf     = (float *)calloc((size_t)n_per_batch * (size_t)nodes_per_batch, sizeof(float));
-    float *labels_buf   = (float *)malloc(labels_bytes);
-    float *weights_buf  = (float *)malloc(weights_bytes);
+    float *features_buf      = (float *)calloc((size_t)features_per_batch, sizeof(float));
+    float *adj_buf           = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
+    float *att_mask_buf      = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
+    float *pool_buf          = (float *)calloc((size_t)n_per_batch * (size_t)nodes_per_batch, sizeof(float));
+    float *labels_buf        = (float *)malloc(labels_bytes);
+    float *weights_buf       = (float *)malloc(weights_bytes);
+    float *old_log_probs_buf = old_log_probs ? (float *)malloc(old_log_probs_bytes) : NULL;
 
     /* Sanity-check the recorded tensors actually have the expected padded shape.
      * If they don't, the caller built the template with the wrong dimensions
@@ -628,6 +668,8 @@ double sn_graph_train_epoch(
                 feature_dim, nodes_per_batch);
         free(features_buf); free(adj_buf); free(pool_buf);
         free(labels_buf); free(weights_buf);
+        free(att_mask_buf);
+        if (old_log_probs_buf) free(old_log_probs_buf);
         return -1.0;
     }
 
@@ -696,6 +738,12 @@ double sn_graph_train_epoch(
             /* --- One weight per sample */
             double *w = (double *)sn_array_get(weights_host, sample_idx);
             weights_buf[i] = (float)(*w);
+
+            /* --- PPO: one oldLogProb per sample */
+            if (old_log_probs_buf) {
+                double *olp = (double *)sn_array_get(old_log_probs_host, sample_idx);
+                old_log_probs_buf[i] = (float)(*olp);
+            }
         }
 
         /* Derive the Phase L attention additive mask from adj_buf:
@@ -723,6 +771,12 @@ double sn_graph_train_epoch(
         ggml_backend_tensor_set(g_opt_features_tensor, features_buf, 0, features_bytes);
         ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
         ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
+
+        /* PPO: upload the oldLogProbs slice for this batch. */
+        if (g_opt_old_log_probs_tensor && old_log_probs_buf) {
+            ggml_backend_tensor_set(g_opt_old_log_probs_tensor,
+                                    old_log_probs_buf, 0, old_log_probs_bytes);
+        }
 
         /* Upload the batched adjacency / pool matrix / attention mask
          * to every tensor in the per-batch registry. Within a single
@@ -767,6 +821,7 @@ double sn_graph_train_epoch(
     free(pool_buf);
     free(labels_buf);
     free(weights_buf);
+    if (old_log_probs_buf) free(old_log_probs_buf);
 
     /* Read back updated PARAM data into the pool slots so subsequent
      * inference (forward() outside record mode) sees the trained values. */
@@ -783,6 +838,81 @@ double sn_graph_train_epoch(
     }
 
     return total_loss / (double)n_batches;
+}
+
+/* Weighted-CE training driver — thin wrapper over the shared impl. */
+double sn_graph_train_epoch(
+    RtTensor *loss_rt,
+    RtTensor *features_rt,
+    RtTensor *labels_rt,
+    RtTensor *weights_rt,
+    SnArray  *features_host,
+    SnArray  *labels_host,
+    SnArray  *weights_host,
+    SnArray  *adj_host,
+    SnArray  *real_node_count_host,
+    SnArray  *batch_perm,
+    long long feature_dim,
+    long long labels_per_sample,
+    long long n_per_batch,
+    long long max_nodes_per_graph,
+    char     *optimizer_str,
+    double    lr,
+    double    beta1,
+    double    beta2,
+    double    eps,
+    double    wd)
+{
+    return sn_graph_train_epoch_impl(
+        loss_rt, features_rt, labels_rt, weights_rt,
+        /*old_log_probs_rt=*/ NULL,
+        features_host, labels_host, weights_host,
+        /*old_log_probs_host=*/ NULL,
+        adj_host, real_node_count_host, batch_perm,
+        feature_dim, labels_per_sample, n_per_batch, max_nodes_per_graph,
+        optimizer_str, lr, beta1, beta2, eps, wd);
+}
+
+/* PPO training driver — thin wrapper over the shared impl.
+ *
+ * Adds one extra per-batch host buffer (log π_old(a_i|s_i)) on top of the
+ * weighted-CE contract. The caller (Gnn.trainPpo) assembles the host buffer
+ * via a pre-train non-record forward pass on every sample. `labels_rt` holds
+ * the one-hot action mask (same shape as supervised labels), `weights_rt`
+ * holds the per-sample advantage A_i, and `old_log_probs_rt` holds log π_old.
+ * The loss tensor is expected to be the output of
+ * sn_tensor_ppo_clipped_loss(logits, oldLogProbs, actionsOneHot, advantages).
+ */
+double sn_graph_train_epoch_ppo(
+    RtTensor *loss_rt,
+    RtTensor *features_rt,
+    RtTensor *labels_rt,
+    RtTensor *weights_rt,
+    RtTensor *old_log_probs_rt,
+    SnArray  *features_host,
+    SnArray  *labels_host,
+    SnArray  *weights_host,
+    SnArray  *old_log_probs_host,
+    SnArray  *adj_host,
+    SnArray  *real_node_count_host,
+    SnArray  *batch_perm,
+    long long feature_dim,
+    long long labels_per_sample,
+    long long n_per_batch,
+    long long max_nodes_per_graph,
+    char     *optimizer_str,
+    double    lr,
+    double    beta1,
+    double    beta2,
+    double    eps,
+    double    wd)
+{
+    return sn_graph_train_epoch_impl(
+        loss_rt, features_rt, labels_rt, weights_rt, old_log_probs_rt,
+        features_host, labels_host, weights_host, old_log_probs_host,
+        adj_host, real_node_count_host, batch_perm,
+        feature_dim, labels_per_sample, n_per_batch, max_nodes_per_graph,
+        optimizer_str, lr, beta1, beta2, eps, wd);
 }
 
 /* ======================================================================
@@ -1796,6 +1926,200 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
     struct ggml_tensor *weighted   = ggml_mul(ctx, per_sample, tw);
     struct ggml_tensor *summed     = ggml_sum(ctx, weighted);
     struct ggml_tensor *loss       = ggml_scale(ctx, summed, inv_n);
+    ggml_set_output(loss);
+
+    struct ggml_cgraph *graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, loss);
+    ggml_gallocr_t ga = run_graph(ctx, graph);
+
+    int idx = pool_alloc(1, 1, 1);
+    ggml_backend_tensor_get(loss, g_pool[idx].data, 0, sizeof(float));
+
+    ggml_gallocr_free(ga);
+    ggml_free(ctx);
+    return wrap_pool(idx);
+}
+
+/* ===========================================================================
+ * PPO-clipped surrogate loss (Schulman et al. 2017, arXiv:1707.06347)
+ *
+ *   logits        : (numClasses, batchRows) — current policy π_θ logits
+ *   oldLogProbs   : (1,          batchRows) — log π_old(a_i|s_i), DETACHED
+ *                                              from the recorded graph; the
+ *                                              caller must have computed these
+ *                                              with a pre-train forward pass.
+ *   actionsOneHot : (numClasses, batchRows) — one-hot mask of chosen actions
+ *   advantages    : (1,          batchRows) — A_i (already normalized by caller)
+ *   epsilon       : clip range (Schulman default ≈ 0.2)
+ *
+ * Returns a scalar loss tensor (1,1), suitable either as the `outputs` of a
+ * recorded training graph or as a one-shot direct-mode eval target.
+ *
+ * Math (both record and direct paths build the same expression):
+ *
+ *   log_pi       = log(softmax(logits) + LOG_SM_EPS)     # bounded log_softmax
+ *   log_pi_a     = sum_classes(log_pi * actionsOneHot)   # one-hot gather
+ *   ratio        = exp(log_pi_a - oldLogProbs)
+ *   surrogate1   = ratio * advantages
+ *   ratio_clip   = clamp(ratio, 1-eps, 1+eps)            # via two relu hinges
+ *   surrogate2   = ratio_clip * advantages
+ *   per_sample   = min(surrogate1, surrogate2)           # via 0.5*(a+b-|a-b|)
+ *   loss         = -1/N * sum(per_sample)
+ *
+ * Design choices forced by the ggml fork:
+ *
+ * - The eps floor on log_softmax is fused into a single ggml_scale_bias
+ *   (`1*softmax + LOG_SM_EPS`) instead of the input-scalar + ggml_add1
+ *   pattern that sn_tensor_weighted_cross_entropy uses. No new input
+ *   tensor is needed in g_param_ctx. Both formulations are mathematically
+ *   equivalent; scale_bias keeps the param context small and the
+ *   expression flat. The backward of GGML_OP_SCALE reads only the `s`
+ *   parameter and ignores `b`, so the constant bias drops out of the
+ *   gradient correctly (d/da (s*a + b) = s).
+ *
+ * - The clamp is built from two ggml_relu hinges instead of ggml_clamp
+ *   because GGML_OP_CLAMP has no backward case in the fork (forward only
+ *   at ggml.c GGML_OP_CLAMP). The two-hinge equivalence
+ *     clamp(x, lo, hi) = x - relu(x - hi) + relu(lo - (x - relu(x - hi)))
+ *   routes through GGML_UNARY_OP_RELU (backward via ggml_step),
+ *   GGML_OP_SCALE (backward at ggml.c:6563), and GGML_OP_SUB/ADD —
+ *   every node has a working backward.
+ *
+ * - The elementwise min is built from ggml_abs because the fork has no
+ *   elementwise ggml_min/ggml_max. The identity
+ *     min(a, b) = 0.5 * (a + b - |a - b|)
+ *   is smooth except at a == b, where ggml_abs's backward uses
+ *   GGML_UNARY_OP_SGN with sgn(0)=0 — that gives a clean zero
+ *   subgradient at the crease, no smoothing required.
+ *
+ * - `actions` is accepted as a (numClasses, batchRows) one-hot mask rather
+ *   than a (1, batchRows) integer-index tensor as the doc's prose API
+ *   first suggests. In a static recorded graph the C op cannot convert
+ *   dynamic integer indices into a one-hot at record time — the topology
+ *   is baked once at sn_graph_begin. Accepting the one-hot directly lets
+ *   callers reuse their existing labels buffer and matches the doc's own
+ *   implementation sketch ("build a one-hot mask of the actions and
+ *   compute sum_over_classes(log_pi * one_hot_actions)"). See
+ *   docs/issues/ppo-clipped-objective.md for the full rationale.
+ *
+ * Why this op exists at all — and why it's SEPARATE from
+ * sn_tensor_weighted_cross_entropy rather than replacing it: the weighted
+ * CE loss is unbounded below when per-sample weights can be negative (the
+ * REINFORCE-with-advantages regime), and even with the eps-floor safety net
+ * it converges to a clamp-boundary local minimum rather than a true
+ * policy-gradient update. The PPO clipped surrogate is bounded below by
+ * construction (the `min` kills the unclipped branch once the policy has
+ * moved enough in the favored direction), so multi-epoch training on the
+ * same batch is mathematically sound. See
+ * docs/issues/ppo-clipped-objective.md § "Why the current setup is wrong".
+ * =========================================================================== */
+
+RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
+                                     RtTensor *old_log_probs_rt,
+                                     RtTensor *actions_one_hot_rt,
+                                     RtTensor *advantages_rt,
+                                     double    epsilon)
+{
+    TPool *pl   = unwrap(logits_rt);
+    TPool *polp = unwrap(old_log_probs_rt);
+    TPool *poh  = unwrap(actions_one_hot_rt);
+    TPool *padv = unwrap(advantages_rt);
+
+    int64_t numClasses = pl->ne[0];
+    int64_t batchRows  = pl->ne[1];
+    const float inv_neg_n = -1.0f / (float)(batchRows > 0 ? batchRows : 1);
+    const float eps_hi = 1.0f + (float)epsilon;
+    const float eps_lo = 1.0f - (float)epsilon;
+
+    if (g_record_mode) {
+        struct ggml_context *ctx = g_record_ctx;
+        struct ggml_tensor *gl   = rec_tensor(logits_rt);
+        struct ggml_tensor *golp = rec_tensor(old_log_probs_rt);
+        struct ggml_tensor *goh  = rec_tensor(actions_one_hot_rt);
+        struct ggml_tensor *gadv = rec_tensor(advantages_rt);
+
+        /* bounded log_softmax: log(softmax + LOG_SM_EPS) */
+        struct ggml_tensor *softmax      = ggml_soft_max(ctx, gl);
+        struct ggml_tensor *softmax_safe = ggml_scale_bias(ctx, softmax, 1.0f, LOG_SM_EPS);
+        struct ggml_tensor *log_pi       = ggml_log(ctx, softmax_safe);
+
+        /* log π(a_i|s_i) via one-hot gather: (1, batchRows) */
+        struct ggml_tensor *masked       = ggml_mul(ctx, log_pi, goh);
+        struct ggml_tensor *log_pi_a     = ggml_sum_rows(ctx, masked);
+
+        /* ratio = exp(log π(a) - log π_old(a)) */
+        struct ggml_tensor *log_ratio    = ggml_sub(ctx, log_pi_a, golp);
+        struct ggml_tensor *ratio        = ggml_exp(ctx, log_ratio);
+
+        /* surrogate1 = ratio * advantages */
+        struct ggml_tensor *surrogate1   = ggml_mul(ctx, ratio, gadv);
+
+        /* ratio_clip = clamp(ratio, 1-eps, 1+eps) via two relu hinges */
+        struct ggml_tensor *r_minus_hi   = ggml_scale_bias(ctx, ratio,    1.0f, -eps_hi);
+        struct ggml_tensor *over_hi      = ggml_relu(ctx, r_minus_hi);
+        struct ggml_tensor *ratio_hi     = ggml_sub(ctx, ratio, over_hi);
+        struct ggml_tensor *lo_minus_r   = ggml_scale_bias(ctx, ratio_hi, -1.0f, eps_lo);
+        struct ggml_tensor *under_lo     = ggml_relu(ctx, lo_minus_r);
+        struct ggml_tensor *ratio_clip   = ggml_add(ctx, ratio_hi, under_lo);
+
+        /* surrogate2 = ratio_clip * advantages */
+        struct ggml_tensor *surrogate2   = ggml_mul(ctx, ratio_clip, gadv);
+
+        /* per_sample = min(surrogate1, surrogate2) = 0.5 * (a + b - |a - b|) */
+        struct ggml_tensor *sum_s        = ggml_add(ctx, surrogate1, surrogate2);
+        struct ggml_tensor *diff_s       = ggml_sub(ctx, surrogate1, surrogate2);
+        struct ggml_tensor *abs_diff     = ggml_abs(ctx, diff_s);
+        struct ggml_tensor *min_two_x    = ggml_sub(ctx, sum_s, abs_diff);
+        struct ggml_tensor *per_sample   = ggml_scale(ctx, min_two_x, 0.5f);
+
+        struct ggml_tensor *summed       = ggml_sum(ctx, per_sample);
+        struct ggml_tensor *loss         = ggml_scale(ctx, summed, inv_neg_n);
+        ggml_set_name(loss, "ppo_clipped_loss");
+        return rec_wrap(loss, 1, 1);
+    }
+
+    /* Direct mode: one-shot eval for test_ppo_clipped_loss.sn */
+    struct ggml_context *ctx = micro_ctx_init();
+
+    struct ggml_tensor *tl   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numClasses, batchRows);
+    struct ggml_tensor *tolp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,          batchRows);
+    struct ggml_tensor *toh  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numClasses, batchRows);
+    struct ggml_tensor *tadv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1,          batchRows);
+    ggml_set_input(tl);
+    ggml_set_input(tolp);
+    ggml_set_input(toh);
+    ggml_set_input(tadv);
+    track_input(tl,   pl->data);
+    track_input(tolp, polp->data);
+    track_input(toh,  poh->data);
+    track_input(tadv, padv->data);
+
+    struct ggml_tensor *softmax      = ggml_soft_max(ctx, tl);
+    struct ggml_tensor *softmax_safe = ggml_scale_bias(ctx, softmax, 1.0f, LOG_SM_EPS);
+    struct ggml_tensor *log_pi       = ggml_log(ctx, softmax_safe);
+    struct ggml_tensor *masked       = ggml_mul(ctx, log_pi, toh);
+    struct ggml_tensor *log_pi_a     = ggml_sum_rows(ctx, masked);
+    struct ggml_tensor *log_ratio    = ggml_sub(ctx, log_pi_a, tolp);
+    struct ggml_tensor *ratio        = ggml_exp(ctx, log_ratio);
+    struct ggml_tensor *surrogate1   = ggml_mul(ctx, ratio, tadv);
+
+    struct ggml_tensor *r_minus_hi   = ggml_scale_bias(ctx, ratio,    1.0f, -eps_hi);
+    struct ggml_tensor *over_hi      = ggml_relu(ctx, r_minus_hi);
+    struct ggml_tensor *ratio_hi     = ggml_sub(ctx, ratio, over_hi);
+    struct ggml_tensor *lo_minus_r   = ggml_scale_bias(ctx, ratio_hi, -1.0f, eps_lo);
+    struct ggml_tensor *under_lo     = ggml_relu(ctx, lo_minus_r);
+    struct ggml_tensor *ratio_clip   = ggml_add(ctx, ratio_hi, under_lo);
+
+    struct ggml_tensor *surrogate2   = ggml_mul(ctx, ratio_clip, tadv);
+
+    struct ggml_tensor *sum_s        = ggml_add(ctx, surrogate1, surrogate2);
+    struct ggml_tensor *diff_s       = ggml_sub(ctx, surrogate1, surrogate2);
+    struct ggml_tensor *abs_diff     = ggml_abs(ctx, diff_s);
+    struct ggml_tensor *min_two_x    = ggml_sub(ctx, sum_s, abs_diff);
+    struct ggml_tensor *per_sample   = ggml_scale(ctx, min_two_x, 0.5f);
+
+    struct ggml_tensor *summed       = ggml_sum(ctx, per_sample);
+    struct ggml_tensor *loss         = ggml_scale(ctx, summed, inv_neg_n);
     ggml_set_output(loss);
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);

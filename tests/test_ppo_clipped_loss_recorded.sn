@@ -1,0 +1,156 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+
+# ===========================================================================
+# test_ppo_clipped_loss_recorded.sn — record-mode unit test for
+# sn_tensor_ppo_clipped_loss
+#
+# test_ppo_clipped_loss.sn covers the direct-mode branch of the op in
+# isolation. This test exercises the **record-mode** branch before it
+# ships inside a full training loop (via Gnn.trainPpo). If the
+# record-mode graph-build has a bug — wrong tensor shape, broken
+# ggml_set_output, missing ancestor in the forward graph — it surfaces
+# here instead of being buried in a training-divergence failure.
+#
+# Strategy: identical cases to test_ppo_clipped_loss.sn, but wrapped in
+# sn_graph_begin / sn_graph_compute_loss / sn_graph_end so the loss op
+# follows the record-mode code path.
+#
+# Reference values (identical to the direct-mode test — see that file
+# for the hand derivations):
+# case 1 (ratio=1,         A=+1):  -1.0
+# case 2 (ratio≈2.394,     A=+1):  -1.2   (upper clip bounded)
+# case 3 (ratio≈0.324,     A=-1):  +0.8   (lower clip bounded)
+# case 4 (ratio≈6.508,     A=-1):  +6.508 (unclipped recovery)
+# case 5 (mixed 2-sample batch ): -0.1
+# ===========================================================================
+
+# Matches the same constant used in test_ppo_clipped_loss.sn.
+fn currentLogPiClass0(): double =>
+  return - 0.12692801
+
+# ---------------------------------------------------------------------------
+# Case 1 — recorded mode: ratio = 1, A > 0
+# ---------------------------------------------------------------------------
+fn case1(): void =>
+  print("case 1 (recorded): ratio=1 exactly (A>0, no clip)\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data({2.0, 0.0}, 1, 2)
+  var oldLogProbs: Tensor = sn_graph_input_data({currentLogPiClass0()}, 1, 1)
+  var actionsOneHot: Tensor = sn_graph_input_data({1.0, 0.0}, 1, 2)
+  var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
+
+  var loss: Tensor = sn_tensor_ppo_clipped_loss(
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, -1.0, 0.001,
+    "case1 recorded PPO loss matches direct-mode reference")
+
+# ---------------------------------------------------------------------------
+# Case 2 — recorded mode: upper clip wins (A>0)
+# ---------------------------------------------------------------------------
+fn case2(): void =>
+  print("case 2 (recorded): r > 1+eps, A>0 (upper clip bounded)\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data({2.0, 0.0}, 1, 2)
+  var oldLogProbs: Tensor = sn_graph_input_data({-1.0}, 1, 1)
+  var actionsOneHot: Tensor = sn_graph_input_data({1.0, 0.0}, 1, 2)
+  var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
+
+  var loss: Tensor = sn_tensor_ppo_clipped_loss(
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, -1.2, 0.001,
+    "case2 recorded PPO loss bounded at -1.2")
+
+# ---------------------------------------------------------------------------
+# Case 3 — recorded mode: lower clip wins (A<0)
+# ---------------------------------------------------------------------------
+fn case3(): void =>
+  print("case 3 (recorded): r < 1-eps, A<0 (lower clip bounded)\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data({2.0, 0.0}, 1, 2)
+  var oldLogProbs: Tensor = sn_graph_input_data({1.0}, 1, 1)
+  var actionsOneHot: Tensor = sn_graph_input_data({1.0, 0.0}, 1, 2)
+  var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
+
+  var loss: Tensor = sn_tensor_ppo_clipped_loss(
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 0.8, 0.001,
+    "case3 recorded PPO loss bounded at +0.8")
+
+# ---------------------------------------------------------------------------
+# Case 4 — recorded mode: unclipped recovery (A<0, large r)
+# ---------------------------------------------------------------------------
+fn case4(): void =>
+  print("case 4 (recorded): r > 1+eps, A<0 (unclipped recovery)\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data({2.0, 0.0}, 1, 2)
+  var oldLogProbs: Tensor = sn_graph_input_data({-2.0}, 1, 1)
+  var actionsOneHot: Tensor = sn_graph_input_data({1.0, 0.0}, 1, 2)
+  var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
+
+  var loss: Tensor = sn_tensor_ppo_clipped_loss(
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, 6.50843, 0.005,
+    "case4 recorded PPO loss ≈ +6.508 (unclipped wins)")
+
+# ---------------------------------------------------------------------------
+# Case 5 — recorded mode: 2-sample mixed batch
+# ---------------------------------------------------------------------------
+fn case5(): void =>
+  print("case 5 (recorded): mixed 2-sample batch\n")
+  sn_graph_begin()
+
+  var logits: Tensor = sn_graph_input_data(
+    {2.0, 0.0, 2.0, 0.0}, 2, 2)
+  var oldLogProbs: Tensor = sn_graph_input_data(
+    {currentLogPiClass0(), 1.0}, 2, 1)
+  var actionsOneHot: Tensor = sn_graph_input_data(
+    {1.0, 0.0, 1.0, 0.0}, 2, 2)
+  var advantages: Tensor = sn_graph_input_data({1.0, -1.0}, 2, 1)
+
+  var loss: Tensor = sn_tensor_ppo_clipped_loss(
+    logits, oldLogProbs, actionsOneHot, advantages, 0.2)
+  var lossValue: double = sn_graph_compute_loss(loss)
+
+  sn_graph_end()
+
+  assertApproxDouble(lossValue, -0.1, 0.001,
+    "case5 recorded PPO loss matches -1/2*(1.0 + -0.8) = -0.1")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+fn main(): void =>
+  println("=== test_ppo_clipped_loss_recorded ===")
+  println("")
+  case1()
+  case2()
+  case3()
+  case4()
+  case5()
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

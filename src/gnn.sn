@@ -356,6 +356,87 @@ struct Gnn =>
   fn train(graphs: GraphTensors[], labels: double[], weights: double[],
     optimizer: Optimizer, epochs: int, batchSize: int,
     valSplit: double, seed: long): TrainResult =>
+    # Thin wrapper over trainCore for the classic weighted-CE loss. The
+    # oldLogProbsHost / epsilon slots are unused in this path and passed
+    # as empty / zero placeholders.
+    var emptyOldLogProbs: double[] = {}
+    return self.trainCore(graphs, labels, weights, optimizer, epochs,
+      batchSize, valSplit, seed, "weighted_ce", emptyOldLogProbs, 0.0)
+
+  # On-policy PPO-clipped training (Schulman et al. 2017). Caller-visible
+  # contract parallels train() but swaps two things:
+  #
+  # labels  → actions     (still one-hot per sample; tells the op which
+  # action was sampled at rollout time)
+  # weights → advantages  (per-sample A_i, already mean-normalized by
+  # the caller; negative A_i pushes the policy
+  # AWAY from the sampled action instead of
+  # crashing the weighted-CE loss into NaN)
+  #
+  # PPO-specific inputs:
+  #
+  # epsilon : the clip range (Schulman default ≈ 0.2). Produces a
+  # bounded surrogate so multi-epoch training on the same
+  # batch is safe — unlike weighted CE with negative weights.
+  #
+  # Internal side-effects before sn_graph_begin():
+  #
+  # We run an extra forward pass on every training graph in non-record
+  # mode to snapshot log π_old(a_i|s_i) — one scalar per sample — into
+  # oldLogProbsHost. This buffer is uploaded per-batch by the PPO
+  # train-epoch driver so the loss op can compute the ratio
+  # exp(log π_θ - log π_old). The snapshot is taken BEFORE record mode
+  # opens so the pool slots used by forward() aren't stale record
+  # tensors.
+  #
+  # The actual training loop delegates to trainCore("ppo", ...), which
+  # shares the host buffer build, record-mode plumbing, Phase C
+  # diagnostics, and metric emissions with the weighted-CE path. The two
+  # loss kinds differ only at (a) the loss op itself and (b) the choice
+  # of per-epoch driver. See docs/issues/ppo-clipped-objective.md.
+  fn trainPpo(graphs: GraphTensors[], actions: double[],
+    advantages: double[], optimizer: Optimizer, epochs: int,
+    batchSize: int, epsilon: double, seed: long): TrainResult =>
+    var numClasses: int = self.config.numActions
+    var total: int = len(graphs)
+    var oldLogProbsHost: double[] = {}
+    for var i: int = 0; i < total; i++ =>
+      var probs: double[] = self.forward(graphs[i], false).probs.toDoubles()
+      # Resolve the chosen action index from the one-hot mask. The loop
+      # scans the whole row instead of break-on-first-match because the
+      # caller may pass float-noisy one-hots (e.g., 0.999999 instead of
+      # 1.0); picking the argmax is robust against that.
+      var chosen: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if actions[i * numClasses + j] > actions[i * numClasses + chosen] =>
+          chosen = j
+      var p: double = probs[chosen]
+      # Floor to match the LOG_SM_EPS ≈ 2e-9 used inside the loss op's
+      # bounded log_softmax — keeps oldLogProbs and log π_θ computed on
+      # the same effective scale. log(2e-9) ≈ -20.
+      if p < 0.000000002 =>
+        p = 0.000000002
+      oldLogProbsHost.push(log(p))
+    return self.trainCore(graphs, actions, advantages, optimizer, epochs,
+      batchSize, 0.0, seed, "ppo", oldLogProbsHost, epsilon)
+
+  # Shared training implementation for train() and trainPpo(). The only
+  # places this method branches on lossKind are:
+  #
+  # (a) loss construction — sn_tensor_weighted_cross_entropy vs
+  # sn_tensor_ppo_clipped_loss (the PPO path also allocates an
+  # extra static input tensor for the oldLogProbs upload slot).
+  # (b) the per-epoch driver — sn_graph_train_epoch vs
+  # sn_graph_train_epoch_ppo (both thin wrappers over the same
+  # sn_graph_train_epoch_impl in tensor.sn.c).
+  #
+  # Everything else — host buffer build, Phase C diagnostics, param
+  # snapshot/delta tracking, metric emissions, TrainResult packaging —
+  # is identical between the two loss kinds.
+  fn trainCore(graphs: GraphTensors[], labels: double[], weights: double[],
+    optimizer: Optimizer, epochs: int, batchSize: int,
+    valSplit: double, seed: long, lossKind: str,
+    oldLogProbsHost: double[], epsilon: double): TrainResult =>
 
     if len(graphs) == 0 || epochs <= 0 || batchSize <= 0 =>
       var emptyD: double[] = {}
@@ -593,8 +674,31 @@ struct Gnn =>
     }
 
     var output: GnnOutput = self.forward(inputGraph, true)
-    var loss: Tensor = sn_tensor_weighted_cross_entropy(
-      output.logits, labelsInput, weightsInput)
+
+    # --- Loss-kind-specific plumbing.
+    #
+    # For PPO we need one extra static input tensor (oldLogProbsInput)
+    # whose per-batch values are uploaded by sn_graph_train_epoch_ppo
+    # from the oldLogProbsHost buffer assembled in trainPpo() before
+    # sn_graph_begin(). Shape is (batchSize, 1) — one log-prob per
+    # sample in the batch.
+    #
+    # oldLogProbsInput is assigned a harmless placeholder in the
+    # weighted_ce path so the variable is definitely initialized at the
+    # train_epoch call site below; it is only READ from inside the PPO
+    # branch of the epoch loop.
+    var oldLogProbsInput: Tensor = nodeFeaturesInput
+    var loss: Tensor = output.logits
+    if lossKind == "ppo" =>
+      var initOldLogProbs: double[] = {}
+      for var i: int = 0; i < batchSize; i++ =>
+        initOldLogProbs.push(0.0)
+      oldLogProbsInput = sn_graph_input_data(initOldLogProbs, batchSize, 1)
+      loss = sn_tensor_ppo_clipped_loss(
+        output.logits, oldLogProbsInput, labelsInput, weightsInput, epsilon)
+    else =>
+      loss = sn_tensor_weighted_cross_entropy(
+        output.logits, labelsInput, weightsInput)
 
     # --- Epoch loop with deterministic ACROSS-BATCH shuffling.
     #
@@ -647,16 +751,35 @@ struct Gnn =>
               srcIdx = srcIdx % totalSamples
             perm[b * batchSize + k] = srcIdx.toDouble()
 
-        var epochLoss: double = sn_graph_train_epoch(
-          loss, nodeFeaturesInput, labelsInput, weightsInput,
-          featuresHost, labels, weights,
-          adjHost, realNodeCountHost, perm,
-          featureDim, numClasses, batchSize,
-          maxNodes,
-          optimizer.kind,
-          optimizer.learningRate,
-          optimizer.beta1, optimizer.beta2, epsAdam,
-          optimizer.weightDecay)
+        # Dispatch to the loss-kind-specific epoch driver. Both route
+        # into sn_graph_train_epoch_impl in tensor.sn.c — the only
+        # differences are (a) the extra oldLogProbs per-batch upload
+        # and (b) the sanity check tensor identity for the PPO slot.
+        var epochLoss: double = 0.0
+        if lossKind == "ppo" =>
+          epochLoss = sn_graph_train_epoch_ppo(
+            loss, nodeFeaturesInput, labelsInput, weightsInput,
+            oldLogProbsInput,
+            featuresHost, labels, weights,
+            oldLogProbsHost,
+            adjHost, realNodeCountHost, perm,
+            featureDim, numClasses, batchSize,
+            maxNodes,
+            optimizer.kind,
+            optimizer.learningRate,
+            optimizer.beta1, optimizer.beta2, epsAdam,
+            optimizer.weightDecay)
+        else =>
+          epochLoss = sn_graph_train_epoch(
+            loss, nodeFeaturesInput, labelsInput, weightsInput,
+            featuresHost, labels, weights,
+            adjHost, realNodeCountHost, perm,
+            featureDim, numClasses, batchSize,
+            maxNodes,
+            optimizer.kind,
+            optimizer.learningRate,
+            optimizer.beta1, optimizer.beta2, epsAdam,
+            optimizer.weightDecay)
         lossCurve.push(epochLoss)
 
         # --- Phase M: emit per-epoch train_loss with {epoch} label.
