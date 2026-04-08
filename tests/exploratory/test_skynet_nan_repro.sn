@@ -1,0 +1,191 @@
+import "../../src/tensor"
+import "../../src/gnn"
+
+# ===========================================================================
+# test_skynet_nan_repro.sn — exploratory NaN reproduction
+#
+# Mirrors skynet's crusher trainer config exactly:
+# arch=gat, numLayers=3, hiddenDim=32, inputDim=24, numActions=3
+# lr=0.001, wd=0.0001, 50 epochs
+#
+# And cycle 2's graph distribution from the orchestrator log:
+# 9 samples, mix of 4-node (~6 edges) and 9-node (~17-36 edges)
+# reward distribution: mostly +1.0, one -5.0
+# advantages clipped to ±5 (none actually hit ±5 here)
+# labels = one-hot of the chosen action
+#
+# Expected (current state, before fix): loss=NaN
+# Expected (after fix): finite loss, model trains
+#
+# Build:
+# sn --unchecked tests/exploratory/test_skynet_nan_repro.sn -o /tmp/sknanrepro
+# /tmp/sknanrepro
+# ===========================================================================
+
+# Build a graph with the given numNodes, a "ring + self-loop" topology, and
+# constant-ish features. featureDim is fixed at 24.
+fn buildRingGraph(numNodes: int, classIdx: int, sampleIdx: int): GraphTensors =>
+  var featureDim: int = 24
+
+  # Features: small per-sample variation so each graph is unique. Use a
+  # mix that's bounded in [0, 1] (matching skynet's FeatureScaler output).
+  var feats: double[] = {}
+  for var n: int = 0; n < numNodes; n++ =>
+    for var k: int = 0; k < featureDim; k++ =>
+      var v: double = 0.3 + 0.1 * ((sampleIdx + n + k) % 7).toDouble() / 7.0
+      if classIdx == 1 =>
+        v = v + 0.05
+      if classIdx == 2 =>
+        v = v + 0.10
+      feats.push(v)
+
+  # Ring topology: each node connects to the next + self-loop
+  # plus extra edges to densify when numNodes is large
+  var srcs: int[] = {}
+  var dsts: int[] = {}
+  for var n: int = 0; n < numNodes; n++ =>
+    # self loop
+    srcs.push(n)
+    dsts.push(n)
+    # forward edge
+    srcs.push(n)
+    dsts.push((n + 1) % numNodes)
+    # backward edge (for densification on larger graphs)
+    if numNodes > 5 =>
+      srcs.push(n)
+      dsts.push((n + 2) % numNodes)
+      srcs.push(n)
+      dsts.push((n + 3) % numNodes)
+
+  var ne: int = len(srcs)
+  var edgeData: double[] = {}
+  for var i: int = 0; i < ne; i++ =>
+    edgeData.push(srcs[i].toDouble())
+  for var i: int = 0; i < ne; i++ =>
+    edgeData.push(dsts[i].toDouble())
+
+  var weights: double[] = {}
+  for var i: int = 0; i < ne; i++ =>
+    weights.push(1.0)
+
+  var batch: double[] = {}
+  for var i: int = 0; i < numNodes; i++ =>
+    batch.push(0.0)
+
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, numNodes, featureDim),
+    edgeIndex: Tensor.fromDoubles(edgeData, 2, ne),
+    edgeWeight: Tensor.fromDoubles(weights, 1, ne),
+    batchIndex: Tensor.fromDoubles(batch, numNodes, 1),
+    numNodes: numNodes, numEdges: ne, featureDim: featureDim
+  }
+
+fn main(): void =>
+  println("=== test_skynet_nan_repro ===")
+  println("")
+
+  var featureDim: int = 24
+  var numActions: int = 3
+  var modelPath: str = "/tmp/test_skynet_nan_model.bin"
+
+  var config: GnnConfig = {
+    inputDim: featureDim, hiddenDim: 32, numActions: numActions,
+    numLayers: 3, arch: "gat", dropoutRate: 0.1
+  }
+
+  # ----- Cycle 1 (mirrors skynet trainer flow exactly) -----
+  println("  cycle 1: fresh model (no champion), zero advantages, 50 epochs")
+
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  # Build cycle-1 training graphs INSIDE the cycle (skynet does this)
+  var c1Graphs: GraphTensors[] = {
+    buildRingGraph(4, 2, 0),
+    buildRingGraph(9, 2, 1),
+    buildRingGraph(4, 2, 2),
+    buildRingGraph(9, 2, 3),
+    buildRingGraph(4, 1, 4),
+    buildRingGraph(9, 2, 5)
+  }
+  var c1Actions: int[] = {2, 2, 2, 2, 1, 2}
+  var c1Labels: double[] = {}
+  for var i: int = 0; i < len(c1Actions); i++ =>
+    for var a: int = 0; a < numActions; a++ =>
+      if a == c1Actions[i] =>
+        c1Labels.push(1.0)
+      else =>
+        c1Labels.push(0.0)
+  var c1Advantages: double[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+
+  var opt1: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  var result1: TrainResult = model.train(
+    c1Graphs, c1Labels, c1Advantages, opt1, 50, 6, 0.0, 42l)
+  println($"    cycle 1 loss = {result1.loss}")
+  model.save(modelPath)
+  println($"    saved")
+  model.reset()
+  println("    pool reset")
+  println("")
+
+  # ----- Cycle 2 (mirrors skynet flow) -----
+  println("  cycle 2: fresh model, load cycle-1, real advantages, 50 epochs")
+
+  var model2: Gnn = Gnn.create(config)
+  model2.load(modelPath)
+  println("    loaded cycle-1 weights")
+
+  # Build cycle-2 training graphs INSIDE this cycle, AFTER load.
+  # Vary the densities more to expose the magnitude growth: some graphs
+  # have lots of edges per node (mimicking the densest skynet graphs).
+  # Add cycle 3 emulation: train, save, reset, recreate, load, train again
+  var c2Graphs: GraphTensors[] = {
+    buildRingGraph(4, 2, 10),
+    buildRingGraph(9, 2, 11),
+    buildRingGraph(8, 2, 12),
+    buildRingGraph(9, 2, 13),
+    buildRingGraph(4, 1, 14),
+    buildRingGraph(9, 2, 15),
+    buildRingGraph(8, 2, 16),
+    buildRingGraph(9, 0, 17),
+    buildRingGraph(3, 2, 18)
+  }
+  var c2Actions: int[] = {2, 2, 2, 2, 1, 2, 2, 0, 2}
+  var c2Labels: double[] = {}
+  for var i: int = 0; i < len(c2Actions); i++ =>
+    for var a: int = 0; a < numActions; a++ =>
+      if a == c2Actions[i] =>
+        c2Labels.push(1.0)
+      else =>
+        c2Labels.push(0.0)
+
+  var rewards: double[] = {-5.0, 1.04, 1.06, 1.0, 1.03, 1.06, 1.03, 1.0, 1.03}
+  var rewardMean: double = -1.64833
+  var rewardStd: double = 3.02143
+  var c2Advantages: double[] = {}
+  for var i: int = 0; i < len(rewards); i++ =>
+    var adv: double = (rewards[i] - rewardMean) / rewardStd
+    if adv < -5.0 =>
+      adv = -5.0
+    if adv > 5.0 =>
+      adv = 5.0
+    c2Advantages.push(adv)
+
+  println("    c2 advantages:")
+  for var i: int = 0; i < len(c2Advantages); i++ =>
+    println($"      a{i}: {c2Advantages[i]}")
+
+  # Forward sanity check on loaded model
+  println("    post-load forward sanity check:")
+  for var i: int = 0; i < len(c2Graphs); i++ =>
+    var probs: double[] = model2.forward(c2Graphs[i], false).probs.toDoubles()
+    println($"      g{i}: [{probs[0]}, {probs[1]}, {probs[2]}]")
+
+  var opt2: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  var result2: TrainResult = model2.train(
+    c2Graphs, c2Labels, c2Advantages, opt2, 50, 9, 0.0, 42l)
+  println($"    cycle 2 loss = {result2.loss}")
+  model2.save(modelPath)
+  model2.reset()
+  println("")
+
+  println("  done")

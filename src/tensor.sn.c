@@ -795,6 +795,69 @@ double sn_graph_train_epoch(
         ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
         ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
 
+        /* DEBUG: dump min/max/anyNaN for each host-side buffer this batch */
+        if (batch_idx == 0) {
+            float fmin=1e30f, fmax=-1e30f; int fnan=0;
+            for (long long k = 0; k < features_per_batch; k++) {
+                float v = features_buf[k];
+                if (v != v) fnan = 1;
+                if (v < fmin) fmin = v;
+                if (v > fmax) fmax = v;
+            }
+            float amin=1e30f, amax=-1e30f; int anan=0;
+            for (long long k = 0; k < nodes_per_batch * nodes_per_batch; k++) {
+                float v = adj_buf[k];
+                if (v != v) anan = 1;
+                if (v < amin) amin = v;
+                if (v > amax) amax = v;
+            }
+            float pmin=1e30f, pmax=-1e30f; int pnan=0;
+            for (long long k = 0; k < n_per_batch * nodes_per_batch; k++) {
+                float v = pool_buf[k];
+                if (v != v) pnan = 1;
+                if (v < pmin) pmin = v;
+                if (v > pmax) pmax = v;
+            }
+            float lmin=1e30f, lmax=-1e30f; int lnan=0;
+            for (long long k = 0; k < n_per_batch * labels_per_sample; k++) {
+                float v = labels_buf[k];
+                if (v != v) lnan = 1;
+                if (v < lmin) lmin = v;
+                if (v > lmax) lmax = v;
+            }
+            float wmin=1e30f, wmax=-1e30f; int wnan=0;
+            for (long long k = 0; k < n_per_batch; k++) {
+                float v = weights_buf[k];
+                if (v != v) wnan = 1;
+                if (v < wmin) wmin = v;
+                if (v > wmax) wmax = v;
+            }
+            fprintf(stderr,
+                "[DBG] inputs: feat=[%.4g,%.4g]nan=%d adj=[%.4g,%.4g]nan=%d pool=[%.4g,%.4g]nan=%d lbl=[%.4g,%.4g]nan=%d w=[%.4g,%.4g]nan=%d\n",
+                fmin, fmax, fnan, amin, amax, anan, pmin, pmax, pnan, lmin, lmax, lnan, wmin, wmax, wnan);
+            fflush(stderr);
+
+            /* Dump each PARAM tensor's host pool data — these are what the
+             * loaded model contributed to this train() call. */
+            for (int p = 0; p < g_pool_count; p++) {
+                struct ggml_tensor *gt = g_record_map[p];
+                if (!gt || !(gt->flags & GGML_TENSOR_FLAG_PARAM)) continue;
+                TPool *s = &g_pool[p];
+                if (!s->data || s->n_elem <= 0) continue;
+                float pmin2=1e30f, pmax2=-1e30f; int pnan2=0;
+                for (int64_t k = 0; k < s->n_elem; k++) {
+                    float v = s->data[k];
+                    if (v != v) pnan2 = 1;
+                    if (v < pmin2) pmin2 = v;
+                    if (v > pmax2) pmax2 = v;
+                }
+                fprintf(stderr,
+                    "[DBG] param pool=%d name=%s shape=(%lld,%lld) range=[%.4g,%.4g] nan=%d\n",
+                    p, gt->name, (long long)s->ne[0], (long long)s->ne[1], pmin2, pmax2, pnan2);
+            }
+            fflush(stderr);
+        }
+
         /* Upload the batched adjacency / pool matrix to every tensor in the
          * per-batch registry. Within a single Gnn.train() call all ADJ
          * tensors share the same edgeIndex/edgeWeight + mode (because every
@@ -823,6 +886,33 @@ double sn_graph_train_epoch(
         float batch_loss = 0.0f;
         ggml_backend_tensor_get(g_opt_loss_tensor, &batch_loss, 0, sizeof(float));
         total_loss += (double)batch_loss;
+
+        /* DEBUG: dump batch loss + post-update param magnitudes on first batch */
+        if (batch_idx == 0) {
+            fprintf(stderr, "[DBG] batch 0 loss = %.6g (nan=%d)\n",
+                    (double)batch_loss, batch_loss != batch_loss ? 1 : 0);
+            for (int p = 0; p < g_pool_count; p++) {
+                struct ggml_tensor *gt = g_record_map[p];
+                if (!gt || !(gt->flags & GGML_TENSOR_FLAG_PARAM)) continue;
+                TPool *s = &g_pool[p];
+                if (!s->data || s->n_elem <= 0) continue;
+                /* Read back from backend to see post-update values */
+                if (gt->buffer) {
+                    ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
+                }
+                float pmin3=1e30f, pmax3=-1e30f; int pnan3=0;
+                for (int64_t k = 0; k < s->n_elem; k++) {
+                    float v = s->data[k];
+                    if (v != v) pnan3 = 1;
+                    if (v < pmin3) pmin3 = v;
+                    if (v > pmax3) pmax3 = v;
+                }
+                fprintf(stderr,
+                    "[DBG] post-eval param pool=%d range=[%.4g,%.4g] nan=%d\n",
+                    p, pmin3, pmax3, pnan3);
+            }
+            fflush(stderr);
+        }
     }
 
     free(features_buf);
