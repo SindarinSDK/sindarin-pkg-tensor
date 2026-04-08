@@ -1,0 +1,287 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_save_load_roundtrip_under_train.sn — Phase I / Part 3 Test 7
+#
+# Strict replacement for the previous tests/test_train_save_infer.sn.
+# The old test tolerated a 0.01 delta between saved and loaded
+# predictions and did not verify the set of trainable parameters
+# survived the round trip. Skynet's champion/challenger ratchet
+# depends entirely on save/load being bit-stable under train, so the
+# loose tolerance was the wrong bar.
+#
+# This version enforces the full contract described in golden-path.md
+# Part 3 Test 7:
+#
+# Part A — Save/load preserves predictions
+# Train model M1. Snapshot its parameters and forward outputs on
+# K canonical graphs. Save → load into M2. Assert M2's
+# parameters match M1's (same count, same shape, same L2 norm,
+# same bytes) and M2's forward outputs match M1's to 1e-6.
+#
+# Part B — Save/load preserves trainability
+# Continue training M2 for a few more epochs. In parallel, train
+# a never-saved reference M3 with the same seed for the same
+# number of extra epochs on top of a fresh M1-equivalent model.
+# Assert M2's post-continue forward outputs match the never-saved
+# reference to 1e-6. This is the "save → load → train → save →
+# load → forward" contract the doc asks for, in its minimal form.
+#
+# Part C — Parameter set identity
+# After Part B, verify once more that the set of parameters in
+# the loaded+retrained model equals the set in the saved-and-
+# loaded model. Catches silent drops of a layer, a bias, or the
+# classifier head under retrain.
+#
+# Crash-on-fail via `failed() > 0 ⇒ 1/0`.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Training data — single-node graphs with 4-dim features, 3 classes.
+# Hand-picked balanced samples so the model converges to a stable state
+# quickly and determinism assertions are meaningful.
+# ---------------------------------------------------------------------------
+
+fn rawSamples(): double[][] =>
+  return {
+    {0.90, 0.10, 0.10, 0.10},
+    {0.10, 0.90, 0.10, 0.10},
+    {0.10, 0.10, 0.90, 0.10},
+    {0.80, 0.20, 0.10, 0.10},
+    {0.20, 0.80, 0.10, 0.10},
+    {0.10, 0.20, 0.80, 0.10},
+    {0.85, 0.15, 0.10, 0.10},
+    {0.15, 0.85, 0.10, 0.10},
+    {0.10, 0.15, 0.85, 0.10}
+  }
+
+fn singleNode(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 4),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 4
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  var samples: double[][] = rawSamples()
+  var graphs: GraphTensors[] = {}
+  for var i: int = 0; i < len(samples); i++ =>
+    graphs.push(singleNode(samples[i]))
+  return graphs
+
+# Labels cycle (0, 1, 2, 0, 1, 2, 0, 1, 2).
+fn buildLabels(): double[] =>
+  var labels: double[] = {}
+  for var i: int = 0; i < 9; i++ =>
+    var cls: int = i % 3
+    for var a: int = 0; a < 3; a++ =>
+      if a == cls =>
+        labels.push(1.0)
+      else =>
+        labels.push(0.0)
+  return labels
+
+fn buildUnitWeights(n: int): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    w.push(1.0)
+  return w
+
+fn makeConfig(): GnnConfig =>
+  return GnnConfig {
+    inputDim: 4, hiddenDim: 8, numActions: 3,
+    numLayers: 2, arch: "gat", dropoutRate: 0.0
+  }
+
+fn makeModel(): Gnn =>
+  return Gnn.createWithSeed(makeConfig(), 42l)
+
+fn trainModel(model: Gnn, epochs: int, trainSeed: long): TrainResult =>
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildUnitWeights(len(graphs))
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  return model.train(graphs, labels, weights, opt, epochs, 3, 0.0, trainSeed)
+
+# Predict every training graph via predictBatch; return a per-sample
+# flat double[][] of probs.
+fn predictAll(model: Gnn): double[][] =>
+  var graphs: GraphTensors[] = buildGraphs()
+  var outs: GnnOutput[] = model.predictBatch(graphs)
+  var probs: double[][] = {}
+  for var i: int = 0; i < len(outs); i++ =>
+    probs.push(outs[i].probs.toDoubles())
+  return probs
+
+# Snapshot every parameter's flat data for byte-level comparison.
+fn snapshotParams(model: Gnn): double[][] =>
+  var ps: Tensor[] = model.parameters()
+  var snap: double[][] = {}
+  for var i: int = 0; i < len(ps); i++ =>
+    snap.push(ps[i].toDoubles())
+  return snap
+
+# Elementwise compare two per-parameter snapshot sets.
+fn assertParamsIdentical(a: double[][], b: double[][],
+  tol: double, label: str): void =>
+  assertEqualInt(len(a), len(b),
+    $"{label}: parameter count matches")
+  for var i: int = 0; i < len(a); i++ =>
+    assertEqualInt(len(a[i]), len(b[i]),
+      $"{label}: param[{i}] element count matches")
+    for var j: int = 0; j < len(a[i]); j++ =>
+      assertApproxDouble(a[i][j], b[i][j], tol,
+        $"{label}: param[{i}] element [{j}]")
+
+# Elementwise compare two per-sample probability tables.
+fn assertProbsIdentical(a: double[][], b: double[][],
+  tol: double, label: str): void =>
+  assertEqualInt(len(a), len(b),
+    $"{label}: sample count matches")
+  for var i: int = 0; i < len(a); i++ =>
+    assertEqualInt(len(a[i]), len(b[i]),
+      $"{label}: sample {i} vector length matches")
+    for var j: int = 0; j < len(a[i]); j++ =>
+      assertApproxDouble(a[i][j], b[i][j], tol,
+        $"{label}: sample {i} probs[{j}]")
+
+# Assert two parameter sets have the same per-param shape AND the same
+# per-param L2 norm to tight tolerance.
+fn assertParamShapesAndNorms(
+  aParams: Tensor[], bParams: Tensor[], label: str): void =>
+  assertEqualInt(len(aParams), len(bParams),
+    $"{label}: parameter count matches")
+  for var i: int = 0; i < len(aParams); i++ =>
+    var aShape: int[] = aParams[i].shape()
+    var bShape: int[] = bParams[i].shape()
+    assertEqualInt(len(aShape), len(bShape),
+      $"{label}: param[{i}] shape rank matches")
+    for var d: int = 0; d < len(aShape); d++ =>
+      assertEqualInt(aShape[d], bShape[d],
+        $"{label}: param[{i}] shape[{d}] matches")
+    assertApproxDouble(aParams[i].norm(), bParams[i].norm(), 0.000001,
+      $"{label}: param[{i}] L2 norm matches to 1e-6")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_save_load_roundtrip_under_train — Phase I ===")
+  println("")
+
+  var savePath: str = "/tmp/test_save_load_roundtrip_model.bin"
+
+  # -----------------------------------------------------------------------
+  # Part A — Save/load preserves predictions and parameters.
+  # -----------------------------------------------------------------------
+  println("--- Part A: save → load preserves predictions + parameters ---")
+
+  # Train M1 on the canonical data.
+  var model1: Gnn = makeModel()
+  var r1: TrainResult = trainModel(model1, 40, 42l)
+  println($"  M1 trained: loss={r1.loss} accuracy={r1.accuracy}")
+
+  # Snapshot M1's parameters and predictions before saving.
+  var m1Params: double[][] = snapshotParams(model1)
+  var m1Probs: double[][] = predictAll(model1)
+
+  # Save.
+  model1.save(savePath)
+  println($"  saved to {savePath}")
+
+  # Load into a fresh M2.
+  var model2: Gnn = Gnn.create(makeConfig())
+  model2.load(savePath)
+  println("  loaded into fresh M2")
+
+  # --- Assertion: param-set identity via shape + L2 (cheap byte check)
+  assertParamShapesAndNorms(model1.parameters(), model2.parameters(),
+    "Part A: save→load param set")
+
+  # --- Assertion: param-set identity via full byte snapshot
+  var m2Params: double[][] = snapshotParams(model2)
+  assertParamsIdentical(m1Params, m2Params, 0.000001,
+    "Part A: save→load param bytes")
+
+  # --- Assertion: prediction identity via predictBatch
+  var m2Probs: double[][] = predictAll(model2)
+  assertProbsIdentical(m1Probs, m2Probs, 0.000001,
+    "Part A: save→load predictions")
+
+  println("  Part A: all preservation checks pass")
+  println("")
+
+  # -----------------------------------------------------------------------
+  # Part B — Save/load preserves trainability.
+  #
+  # Continue training M2 for 20 more epochs. Independently, train a
+  # reference M3 that was NEVER saved/loaded: same architecture, same
+  # seed, same 40+20 = 60 epochs of training total. Assert M2 and M3
+  # end up in the same state.
+  # -----------------------------------------------------------------------
+  println("--- Part B: save → load → train matches never-saved reference ---")
+
+  # Continue training on the save/load path.
+  var rCont: TrainResult = trainModel(model2, 20, 43l)
+  println($"  M2 continue-trained: loss={rCont.loss} accuracy={rCont.accuracy}")
+
+  # Reference: fresh model, train for 40 + 20 epochs with the same
+  # train-call seeds used above. The Gnn weights are re-seeded from
+  # the same Gnn.createWithSeed(..., 42l), and the Random used for
+  # batch shuffling inside Gnn.train() is seeded from the per-call
+  # trainSeed argument. Matching both reproduces the same trajectory.
+  var model3: Gnn = makeModel()
+  var r3a: TrainResult = trainModel(model3, 40, 42l)
+  var r3b: TrainResult = trainModel(model3, 20, 43l)
+  println($"  M3 reference-trained: loss={r3b.loss} accuracy={r3b.accuracy}")
+
+  # --- Assertion: post-continue predictions match the never-saved
+  # reference to 1e-6.
+  var m2ContProbs: double[][] = predictAll(model2)
+  var m3Probs: double[][] = predictAll(model3)
+  assertProbsIdentical(m2ContProbs, m3Probs, 0.000001,
+    "Part B: continue-trained save/load matches never-saved reference")
+
+  # --- Assertion: post-continue parameter bytes match too.
+  var m2ContParams: double[][] = snapshotParams(model2)
+  var m3Snap: double[][] = snapshotParams(model3)
+  assertParamsIdentical(m2ContParams, m3Snap, 0.000001,
+    "Part B: continue-trained save/load param bytes match reference")
+
+  println("  Part B: save/load preserves trainability")
+  println("")
+
+  # -----------------------------------------------------------------------
+  # Part C — Parameter set identity after retrain.
+  #
+  # After continuing training, re-save and re-load, and verify the
+  # parameter set still has the same shape as the original. Catches
+  # silent drops of a layer / bias / classifier head under retrain.
+  # -----------------------------------------------------------------------
+  println("--- Part C: parameter set identity after retrain ---")
+
+  model2.save(savePath)
+  var model4: Gnn = Gnn.create(makeConfig())
+  model4.load(savePath)
+
+  assertParamShapesAndNorms(model2.parameters(), model4.parameters(),
+    "Part C: second-round save→load param set")
+
+  var m4Probs: double[][] = predictAll(model4)
+  assertProbsIdentical(m2ContProbs, m4Probs, 0.000001,
+    "Part C: second-round save→load predictions match")
+
+  println("  Part C: parameter set preserved across second save/load")
+  println("")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

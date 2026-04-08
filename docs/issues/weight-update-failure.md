@@ -43,6 +43,18 @@ directly with no intermediate copy.
    `gnnMatmul` (GCN, GraphSAGE, GAT forward passes and the classifier
    head).
 
+   **Follow-up fix (Phase A of `docs/issues/golden-path.md`):** The
+   GraphSAGE path (`sageForward` in `src/gnn.sn`) was still using the
+   old `.matmul()` call at the time this doc was first marked
+   RESOLVED. No existing test exercised sage, so the regression went
+   undetected. The new `tests/test_weight_update_proven.sn` parametrizes
+   across gat/gcn/sage and flushed this out: sage not only failed the
+   gradient-flow check but also hit a `ggml_add` broadcast assertion
+   because `sn_tensor_matmul`'s host pre-transpose misinterprets the
+   GNN weight layout `(ne0=inputDim, ne1=outputDim)` and produces the
+   wrong output shape. `sageForward` now uses `gnnMatmul` and passes
+   the regression guard alongside gat and gcn.
+
 2. **ggml backward-pass contiguity patches** (commits `6cdcdc9` →
    `de8613f`). Fix `ggml_repeat_back` and the TRANSPOSE/PERMUTE
    backward expansions to produce contiguous gradients. Without these

@@ -1,0 +1,261 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_train_result_diagnostics.sn — Phase C cross-check (Bug B4)
+#
+# Verifies that every field in the extended TrainResult struct matches an
+# independently-computed value over the same inputs. This is the contract
+# between Gnn.train() and any consumer (skynet) that needs to read
+# diagnostics out of the package — if the field disagrees with what the
+# caller would compute themselves, the diagnostic is worse than useless.
+#
+# The cross-checks are split into:
+# - Pre-train computables (weightSumIn, weightVarianceIn, inputMean,
+# inputStd, paramNormBefore) — measured externally and compared to
+# the field after train() returns.
+# - Post-train computables (paramNormAfter, paramMaxAbsDelta) —
+# measured externally on the same model handle after train() and
+# compared to the field.
+# - Trajectory shapes (lossCurve, gradNormCurve) — length checks +
+# non-NaN + first-epoch grad-norm > 0 sanity.
+# - Accuracy — recomputed externally via the same forward path and
+# compared.
+#
+# This file is the regression guard for §2.4 of golden-path.md.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  var samples: double[][] = {
+    {0.9, 0.1, 0.1},
+    {0.1, 0.9, 0.1},
+    {0.1, 0.1, 0.9},
+    {0.8, 0.2, 0.1},
+    {0.2, 0.8, 0.1},
+    {0.1, 0.2, 0.8}
+  }
+  var graphs: GraphTensors[] = {}
+  for var i: int = 0; i < len(samples); i++ =>
+    graphs.push(singleNode(samples[i], 3))
+  return graphs
+
+fn buildLabels(): double[] =>
+  var labels: double[] = {}
+  var actions: int[] = {0, 1, 2, 0, 1, 2}
+  for var i: int = 0; i < len(actions); i++ =>
+    for var a: int = 0; a < 3; a++ =>
+      if a == actions[i] =>
+        labels.push(1.0)
+      else =>
+        labels.push(0.0)
+  return labels
+
+fn buildWeights(): double[] =>
+  # Mixed magnitudes so weightVarianceIn != 0.
+  return {2.0, 1.0, 0.5, 1.5, 0.5, 1.0}
+
+# Externally compute mean of a flat double array — must match the
+# package's inputMean computation byte-for-byte (same accumulation
+# order).
+fn arrayMean(arr: double[]): double =>
+  var s: double = 0.0
+  for var i: int = 0; i < len(arr); i++ =>
+    s = s + arr[i]
+  return s / len(arr).toDouble()
+
+fn arrayStd(arr: double[]): double =>
+  var m: double = arrayMean(arr)
+  var sq: double = 0.0
+  for var i: int = 0; i < len(arr); i++ =>
+    var d: double = arr[i] - m
+    sq = sq + d * d
+  return sqrt(sq / len(arr).toDouble())
+
+fn sumOf(arr: double[]): double =>
+  var s: double = 0.0
+  for var i: int = 0; i < len(arr); i++ =>
+    s = s + arr[i]
+  return s
+
+fn varianceOf(arr: double[]): double =>
+  var m: double = arrayMean(arr)
+  var sq: double = 0.0
+  for var i: int = 0; i < len(arr); i++ =>
+    var d: double = arr[i] - m
+    sq = sq + d * d
+  return sq / len(arr).toDouble()
+
+# isNan is provided by sindarin-pkg-sdk/src/core/math.sn
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_train_result_diagnostics — Phase C (Bug B4) ===")
+  println("")
+
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildWeights()
+  var totalSamples: int = len(graphs)
+
+  # ----- External pre-train measurements -----
+
+  # featuresHost is built by Gnn.train() as: for each sample, padded
+  # nodeFeatures concatenated. Single-node graphs with featureDim=3
+  # mean each sample contributes exactly 3 doubles, no padding (since
+  # maxNodes=1 across all samples). So the expected featuresHost is
+  # the per-sample features concatenated in sample order.
+  var expectedFeaturesHost: double[] = {}
+  for var i: int = 0; i < totalSamples; i++ =>
+    var f: double[] = graphs[i].nodeFeatures.toDoubles()
+    for var j: int = 0; j < len(f); j++ =>
+      expectedFeaturesHost.push(f[j])
+
+  var expectedInputMean: double = arrayMean(expectedFeaturesHost)
+  var expectedInputStd: double = arrayStd(expectedFeaturesHost)
+  var expectedWeightSum: double = sumOf(weights)
+  var expectedWeightVar: double = varianceOf(weights)
+
+  # External per-parameter L2 norms (pre-train).
+  var paramsRef: Tensor[] = model.parameters()
+  var nParams: int = len(paramsRef)
+  var expectedNormBefore: double[] = {}
+  var beforeSnap: double[][] = {}
+  for var i: int = 0; i < nParams; i++ =>
+    expectedNormBefore.push(paramsRef[i].norm())
+    beforeSnap.push(paramsRef[i].toDoubles())
+
+  # ----- Train -----
+
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var epochs: int = 25
+  var result: TrainResult = model.train(
+    graphs, labels, weights, opt, epochs, 3, 0.0, 42l)
+
+  println($"  loss={result.loss} accuracy={result.accuracy} epochs={result.epochs}")
+
+  # ----- External post-train measurements -----
+
+  var expectedNormAfter: double[] = {}
+  var expectedMaxAbsDelta: double[] = {}
+  for var i: int = 0; i < nParams; i++ =>
+    expectedNormAfter.push(paramsRef[i].norm())
+    var curr: double[] = paramsRef[i].toDoubles()
+    var m: double = 0.0
+    for var j: int = 0; j < len(curr); j++ =>
+      var d: double = curr[j] - beforeSnap[i][j]
+      if d < 0.0 =>
+        d = -d
+      if d > m =>
+        m = d
+    expectedMaxAbsDelta.push(m)
+
+  # External accuracy via the same forward path Gnn.train() uses.
+  var extCorrect: int = 0
+  for var i: int = 0; i < totalSamples; i++ =>
+    var probs: double[] = model.forward(graphs[i], false).probs.toDoubles()
+    var predIdx: int = 0
+    for var j: int = 1; j < 3; j++ =>
+      if probs[j] > probs[predIdx] =>
+        predIdx = j
+    var trueIdx: int = 0
+    for var j: int = 1; j < 3; j++ =>
+      if labels[i * 3 + j] > labels[i * 3 + trueIdx] =>
+        trueIdx = j
+    if predIdx == trueIdx =>
+      extCorrect = extCorrect + 1
+  var expectedAccuracy: double = extCorrect.toDouble() / totalSamples.toDouble()
+
+  # ----- Assertions: scalars -----
+
+  assertEqualInt(result.epochs, epochs,
+    "result.epochs reflects the requested epoch count")
+
+  assertApproxDouble(result.weightSumIn, expectedWeightSum, 0.000000001,
+    "result.weightSumIn matches sum of caller weights")
+
+  assertApproxDouble(result.weightVarianceIn, expectedWeightVar, 0.000000001,
+    "result.weightVarianceIn matches population variance of caller weights")
+
+  assertTrue(result.weightVarianceIn > 0.0,
+    "weightVarianceIn > 0 for the mixed-magnitude weights array")
+
+  assertApproxDouble(result.inputMean, expectedInputMean, 0.000000001,
+    "result.inputMean matches externally computed mean of featuresHost")
+
+  assertApproxDouble(result.inputStd, expectedInputStd, 0.000000001,
+    "result.inputStd matches externally computed std of featuresHost")
+
+  assertApproxDouble(result.accuracy, expectedAccuracy, 0.000000001,
+    "result.accuracy matches an external forward-pass argmax count")
+
+  # ----- Assertions: per-parameter arrays -----
+
+  assertEqualInt(len(result.paramNormBefore), nParams,
+    "paramNormBefore length matches model.parameters() count")
+  assertEqualInt(len(result.paramNormAfter), nParams,
+    "paramNormAfter length matches model.parameters() count")
+  assertEqualInt(len(result.paramMaxAbsDelta), nParams,
+    "paramMaxAbsDelta length matches model.parameters() count")
+
+  for var i: int = 0; i < nParams; i++ =>
+    assertApproxDouble(result.paramNormBefore[i], expectedNormBefore[i], 0.000001,
+      $"paramNormBefore[{i}] matches external pre-train L2")
+    assertApproxDouble(result.paramNormAfter[i], expectedNormAfter[i], 0.000001,
+      $"paramNormAfter[{i}] matches external post-train L2")
+    assertApproxDouble(result.paramMaxAbsDelta[i], expectedMaxAbsDelta[i], 0.000001,
+      $"paramMaxAbsDelta[{i}] matches external max-abs-delta")
+
+  # ----- Assertions: trajectory shapes -----
+
+  assertEqualInt(len(result.lossCurve), epochs,
+    "lossCurve has one entry per epoch")
+  assertEqualInt(len(result.gradNormCurve), epochs,
+    "gradNormCurve has one entry per epoch")
+
+  for var e: int = 0; e < epochs; e++ =>
+    assertFalse(isNan(result.lossCurve[e]),
+      $"lossCurve[{e}] is not NaN")
+    assertFalse(isNan(result.gradNormCurve[e]),
+      $"gradNormCurve[{e}] is not NaN")
+
+  # The first epoch must have measurable parameter movement — gradients
+  # are flowing on the very first step. (Later epochs may converge and
+  # show very small movement; only assert on epoch 0.)
+  assertTrue(result.gradNormCurve[0] > 0.0,
+    $"gradNormCurve[0]={result.gradNormCurve[0]} > 0 (params actually moved on epoch 0)")
+
+  # The result.loss scalar should equal the last entry of the loss curve.
+  assertApproxDouble(result.loss, result.lossCurve[epochs - 1], 0.000000001,
+    "result.loss matches lossCurve[last]")
+
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

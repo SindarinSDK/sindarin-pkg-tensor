@@ -1,0 +1,220 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_predict_batch_and_divergence.sn — Phase F / §2.5
+#
+# Covers two additions in a single test binary:
+#
+# 1. distributionDivergence(a, b, kind: str) — free function in
+# src/tensor.sn, supports "l1", "l2", "kl", "js". Cross-checked
+# against hand-computed reference values.
+#
+# 2. Gnn.predictBatch(graphs: GraphTensors[]) — naive loop over
+# forward(g, false). Cross-checked against per-graph forward()
+# calls made the same way the method does internally.
+#
+# Both features are pure Sindarin — no new native code. This test
+# is the regression guard for §2.5 of docs/issues/golden-path.md.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn sn3(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 3),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 3
+  }
+
+# ---------------------------------------------------------------------------
+# Part 1 — distributionDivergence reference checks
+# ---------------------------------------------------------------------------
+
+fn testIdentityPairs(): void =>
+  println("--- Part 1a: identical distributions → all divergences are 0 ---")
+  var p: double[] = {0.5, 0.5}
+  var q: double[] = {0.5, 0.5}
+
+  assertApproxDouble(distributionDivergence(p, q, "l1"), 0.0, 0.0000000001,
+    "L1 divergence of identical distributions is 0")
+  assertApproxDouble(distributionDivergence(p, q, "l2"), 0.0, 0.0000000001,
+    "L2 divergence of identical distributions is 0")
+  assertApproxDouble(distributionDivergence(p, q, "kl"), 0.0, 0.0000000001,
+    "KL divergence of identical distributions is 0")
+  assertApproxDouble(distributionDivergence(p, q, "js"), 0.0, 0.0000000001,
+    "JS divergence of identical distributions is 0")
+
+  var p3: double[] = {0.2, 0.3, 0.5}
+  var q3: double[] = {0.2, 0.3, 0.5}
+  assertApproxDouble(distributionDivergence(p3, q3, "kl"), 0.0, 0.0000000001,
+    "KL divergence of identical 3-element distributions is 0")
+  assertApproxDouble(distributionDivergence(p3, q3, "js"), 0.0, 0.0000000001,
+    "JS divergence of identical 3-element distributions is 0")
+
+fn testDisjointOneHot(): void =>
+  println("--- Part 1b: disjoint one-hot distributions ---")
+  var p: double[] = {1.0, 0.0}
+  var q: double[] = {0.0, 1.0}
+
+  # L1 = |1-0| + |0-1| = 2
+  assertApproxDouble(distributionDivergence(p, q, "l1"), 2.0, 0.0000000001,
+    "L1 divergence of [1,0] vs [0,1] is 2.0")
+
+  # L2 = sqrt(1 + 1) = sqrt(2) ≈ 1.41421356
+  assertApproxDouble(distributionDivergence(p, q, "l2"), 1.41421356237, 0.0000001,
+    "L2 divergence of [1,0] vs [0,1] is sqrt(2)")
+
+  # JS (natural log) = ln(2) ≈ 0.69314718
+  # m = [0.5, 0.5]
+  # KL(p || m) = 1*ln(1/0.5) + 0 = ln(2)
+  # KL(q || m) = 0 + 1*ln(1/0.5) = ln(2)
+  # JS = 0.5*ln(2) + 0.5*ln(2) = ln(2)
+  assertApproxDouble(distributionDivergence(p, q, "js"), 0.69314718056, 0.000001,
+    "JS divergence of [1,0] vs [0,1] is ln(2)")
+
+fn testKnownPair(): void =>
+  println("--- Part 1c: known non-trivial pair ---")
+  var p: double[] = {0.8, 0.2}
+  var q: double[] = {0.6, 0.4}
+
+  # L1 = |0.8-0.6| + |0.2-0.4| = 0.2 + 0.2 = 0.4
+  assertApproxDouble(distributionDivergence(p, q, "l1"), 0.4, 0.0000000001,
+    "L1 divergence of [0.8,0.2] vs [0.6,0.4] is 0.4")
+
+  # L2 = sqrt(0.04 + 0.04) = sqrt(0.08) ≈ 0.28284271
+  assertApproxDouble(distributionDivergence(p, q, "l2"), 0.28284271247, 0.0000001,
+    "L2 divergence of [0.8,0.2] vs [0.6,0.4] is sqrt(0.08)")
+
+  # KL = 0.8*ln(0.8/0.6) + 0.2*ln(0.2/0.4)
+  # = 0.8*ln(1.3333) + 0.2*ln(0.5)
+  # ≈ 0.8*0.28768 + 0.2*(-0.69315)
+  # ≈ 0.23014 - 0.13863
+  # ≈ 0.09151
+  assertApproxDouble(distributionDivergence(p, q, "kl"), 0.09151, 0.0001,
+    "KL divergence of [0.8,0.2] vs [0.6,0.4] is ≈0.09151")
+
+fn testEmptyAndMismatched(): void =>
+  println("--- Part 1d: edge cases ---")
+  var empty: double[] = {}
+  var other: double[] = {}
+  assertApproxDouble(distributionDivergence(empty, other, "l1"), 0.0, 0.0000000001,
+    "Empty distributions return 0")
+
+  var p: double[] = {0.5, 0.5}
+  var q3: double[] = {0.3, 0.3, 0.4}
+  assertApproxDouble(distributionDivergence(p, q3, "l1"), 0.0, 0.0000000001,
+    "Mismatched-length distributions return 0")
+
+  assertApproxDouble(distributionDivergence(p, q3, "unknown"), 0.0, 0.0000000001,
+    "Unknown kind returns 0")
+
+# ---------------------------------------------------------------------------
+# Part 2 — Gnn.predictBatch cross-check against manual forward loop
+# ---------------------------------------------------------------------------
+
+fn testPredictBatch(): void =>
+  println("--- Part 2: Gnn.predictBatch matches manual forward loop ---")
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  # Build K graphs with distinct features
+  var graphs: GraphTensors[] = {
+    sn3({1.0, 0.0, 0.0}),
+    sn3({0.0, 1.0, 0.0}),
+    sn3({0.0, 0.0, 1.0}),
+    sn3({0.5, 0.3, 0.2})
+  }
+
+  # predictBatch vs manual forward loop
+  var batchOut: GnnOutput[] = model.predictBatch(graphs)
+
+  assertEqualInt(len(batchOut), len(graphs),
+    "predictBatch returns one GnnOutput per input graph")
+
+  for var i: int = 0; i < len(graphs); i++ =>
+    var manual: double[] = model.forward(graphs[i], false).probs.toDoubles()
+    var batch: double[] = batchOut[i].probs.toDoubles()
+
+    assertEqualInt(len(manual), len(batch),
+      $"predictBatch[{i}].probs has same length as forward().probs")
+
+    for var j: int = 0; j < len(manual); j++ =>
+      assertApproxDouble(batch[j], manual[j], 0.000000001,
+        $"predictBatch[{i}].probs[{j}] matches manual forward() to 1e-9")
+
+# ---------------------------------------------------------------------------
+# Part 3 — distributionDivergence over predictBatch outputs (integration)
+# ---------------------------------------------------------------------------
+
+fn testPredictBatchWithDivergence(): void =>
+  println("--- Part 3: distributionDivergence over predictBatch outputs ---")
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  var graphs: GraphTensors[] = {
+    sn3({1.0, 0.0, 0.0}),
+    sn3({0.0, 1.0, 0.0})
+  }
+
+  var out: GnnOutput[] = model.predictBatch(graphs)
+  var a: double[] = out[0].probs.toDoubles()
+  var b: double[] = out[1].probs.toDoubles()
+
+  # Sanity: JS divergence of a distribution with itself is 0.
+  assertApproxDouble(distributionDivergence(a, a, "js"), 0.0, 0.0000000001,
+    "JS(a, a) over real model output is 0")
+
+  # Sanity: L1 divergence between two real distributions is >= 0
+  # and L1(a,b) == L1(b,a).
+  var l1ab: double = distributionDivergence(a, b, "l1")
+  var l1ba: double = distributionDivergence(b, a, "l1")
+  assertTrue(l1ab >= 0.0, $"L1(a, b) = {l1ab} >= 0")
+  assertApproxDouble(l1ab, l1ba, 0.000000001, "L1 is symmetric")
+
+  # Sanity: JS is symmetric.
+  var jsab: double = distributionDivergence(a, b, "js")
+  var jsba: double = distributionDivergence(b, a, "js")
+  assertApproxDouble(jsab, jsba, 0.000000001, "JS is symmetric")
+
+  # Upper bound: JS with natural log is bounded by ln(2).
+  assertTrue(jsab <= 0.69314718056 + 0.0000001,
+    $"JS(a, b) = {jsab} <= ln(2)")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_predict_batch_and_divergence — Phase F (§2.5) ===")
+  println("")
+  testIdentityPairs()
+  println("")
+  testDisjointOneHot()
+  println("")
+  testKnownPair()
+  println("")
+  testEmptyAndMismatched()
+  println("")
+  testPredictBatch()
+  println("")
+  testPredictBatchWithDivergence()
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

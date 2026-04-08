@@ -24,6 +24,8 @@
 @link pthread
 @source "tensor.sn.c"
 
+import "sindarin-pkg-sdk/src/core/math"
+
 # ---------------------------------------------------------------------------
 # Opaque tensor handle
 # ---------------------------------------------------------------------------
@@ -159,10 +161,37 @@ native fn sn_graph_input(rows: int, cols: int): Tensor
 native fn sn_graph_input_data(data: double[], rows: int, cols: int): Tensor
 native fn sn_graph_param(t: Tensor): Tensor
 native fn sn_graph_compute_loss(t: Tensor): double
-native fn sn_graph_train(output: Tensor, input: Tensor, data: double[], labels: double[], nsamples: int, epochs: int, batchSize: int, valSplit: double, lossType: str, optimizer: str, lr: double, wd: double): double
-native fn sn_graph_train_loss(): double
-native fn sn_graph_train_accuracy(): double
-native fn sn_graph_train_ndata(): int
+
+# ---------------------------------------------------------------------------
+# Phase J: training metric callback (§4.2 of docs/issues/golden-path.md)
+#
+# Register a Sindarin lambda that receives (metric_name, value) pairs
+# emitted during Gnn.train(). Use for continuous metric streaming into
+# a consumer-side MetricsClient.
+#
+# Deviation from §4.2's doc spec: the doc called for
+# fn(name: str, value: double, labels: StringField[]): void
+# but StringField is not yet in the SDK. This two-arg form is the
+# stable subset — callers can pack label values into the metric name
+# ("param_norm_before/layer_0/weight") until the full form lands.
+#
+# Emitted metrics in this release:
+# - "train_loss"           (per-epoch, matches TrainResult.lossCurve[e])
+# - "grad_norm_l2"         (per-epoch, matches TrainResult.gradNormCurve[e])
+# - "weight_sum_in"        (once per train)
+# - "weight_variance_in"   (once per train)
+# - "input_mean"           (once per train)
+# - "input_std"            (once per train)
+# - "accuracy"             (once per train)
+# - "param_norm_before/{i}"    (one per parameter)
+# - "param_norm_after/{i}"     (one per parameter)
+# - "param_max_abs_delta/{i}"  (one per parameter)
+#
+# The callback is deep-copied on registration and survives across
+# multiple train() calls until explicitly cleared.
+native fn sn_graph_set_train_metric_callback(cb: fn(str, double): void): void
+native fn sn_graph_clear_train_metric_callback(): void
+native fn sn_graph_emit_train_metric(name: str, value: double): void
 
 # Per-epoch training driver. Lazy-initializes a static-graph ggml_opt
 # context on the first call within a sn_graph_begin/end cycle, runs one
@@ -219,12 +248,47 @@ struct Optimizer =>
 
 # ---------------------------------------------------------------------------
 # Training result
+#
+# Returned by Gnn.train(). Top-line scalars (loss, accuracy, epochs) are
+# the headline values; the *Curve / *Norm* / *Delta arrays are the
+# Phase C "Bug B4" diagnostics from docs/issues/golden-path.md §2.4 and
+# Part 7. Use them to detect:
+#
+# - Loss diverging or NaNing            -> lossCurve
+# - Optimizer not moving the params     -> gradNormCurve, paramMaxAbsDelta
+# - Garbage in / garbage out            -> inputMean, inputStd
+# - Caller dropped the weight vector    -> weightSumIn, weightVarianceIn
+# - Bug B3 weight-update regression     -> paramNormBefore vs paramNormAfter
+#
+# All Per-parameter arrays (paramNorm*, paramMaxAbsDelta) are indexed in
+# the same order as Gnn.parameters() returns them.
+#
+# Semantic note on `loss`: this is the FINAL EPOCH average loss (the
+# tail of lossCurve), not the across-epoch average. Use lossCurve for
+# the full trajectory.
+#
+# Semantic note on `gradNormCurve`: this is the per-epoch L2 of the
+# parameter DELTA, i.e. L2(params_after_epoch - params_before_epoch).
+# For AdamW this is proportional to the optimizer's effective step
+# magnitude over the epoch (lr * L2(sum_of_adamw_steps)). It is not
+# the L2 of the raw gradient. Both answer the same diagnostic
+# question — "is the model moving?" — and the param-delta form is
+# robust against ggml zeroing the .grad field after backward.
 # ---------------------------------------------------------------------------
 
 struct TrainResult =>
   loss: double
   accuracy: double
   epochs: int
+  lossCurve: double[]
+  gradNormCurve: double[]
+  paramNormBefore: double[]
+  paramNormAfter: double[]
+  paramMaxAbsDelta: double[]
+  weightSumIn: double
+  weightVarianceIn: double
+  inputMean: double
+  inputStd: double
 
 # ---------------------------------------------------------------------------
 # Graph-to-tensor conversion (for GNN input)
@@ -328,3 +392,88 @@ fn batchGraphs(graphs: GraphTensors[]): GraphTensors =>
     numEdges: totalEdges,
     featureDim: featureDim
   }
+
+# ---------------------------------------------------------------------------
+# Distribution divergence — compare two discrete probability distributions.
+#
+# Phase F (§2.5 of docs/issues/golden-path.md): generic metric function
+# callers can use to quantify "how different are these two predictions"
+# without rolling their own implementation. The canonical consumer is
+# skynet's canonical-pair JSD probe, which runs forward() on two fixed
+# graphs and reports the divergence between the resulting action
+# distributions as a learning-progress signal.
+#
+# Inputs:
+# a, b   — same-length double[] containing the two distributions
+# kind   — one of "l1", "l2", "kl", "js"
+#
+# Semantics:
+# "l1" : sum_i |a[i] - b[i]|
+# "l2" : sqrt(sum_i (a[i] - b[i])^2)
+# "kl" : Kullback-Leibler KL(a || b) = sum_i a[i] * log(a[i] / b[i])
+# Uses natural log. Terms where a[i] == 0 are skipped (0*log0=0).
+# A tiny epsilon floor is applied to b[i] to avoid log(0) when
+# b has exact zeros — in that regime KL is formally infinite,
+# but returning a large finite value is more useful for a
+# metric consumer than crashing.
+# "js" : Jensen-Shannon divergence
+# JSD(a, b) = 0.5*KL(a || m) + 0.5*KL(b || m)  where m = (a+b)/2
+# Uses natural log (so the maximum for disjoint distributions
+# is ln(2) ≈ 0.693, not 1). Symmetric, always finite.
+#
+# The function is pure Sindarin — no FFI, no tensor allocation. Cheap
+# to call in a tight loop.
+#
+# Unknown `kind` strings return 0.0.
+# ---------------------------------------------------------------------------
+fn distributionDivergence(a: double[], b: double[], kind: str): double =>
+  var n: int = len(a)
+  if n == 0 || len(b) != n =>
+    return 0.0
+
+  if kind == "l1" =>
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var d: double = a[i] - b[i]
+      if d < 0.0 =>
+        d = -d
+      s = s + d
+    return s
+
+  if kind == "l2" =>
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var d: double = a[i] - b[i]
+      s = s + d * d
+    return sqrt(s)
+
+  if kind == "kl" =>
+    var eps: double = 0.000000000001
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      if a[i] > 0.0 =>
+        var bi: double = b[i]
+        if bi < eps =>
+          bi = eps
+        s = s + a[i] * log(a[i] / bi)
+    return s
+
+  if kind == "js" =>
+    var eps: double = 0.000000000001
+    var klAm: double = 0.0
+    var klBm: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var m: double = (a[i] + b[i]) * 0.5
+      if a[i] > 0.0 =>
+        var md: double = m
+        if md < eps =>
+          md = eps
+        klAm = klAm + a[i] * log(a[i] / md)
+      if b[i] > 0.0 =>
+        var md2: double = m
+        if md2 < eps =>
+          md2 = eps
+        klBm = klBm + b[i] * log(b[i] / md2)
+    return 0.5 * klAm + 0.5 * klBm
+
+  return 0.0

@@ -16,6 +16,7 @@
 
 import "./tensor"
 import "sindarin-pkg-sdk/src/core/random"
+import "sindarin-pkg-sdk/src/core/math"
 
 # ---------------------------------------------------------------------------
 # GNN configuration
@@ -111,7 +112,15 @@ struct GnnLayer =>
 
   fn sageForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     var agg: Tensor = x.aggregate(edgeIndex, edgeWeight, "mean")
-    var h: Tensor = agg.matmul(self.weight).add(self.bias)
+    # NOTE: must use gnnMatmul, not matmul. Weight is stored in GNN
+    # layout (ne0=inputDim, ne1=outputDim), which sn_tensor_matmul's
+    # host-side pre-transpose misinterprets — it both (a) garbles the
+    # weight shape (produces (inputDim, numNodes) instead of
+    # (outputDim, numNodes), so the subsequent .add(bias) broadcast
+    # fails) and (b) disconnects gradients via the pool-slot copy
+    # (Bug B3 in docs/issues/weight-update-failure.md). gnnMatmul
+    # consumes the weight PARAM tensor directly.
+    var h: Tensor = agg.gnnMatmul(self.weight).add(self.bias)
     h = h.relu().dropout(self.dropoutRate, training)
     if self.inputDim == self.outputDim =>
       h = h.add(x)
@@ -224,6 +233,24 @@ struct Gnn =>
       embedding: embedding
     }
 
+  # Predict on a list of graphs in inference mode. Equivalent to calling
+  # forward(g, false) on each input, returned in input order.
+  #
+  # Phase F (§2.5 of docs/issues/golden-path.md): the canonical
+  # consumer is skynet's canonical-pair probe, which predicts on two
+  # fixed graphs each cycle and reports distributionDivergence()
+  # between the resulting action distributions as a learning-progress
+  # signal. The naive loop form is intentional — no internal
+  # checkpoint/restore, because the caller needs the returned
+  # GnnOutput Tensors to stay valid until they are read. Callers
+  # concerned about pool growth can call `reset()` after extracting
+  # the probabilities they need via `.probs.toDoubles()`.
+  fn predictBatch(graphs: GraphTensors[]): GnnOutput[] =>
+    var out: GnnOutput[] = {}
+    for var i: int = 0; i < len(graphs); i++ =>
+      out.push(self.forward(graphs[i], false))
+    return out
+
   fn parameters(): Tensor[] =>
     var params: Tensor[] = {}
     for var i: int = 0; i < len(self.layers); i++ =>
@@ -312,10 +339,24 @@ struct Gnn =>
     valSplit: double, seed: long): TrainResult =>
 
     if len(graphs) == 0 || epochs <= 0 || batchSize <= 0 =>
+      var emptyD: double[] = {}
+      var emptyD2: double[] = {}
+      var emptyD3: double[] = {}
+      var emptyD4: double[] = {}
+      var emptyD5: double[] = {}
       return TrainResult {
         loss: 0.0,
         accuracy: 0.0,
-        epochs: 0
+        epochs: 0,
+        lossCurve: emptyD,
+        gradNormCurve: emptyD2,
+        paramNormBefore: emptyD3,
+        paramNormAfter: emptyD4,
+        paramMaxAbsDelta: emptyD5,
+        weightSumIn: 0.0,
+        weightVarianceIn: 0.0,
+        inputMean: 0.0,
+        inputStd: 0.0
       }
 
     var totalSamples: int = len(graphs)
@@ -451,6 +492,37 @@ struct Gnn =>
     for var i: int = 0; i < batchSize; i++ =>
       initWeights.push(0.0)
 
+    # --- Phase C diagnostics: input + weight statistics over the
+    # exact host buffers that will be uploaded to the model. Computed
+    # BEFORE record mode opens, so the work doesn't pollute the
+    # recorded graph.
+    var inputMean: double = 0.0
+    var inputStd: double = 0.0
+    var nFeat: int = len(featuresHost)
+    if nFeat > 0 =>
+      var sumIn: double = 0.0
+      for var i: int = 0; i < nFeat; i++ =>
+        sumIn = sumIn + featuresHost[i]
+      inputMean = sumIn / nFeat.toDouble()
+      var sqDiff: double = 0.0
+      for var i: int = 0; i < nFeat; i++ =>
+        var d: double = featuresHost[i] - inputMean
+        sqDiff = sqDiff + d * d
+      inputStd = sqrt(sqDiff / nFeat.toDouble())
+
+    var weightSumIn: double = 0.0
+    var weightVarianceIn: double = 0.0
+    var nW: int = len(weights)
+    if nW > 0 =>
+      for var i: int = 0; i < nW; i++ =>
+        weightSumIn = weightSumIn + weights[i]
+      var wMean: double = weightSumIn / nW.toDouble()
+      var wSqDiff: double = 0.0
+      for var i: int = 0; i < nW; i++ =>
+        var d: double = weights[i] - wMean
+        wSqDiff = wSqDiff + d * d
+      weightVarianceIn = wSqDiff / nW.toDouble()
+
     # --- Begin record mode and build the static training graph.
     sn_graph_begin()
 
@@ -458,6 +530,31 @@ struct Gnn =>
     var params: Tensor[] = self.parameters()
     for var i: int = 0; i < len(params); i++ =>
       sn_graph_param(params[i])
+
+    # --- Phase C: snapshot per-parameter pre-train state for the
+    # paramNorm* / paramMaxAbsDelta / gradNormCurve diagnostics.
+    #
+    # initialData[i] is the t=0 elementwise snapshot, used at end of
+    # train() to compute paramMaxAbsDelta against the absolute drift
+    # over the whole call.
+    #
+    # rollingData[i] holds the previous-epoch elementwise snapshot
+    # and gets overwritten each epoch so gradNormCurve can measure
+    # L2(params_after_epoch - params_before_epoch) — the true
+    # per-epoch parameter delta. An earlier revision used a flat
+    # double[] of L2 norms instead as a workaround for
+    # docs/issues/compiler-problems.31.md issue #50 (refcount
+    # double-free on double[][] element reassignment); that bug has
+    # since been fixed upstream.
+    var nParams: int = len(params)
+    var initialData: double[][] = {}
+    var rollingData: double[][] = {}
+    var paramNormBefore: double[] = {}
+    for var i: int = 0; i < nParams; i++ =>
+      var snap: double[] = params[i].toDoubles()
+      initialData.push(snap)
+      rollingData.push(snap)
+      paramNormBefore.push(params[i].norm())
 
     var nodeFeaturesInput: Tensor = sn_graph_input_data(
       initFeatures, nodesPerBatch, featureDim)
@@ -509,7 +606,8 @@ struct Gnn =>
       perm.push((cyc % totalSamples).toDouble())
       cyc = cyc + 1
 
-    var totalLoss: double = 0.0
+    var lossCurve: double[] = {}
+    var gradNormCurve: double[] = {}
     var epsAdam: double = 0.00000001
 
     # The `using` block scopes the xoshiro256 state buffer to the
@@ -540,14 +638,100 @@ struct Gnn =>
           optimizer.learningRate,
           optimizer.beta1, optimizer.beta2, epsAdam,
           optimizer.weightDecay)
-        totalLoss = totalLoss + epochLoss
+        lossCurve.push(epochLoss)
 
-    var avgLoss: double = totalLoss / epochs.toDouble()
+        # --- Phase J: emit per-epoch train_loss to the metric callback.
+        sn_graph_emit_train_metric("train_loss", epochLoss)
+
+        # --- Phase C: per-epoch param-delta L2 norm.
+        # gradNormCurve[epoch] = L2(params_after_epoch -
+        # params_before_epoch). For AdamW this is proportional to
+        # the optimizer's effective step magnitude over the epoch
+        # (lr * L2(sum_of_adamw_steps)). Robust against ggml zeroing
+        # .grad post-backward — we measure movement on the parameter
+        # tensors directly via the pool-slot snapshots.
+        var deltaSqEpoch: double = 0.0
+        for var i: int = 0; i < nParams; i++ =>
+          var curr: double[] = params[i].toDoubles()
+          for var j: int = 0; j < len(curr); j++ =>
+            var dd: double = curr[j] - rollingData[i][j]
+            deltaSqEpoch = deltaSqEpoch + dd * dd
+          rollingData[i] = curr
+        var gradThisEpoch: double = sqrt(deltaSqEpoch)
+        gradNormCurve.push(gradThisEpoch)
+
+        # --- Phase J: emit per-epoch grad_norm_l2 to the metric callback.
+        sn_graph_emit_train_metric("grad_norm_l2", gradThisEpoch)
 
     sn_graph_end()
 
+    # --- Phase C: post-train per-parameter snapshots.
+    # paramMaxAbsDelta is computed against initialData (the t=0
+    # snapshot), so it reflects total drift over the whole train()
+    # call, not just the last epoch.
+    var paramNormAfter: double[] = {}
+    var paramMaxAbsDelta: double[] = {}
+    for var i: int = 0; i < nParams; i++ =>
+      paramNormAfter.push(params[i].norm())
+      var curr: double[] = params[i].toDoubles()
+      var m: double = 0.0
+      for var j: int = 0; j < len(curr); j++ =>
+        var dd: double = curr[j] - initialData[i][j]
+        if dd < 0.0 =>
+          dd = -dd
+        if dd > m =>
+          m = dd
+      paramMaxAbsDelta.push(m)
+
+    # --- Phase C: training-set accuracy after the final epoch.
+    # Eager-mode forward over each training graph, count argmax
+    # matches against the one-hot labels. Runs OUTSIDE the recorded
+    # graph because the param pool slots have been read back from
+    # the trained backend buffers.
+    var correct: int = 0
+    for var i: int = 0; i < totalSamples; i++ =>
+      var probs: double[] = self.forward(graphs[i], false).probs.toDoubles()
+      var predIdx: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if probs[j] > probs[predIdx] =>
+          predIdx = j
+      var trueIdx: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if labels[i * numClasses + j] > labels[i * numClasses + trueIdx] =>
+          trueIdx = j
+      if predIdx == trueIdx =>
+        correct = correct + 1
+    var accuracy: double = correct.toDouble() / totalSamples.toDouble()
+
+    # --- Final scalar loss = last-epoch loss (per golden-path §2.4
+    # "final training loss"). Use lossCurve for the full trajectory.
+    var finalLoss: double = lossCurve[len(lossCurve) - 1]
+
+    # --- Phase J: post-train scalar and per-parameter emissions.
+    # These fire once per train() call, after all epoch metrics have
+    # been streamed. The consumer can reconstruct the full TrainResult
+    # contents purely from the callback stream if they want to.
+    sn_graph_emit_train_metric("weight_sum_in", weightSumIn)
+    sn_graph_emit_train_metric("weight_variance_in", weightVarianceIn)
+    sn_graph_emit_train_metric("input_mean", inputMean)
+    sn_graph_emit_train_metric("input_std", inputStd)
+    sn_graph_emit_train_metric("accuracy", accuracy)
+    for var i: int = 0; i < nParams; i++ =>
+      sn_graph_emit_train_metric($"param_norm_before/{i}", paramNormBefore[i])
+      sn_graph_emit_train_metric($"param_norm_after/{i}", paramNormAfter[i])
+      sn_graph_emit_train_metric($"param_max_abs_delta/{i}", paramMaxAbsDelta[i])
+
     return TrainResult {
-      loss: avgLoss,
-      accuracy: 0.0, # TODO: compute in 2c.5 with full TrainResult diagnostics
-      epochs: epochs
+      loss: finalLoss,
+      accuracy: accuracy,
+      epochs: epochs,
+      lossCurve: lossCurve,
+      gradNormCurve: gradNormCurve,
+      paramNormBefore: paramNormBefore,
+      paramNormAfter: paramNormAfter,
+      paramMaxAbsDelta: paramMaxAbsDelta,
+      weightSumIn: weightSumIn,
+      weightVarianceIn: weightVarianceIn,
+      inputMean: inputMean,
+      inputStd: inputStd
     }

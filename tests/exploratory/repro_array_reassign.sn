@@ -1,0 +1,24 @@
+# Regression guard for compiler-problems.31 issue #50 (RESOLVED).
+#
+# Historical: `arr2d[i] = curr` reassignment of a heap-allocated
+# double[] element in a double[][] crashed at scope exit during
+# refcount cleanup. The subscript-assign emitted a raw pointer store
+# with no release(old) / retain(new), so the destructor for arr2d
+# and the autocleanup for `curr` both freed the same SnArray.
+#
+# This file is kept as a regression guard: compile, run, expect
+# exit 0. If this ever reverts to exit 139 the codegen fix for
+# refcounted T[][] subscript-assign has regressed.
+#
+# No tensor package, no native code, no record mode involved.
+
+fn main(): void =>
+  println("=== compiler-problems.31 regression guard ===")
+
+  var arr2d: double[][] = {}
+  arr2d.push({0.0, 0.0, 0.0})
+
+  var curr: double[] = {1.0, 2.0, 3.0}
+  arr2d[0] = curr
+
+  println($"  done, len={len(arr2d)}")

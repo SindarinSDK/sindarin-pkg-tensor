@@ -1,0 +1,143 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_weighted_loss.sn â€” Bug B2 behavioural regression guard (Part 3 Test 1)
+#
+# Verifies that per-sample weights actually steer the gradient. Two
+# training graphs with disjoint correct actions are presented to the same
+# model, but with the per-sample weight vector zeroing one of them out.
+# The model must learn ONLY the action whose sample carried positive
+# weight; the zero-weighted sample contributes no gradient and never
+# teaches the model its label.
+#
+# Setup (mirroring docs/issues/golden-path.md Part 3 Test 1):
+# - Graph A: 1 node, features [1, 0, 0], label [1, 0, 0] (action 0)
+# - Graph B: 1 node, features [0, 1, 0], label [0, 0, 1] (action 2)
+#
+# Two training runs:
+# - Run 1: weights [10.0, 0.0]. Only Graph A teaches the model.
+# - Run 2: weights [0.0, 10.0]. Only Graph B teaches the model.
+#
+# Assertions per the doc:
+# Run 1
+# - forward(GraphA).probs[0] > 0.7 â€” Graph A learned its action.
+# - forward(GraphB).probs[0] > 0.5 â€” Graph B's training was
+# zero-weighted, so the model never learned action 2 and the
+# classifier bias drift from learning A makes action 0 the most
+# confident prediction even for B's features.
+# Run 2 (symmetric)
+# - forward(GraphB).probs[2] > 0.7
+# - Graph A is NOT required to predict 0 (its training was
+# zero-weighted; we only check that Run 2 differs from Run 1).
+#
+# If Bug B2 regresses (weights silently ignored or default-1.0'd) both
+# runs would produce identical models â€” both samples got equal effective
+# weight â€” and the asymmetric assertions would not hold.
+#
+# NOTE: weightSumIn / weightVarianceIn assertions from the doc are
+# deferred to Phase C of the golden-path plan, when TrainResult grows
+# those fields. They are tracked in test_train_result_diagnostics.sn.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn singleNode(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 3),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 3
+  }
+
+fn makeModel(): Gnn =>
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  return Gnn.createWithSeed(config, 42l)
+
+fn trainOnce(model: Gnn, weights: double[]): TrainResult =>
+  var graphA: GraphTensors = singleNode({1.0, 0.0, 0.0})
+  var graphB: GraphTensors = singleNode({0.0, 1.0, 0.0})
+  var trainGraphs: GraphTensors[] = {graphA, graphB}
+  var labels: double[] = {
+    1.0, 0.0, 0.0, # Graph A â † ’ action 0
+    0.0, 0.0, 1.0 # Graph B â † ’ action 2
+  }
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  return model.train(trainGraphs, labels, weights, opt, 200, 2, 0.0, 42l)
+
+# ---------------------------------------------------------------------------
+# Run 1 â€” heavy weight on Graph A, zero on Graph B
+# ---------------------------------------------------------------------------
+
+fn run1(): void =>
+  println("--- Run 1: weights [10.0, 0.0] (only A teaches) ---")
+  var model: Gnn = makeModel()
+  var result: TrainResult = trainOnce(model, {10.0, 0.0})
+  println($"  loss={result.loss}")
+
+  var graphA: GraphTensors = singleNode({1.0, 0.0, 0.0})
+  var graphB: GraphTensors = singleNode({0.0, 1.0, 0.0})
+
+  var probsA: double[] = model.forward(graphA, false).probs.toDoubles()
+  var probsB: double[] = model.forward(graphB, false).probs.toDoubles()
+
+  println($"  graphA probs=[{probsA[0]}, {probsA[1]}, {probsA[2]}]")
+  println($"  graphB probs=[{probsB[0]}, {probsB[1]}, {probsB[2]}]")
+
+  assertTrue(probsA[0] > 0.7,
+    $"run1 graphA should predict action 0 with prob > 0.7 (got {probsA[0]})")
+  assertTrue(probsB[0] > 0.5,
+    $"run1 graphB should predict action 0 with prob > 0.5 (zero-weighted; never learned action 2) (got {probsB[0]})")
+
+# ---------------------------------------------------------------------------
+# Run 2 â€” heavy weight on Graph B, zero on Graph A (symmetric to Run 1)
+# ---------------------------------------------------------------------------
+
+fn run2(): void =>
+  println("--- Run 2: weights [0.0, 10.0] (only B teaches) ---")
+  var model: Gnn = makeModel()
+  var result: TrainResult = trainOnce(model, {0.0, 10.0})
+  println($"  loss={result.loss}")
+
+  var graphA: GraphTensors = singleNode({1.0, 0.0, 0.0})
+  var graphB: GraphTensors = singleNode({0.0, 1.0, 0.0})
+
+  var probsA: double[] = model.forward(graphA, false).probs.toDoubles()
+  var probsB: double[] = model.forward(graphB, false).probs.toDoubles()
+
+  println($"  graphA probs=[{probsA[0]}, {probsA[1]}, {probsA[2]}]")
+  println($"  graphB probs=[{probsB[0]}, {probsB[1]}, {probsB[2]}]")
+
+  assertTrue(probsB[2] > 0.7,
+    $"run2 graphB should predict action 2 with prob > 0.7 (got {probsB[2]})")
+  # Graph A is intentionally unconstrained â€” its training contributed
+  # nothing, so its post-train prediction depends on bias drift toward
+  # action 2. We assert only that the Run-2 model is NOT identical to a
+  # uniform-init model (i.e. it actually trained on something) by
+  # requiring action 2's probability for Graph A to be the largest.
+  assertTrue(probsA[2] >= probsA[0] && probsA[2] >= probsA[1],
+    $"run2 graphA should reflect classifier drift toward action 2 (probs=[{probsA[0]}, {probsA[1]}, {probsA[2]}])")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_weighted_loss â€” Bug B2 behavioural guard ===")
+  println("")
+  run1()
+  println("")
+  run2()
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

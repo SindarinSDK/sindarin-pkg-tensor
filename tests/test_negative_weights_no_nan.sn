@@ -71,9 +71,8 @@ fn buildGraph(numNodes: int, classIdx: int, sampleIdx: int): GraphTensors =>
     numNodes: numNodes, numEdges: ne, featureDim: featureDim
   }
 
-# Check for NaN by abusing the property that NaN != NaN.
-fn isNan(x: double): bool =>
-  return x != x
+# isNan is provided transitively via sindarin-pkg-sdk/src/core/math
+# (imported by ../src/gnn).
 
 fn main(): void =>
   println("=== test_negative_weights_no_nan ===")

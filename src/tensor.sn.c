@@ -399,7 +399,7 @@ RtTensor *sn_graph_param(RtTensor *rt) {
     ggml_set_name(gt, "param");
     ggml_set_input(gt);
     ggml_set_param(gt);
-    /* Data uploaded after ggml_backend_alloc_ctx_tensors in sn_graph_train */
+    /* Data uploaded after ggml_backend_alloc_ctx_tensors in sn_graph_train_epoch */
     g_record_map[idx] = gt;
     return rt;
 }
@@ -407,167 +407,69 @@ RtTensor *sn_graph_param(RtTensor *rt) {
 /* Custom optimizer params callback — returns user-configured lr/wd */
 static struct ggml_opt_optimizer_params g_opt_params;
 
-/* Cached training stats from last sn_graph_train call */
-static double g_train_loss     = 0.0;
-static double g_train_accuracy = 0.0;
-static long long g_train_ndata = 0;
-
 static struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata) {
     (void)userdata;
     return g_opt_params;
 }
 
-double sn_graph_train(RtTensor *output_rt, RtTensor *input_rt,
-                      SnArray *data_arr, SnArray *label_arr,
-                      long long nsamples, long long nepochs,
-                      long long nbatch, double val_split,
-                      char *loss_type_str, char *optimizer_str,
-                      double lr, double wd)
+/* ============================================================================
+ * Phase J: training metric callback
+ *
+ * Consumers (skynet's MetricsClient) register a Sindarin lambda via
+ * sn_graph_set_train_metric_callback. During Gnn.train() the package
+ * emits (name, value) pairs via sn_graph_emit_train_metric, which
+ * invokes the registered closure if one is set.
+ *
+ * Closure ABI is copied from sindarin-pkg-threads/src/threads_internal.h:
+ *   [0]              void *fn       — function pointer
+ *   [sizeof(ptr)]    size_t size    — total closure bytes
+ *   [ptr+size_t]     void *cleanup  — cleanup pointer (zero on copies)
+ *   [...]            captured vars
+ *
+ * The callback is deep-copied on registration so it survives across
+ * begin/end cycles and multiple train() invocations. Registering a new
+ * callback frees the previously stored one. Clearing with
+ * sn_graph_clear_train_metric_callback frees and nulls the slot.
+ * ============================================================================ */
+
+static void *g_train_metric_cb = NULL;
+
+static void *sn_tensor_closure_copy(void *closure)
 {
-    if (!g_record_mode || !g_record_ctx) return -1.0;
-    struct ggml_tensor *outputs = rec_tensor(output_rt);
-    struct ggml_tensor *inputs  = rec_tensor(input_rt);
-    if (!outputs || !inputs) return -1.0;
-    ggml_set_output(outputs);
-
-    int64_t ne_datapoint = inputs->ne[0];
-    int64_t ne_label     = outputs->ne[0];
-
-    ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
-        GGML_TYPE_F32, GGML_TYPE_F32, ne_datapoint, ne_label, nsamples, 1);
-
-    struct ggml_tensor *dd = ggml_opt_dataset_data(dataset);
-    struct ggml_tensor *dl = ggml_opt_dataset_labels(dataset);
-    long long dlen = sn_array_length(data_arr);
-    long long llen = sn_array_length(label_arr);
-    for (long long i = 0; i < dlen && i < ne_datapoint * nsamples; i++) {
-        double *v = (double *)sn_array_get(data_arr, i);
-        ((float *)dd->data)[i] = (float)(*v);
-    }
-    for (long long i = 0; i < llen && i < ne_label * nsamples; i++) {
-        double *v = (double *)sn_array_get(label_arr, i);
-        ((float *)dl->data)[i] = (float)(*v);
-    }
-
-    enum ggml_opt_loss_type loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
-    if (strcmp(loss_type_str, "mse") == 0) loss_type = GGML_OPT_LOSS_TYPE_MEAN_SQUARED_ERROR;
-
-    enum ggml_opt_optimizer_type opt_type = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
-    if (strcmp(optimizer_str, "sgd") == 0) opt_type = GGML_OPT_OPTIMIZER_TYPE_SGD;
-
-    /* Configure optimizer params from user-provided lr/wd */
-    g_opt_params = ggml_opt_get_default_optimizer_params(NULL);
-    g_opt_params.adamw.alpha = (float)lr;
-    g_opt_params.adamw.wd    = (float)wd;
-    g_opt_params.sgd.alpha   = (float)lr;
-    g_opt_params.sgd.wd      = (float)wd;
-
-    ggml_backend_t backends[] = { g_backend };
-    /* Use a reasonable graph size upper bound instead of SN_TENSOR_MAX.
-     * SN_TENSOR_MAX (65536) caused scheduler pre-allocation to exhaust ggml
-     * backend memory after prior tensor operations fragmented the heap. */
-    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 1, 4096, false, false);
-
-    /* Allocate backend buffers for all tensors in param context */
-    ggml_backend_buffer_t param_buf = ggml_backend_alloc_ctx_tensors(g_param_ctx, g_backend);
-
-    /* Upload data from pool to backend buffers for all mapped param-ctx tensors */
-    for (int i = 0; i < g_pool_count; i++) {
-        struct ggml_tensor *gt = g_record_map[i];
-        if (gt && gt->buffer && g_pool[i].data) {
-            ggml_backend_tensor_set(gt, g_pool[i].data, 0,
-                                    ggml_nbytes(gt) < (size_t)g_pool[i].n_elem * sizeof(float)
-                                    ? ggml_nbytes(gt)
-                                    : (size_t)g_pool[i].n_elem * sizeof(float));
-        }
-    }
-
-    /* Use lower-level ggml_opt API instead of ggml_opt_fit so we can
-     * capture the final training loss (ggml_opt_fit discards it). */
-    int64_t nbatch_physical = inputs->ne[1];
-    int64_t opt_period = nbatch / nbatch_physical;
-    if (opt_period < 1) opt_period = 1;
-    int64_t nbatches_logical = nsamples / nbatch;
-    int64_t ibatch_split = (int64_t)((1.0f - (float)val_split) * nbatches_logical) * opt_period;
-    int64_t idata_split = ibatch_split * nbatch_physical;
-
-    int64_t epoch_counter = 1;
-    struct ggml_opt_params opt_params_s = ggml_opt_default_params(sched, loss_type);
-    opt_params_s.ctx_compute     = g_compute_ctx;
-    opt_params_s.inputs          = inputs;
-    opt_params_s.outputs         = outputs;
-    opt_params_s.opt_period      = opt_period;
-    opt_params_s.get_opt_pars    = sn_get_opt_params;
-    opt_params_s.get_opt_pars_ud = &epoch_counter;
-    opt_params_s.optimizer       = opt_type;
-    ggml_opt_context_t opt_ctx = ggml_opt_init(opt_params_s);
-
-    if (nbatch < nsamples) {
-        ggml_opt_dataset_shuffle(opt_ctx, dataset, -1);
-    }
-
-    ggml_opt_result_t result_train = ggml_opt_result_init();
-    ggml_opt_result_t result_val   = ggml_opt_result_init();
-
-    for (; epoch_counter <= nepochs; ++epoch_counter) {
-        if (nbatch < idata_split) {
-            ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
-        }
-        ggml_opt_result_reset(result_train);
-        ggml_opt_result_reset(result_val);
-        fprintf(stderr, "ggml_opt_fit: epoch %04lld/%04lld:\n",
-                (long long)epoch_counter, (long long)nepochs);
-        ggml_opt_epoch(opt_ctx, dataset, result_train, result_val,
-                       idata_split,
-                       ggml_opt_epoch_callback_progress_bar,
-                       ggml_opt_epoch_callback_progress_bar);
-        fprintf(stderr, "\n");
-    }
-
-    /* Extract final training stats and cache for accessor functions */
-    ggml_opt_result_loss(result_train, &g_train_loss, NULL);
-    ggml_opt_result_accuracy(result_train, &g_train_accuracy, NULL);
-    {
-        int64_t nd = 0;
-        ggml_opt_result_ndata(result_train, &nd);
-        g_train_ndata = (long long)nd;
-    }
-
-    ggml_opt_free(opt_ctx);
-    ggml_opt_result_free(result_train);
-    ggml_opt_result_free(result_val);
-
-    /* Read back trained parameters to pool */
-    for (int i = 0; i < g_pool_count; i++) {
-        struct ggml_tensor *gt = g_record_map[i];
-        if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
-            TPool *s = &g_pool[i];
-            float before = s->data[0];
-            if (gt->buffer) {
-                ggml_backend_tensor_get(gt, s->data, 0, (size_t)s->n_elem * sizeof(float));
-            } else if (gt->data) {
-                memcpy(s->data, gt->data, (size_t)s->n_elem * sizeof(float));
-            }
-            fprintf(stderr, "readback param pool=%d: before=%.6f after=%.6f buf=%p data=%p\n",
-                    i, before, s->data[0], (void*)gt->buffer, (void*)gt->data);
-        }
-    }
-
-    ggml_backend_sched_free(sched);
-    ggml_opt_dataset_free(dataset);
-    if (param_buf) ggml_backend_buffer_free(param_buf);
-    return g_train_loss;
+    size_t size = *(size_t *)((char *)closure + sizeof(void *));
+    void *copy = malloc(size);
+    if (!copy) { fprintf(stderr, "sn_tensor_closure_copy: oom\n"); exit(1); }
+    memcpy(copy, closure, size);
+    /* Zero the cleanup pointer so freeing the copy does not free
+     * captured objects the caller still owns. */
+    void **cleanup = (void **)((char *)copy + sizeof(void *) + sizeof(size_t));
+    *cleanup = NULL;
+    return copy;
 }
 
-double sn_graph_train_loss(void)     { return g_train_loss; }
-double sn_graph_train_accuracy(void) { return g_train_accuracy; }
-long long sn_graph_train_ndata(void) { return g_train_ndata; }
+void sn_graph_set_train_metric_callback(void *cb)
+{
+    if (g_train_metric_cb) { free(g_train_metric_cb); g_train_metric_cb = NULL; }
+    if (cb) g_train_metric_cb = sn_tensor_closure_copy(cb);
+}
+
+void sn_graph_clear_train_metric_callback(void)
+{
+    if (g_train_metric_cb) { free(g_train_metric_cb); g_train_metric_cb = NULL; }
+}
+
+void sn_graph_emit_train_metric(char *name, double value)
+{
+    if (!g_train_metric_cb) return;
+    typedef void (*CbFn)(void *closure, char *name, double value);
+    CbFn fn = (CbFn)(*(void **)g_train_metric_cb);
+    fn(g_train_metric_cb, name, value);
+}
 
 /* ======================================================================
  * Per-epoch training driver
  *
- * This is the new training entry point. Unlike sn_graph_train (which
- * wraps ggml_opt_epoch with the dataset abstraction), this function:
+ * The training entry point used by Gnn.train(). Key design points:
  *
  *   - Uses ggml_opt with loss_type=GGML_OPT_LOSS_TYPE_SUM and a
  *     pre-built loss tensor as `outputs`. ggml_sum of a scalar is

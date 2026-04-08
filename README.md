@@ -220,49 +220,110 @@ Returned by `Gnn.forward`.
 
 ### TrainResult
 
-Returned by `Gnn.train`.
+Returned by `Gnn.train`. Carries top-line scalars plus the Phase C
+diagnostics consumers need to detect Bug B3-style regressions,
+diverging loss, optimizer stalls, and garbage-in/garbage-out
+conditions without tailing stderr.
 
-| Field      | Type     | Description                     |
-|------------|----------|---------------------------------|
-| `loss`     | `double` | Average per-epoch training loss |
-| `accuracy` | `double` | Currently reserved (always 0.0) |
-| `epochs`   | `int`    | Epochs actually executed        |
+| Field              | Type       | Description |
+|--------------------|------------|-------------|
+| `loss`             | `double`   | **Final-epoch** training loss (tail of `lossCurve`). Semantics changed from "across-epoch average" in v1.0.0. |
+| `accuracy`         | `double`   | Training-set accuracy computed by a post-train forward pass over the training graphs |
+| `epochs`           | `int`      | Epochs actually executed |
+| `lossCurve`        | `double[]` | Per-epoch average loss — length == epochs |
+| `gradNormCurve`    | `double[]` | Per-epoch L2 of the parameter delta vector (proxy for optimizer effective step) |
+| `paramNormBefore`  | `double[]` | Per-parameter L2 at `train()` entry, in `model.parameters()` order |
+| `paramNormAfter`   | `double[]` | Per-parameter L2 at `train()` exit |
+| `paramMaxAbsDelta` | `double[]` | Per-parameter max absolute elementwise change from entry to exit |
+| `weightSumIn`      | `double`   | Sum of the caller-supplied `weights` array (sanity check: detects silently-dropped weights) |
+| `weightVarianceIn` | `double`   | Population variance of the caller-supplied `weights` (zero ⇒ unweighted) |
+| `inputMean`        | `double`   | Mean of the padded feature host buffer across the whole training set |
+| `inputStd`         | `double`   | Std of the padded feature host buffer across the whole training set |
 
 ### Gnn
 
 Full GNN model: message-passing layers + mean-pool readout + 2-layer classification head.
 
-| Method                                                                                                                                        | Description                                                                                                     |
-|-----------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------|
-| `Gnn.create(config)`                                                                                                                          | Create a new model with random weights                                                                         |
-| `Gnn.createWithSeed(config, seed)`                                                                                                            | Create a deterministic model: two runs with the same seed produce bit-identical initial weights                |
-| `model.forward(graph, training)`                                                                                                              | Run inference, returns `GnnOutput` (probs, logits, embedding)                                                   |
-| `model.train(graphs, labels, weights, optimizer, epochs, batchSize, valSplit, seed)`                                                          | End-to-end training on a list of `GraphTensors`. See topology precondition below and the docstring in `gnn.sn`. |
-| `model.parameters()`                                                                                                                          | Collect all trainable tensors                                                                                   |
-| `model.save(path)`                                                                                                                            | Save model weights to disk                                                                                      |
-| `model.load(path)`                                                                                                                            | Restore model weights from disk in-place                                                                        |
-| `model.reset()`                                                                                                                               | Free all tensor pool slots                                                                                      |
-| `model.checkpoint()`                                                                                                                          | Snapshot the current pool high-water mark                                                                       |
-| `model.restore(cp)`                                                                                                                           | Release pool slots allocated since a checkpoint                                                                 |
+| Method | Description |
+|---|---|
+| `Gnn.create(config)` | Create a new model with random weights |
+| `Gnn.createWithSeed(config, seed)` | Create a deterministic model: two runs with the same seed produce bit-identical initial weights |
+| `model.forward(graph, training)` | Run inference, returns `GnnOutput` (probs, logits, embedding) |
+| `model.predictBatch(graphs)` | Run inference on a list of graphs in input order; returns `GnnOutput[]`. Naive loop over `forward(g, false)` — callers holding the returned outputs should not `reset()` the pool until finished reading |
+| `model.train(graphs, labels, weights, optimizer, epochs, batchSize, valSplit, seed)` | End-to-end training on a list of `GraphTensors`. See topology precondition below and the docstring in `gnn.sn`. |
+| `model.parameters()` | Collect all trainable tensors |
+| `model.save(path)` | Save model weights to disk |
+| `model.load(path)` | Restore model weights from disk in-place |
+| `model.reset()` | Free all tensor pool slots |
+| `model.checkpoint()` | Snapshot the current pool high-water mark |
+| `model.restore(cp)` | Release pool slots allocated since a checkpoint |
 
-#### `Gnn.train` topology precondition
+#### `Gnn.train` shape precondition
 
-The training driver records a **static forward graph** once and then
-refreshes the feature/label/weight tensors per batch. As a result,
-every graph passed to `train()` must share the same `numNodes` and
-`featureDim`. If `len(graphs) > batchSize` (i.e. multi-batch training),
-every graph must additionally share `numEdges`. A runtime assertion
-enforces this; see `docs/issues/heterogeneous-graph-batching.md` for
-the architectural background and the long-term plan for supporting
-variable-shape graphs.
+The only shape requirement is that every graph in the training set
+shares the same `featureDim`. Per-graph `numNodes` and `numEdges`
+can vary freely within one `train()` call. Internally each sample
+is padded to `maxNodes = max(graphs[i].numNodes)` and the dense
+adjacency / pool matrix is rebuilt per batch via the per-batch upload
+registry. See `docs/issues/heterogeneous-graph-batching.md` for the
+long-form architectural write-up.
 
 `weights[i]` is the per-sample loss multiplier. Pass all-1.0s for
 standard unweighted cross-entropy, or per-sample rewards / advantages
-for policy-gradient style training.
+for policy-gradient style training (see `tests/test_reward_weighted_policy.sn`
+for the existence proof).
 
 Training is deterministic for a given `seed`: the across-batch shuffle
 is seeded from `Random.createWithSeed(seed)`, and the underlying ggml
 optimizer is driven with the caller-supplied AdamW / SGD hyperparameters.
+Two `Gnn.createWithSeed(config, seed)` + `train(..., seed)` runs on
+identical data produce bit-identical forward outputs to 1e-6 tolerance
+(regression-guarded by `tests/test_crusher_policy_e2e.sn` and
+`tests/test_save_load_roundtrip_under_train.sn`).
+
+### `distributionDivergence(a, b, kind)`
+
+Free function in `src/tensor.sn` that compares two discrete probability
+distributions. Supports `kind ∈ {"l1", "l2", "kl", "js"}`. `kl` uses
+natural log with an epsilon floor on `b[i]`; `js` is the symmetric
+Jensen-Shannon divergence (natural log, so bounded above by `ln(2)`).
+
+```sindarin
+var jsd: double = distributionDivergence(
+  model.forward(stateA, false).probs.toDoubles(),
+  model.forward(stateB, false).probs.toDoubles(),
+  "js")
+```
+
+The canonical consumer is a periodic canonical-pair probe that reports
+the JSD between two fixed graphs' predictions as a learning-progress
+signal. Covered by `tests/test_predict_batch_and_divergence.sn`.
+
+### Training metric callback
+
+For continuous metric streaming into a consumer-side metrics store
+(e.g. skynet's Postgres-backed dashboard), register a callback via
+`sn_graph_set_train_metric_callback`. The package emits named metrics
+per epoch and once more at end-of-train.
+
+```sindarin
+var cb: fn(str, double): void = fn(name: str, value: double): void =>
+  # forward into your MetricsClient, log, etc.
+  println($"{name} = {value}")
+sn_graph_set_train_metric_callback(cb)
+
+var result: TrainResult = model.train(graphs, labels, weights, opt, ...)
+# cb was invoked per epoch with train_loss + grad_norm_l2,
+# and once at the end with weight_sum_in, weight_variance_in,
+# input_mean, input_std, accuracy, and per-parameter
+# param_norm_before/{i}, param_norm_after/{i}, param_max_abs_delta/{i}.
+
+sn_graph_clear_train_metric_callback()
+```
+
+The callback is deep-copied on registration and survives across
+multiple `train()` calls until explicitly cleared. Covered by
+`tests/test_train_metric_callback.sn`.
 
 ## Backend
 

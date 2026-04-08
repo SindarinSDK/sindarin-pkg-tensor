@@ -1,0 +1,255 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_weight_update_proven.sn — Bug B3 regression guard (Part 3 Test 3)
+#
+# Verifies that EVERY trainable parameter — weights AND biases — receives
+# non-zero gradient updates during training. This is the direct regression
+# guard for `docs/issues/weight-update-failure.md` (Bug B3): the host-side
+# weight pre-transpose in sn_tensor_matmul previously caused weights to
+# never update while biases did. The fix (sn_tensor_gnn_matmul, used by
+# every layer forward plus the classifier head) restores gradient flow.
+#
+# The test runs across all three GNN architectures — gat, gcn, sage — so
+# that any future regression in one layer type's forward path is caught.
+# In particular, Phase A of the golden-path plan identified a latent
+# regression where GraphSAGE's forward still used the old .matmul() path;
+# this test will fail if that ever comes back.
+#
+# Known scoped exclusion:
+# - GAT's attWeight receives no gradient (golden-path "Outstanding work"
+# item 2 — sn_tensor_attention_aggregate falls back to sparse_aggregate
+# in record mode and never references attWeight). The test skips
+# attWeight for the max-abs-delta assertion but still records it in
+# the role vector so the mask length check stays honest.
+#
+# Assertions per architecture:
+# - Every non-attWeight parameter has max-abs elementwise delta > 1e-5
+# between before-train and after-train pool data.
+# - Every weight MATRIX (layer weights + classifierW1 + classifierW2,
+# NOT biases, NOT attWeight) has |L2-norm-after - L2-norm-before|
+# > 1e-4.
+#
+# If either assertion fires, Bug B3 is back.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+# 20 hand-picked 4-feature samples cycling across 3 classes (class index
+# = i % 3). Hermetic — no RNG — so the test is bit-reproducible under
+# the same seed across runs. Features are chosen so each class has a
+# clear signal on one dimension, with some intra-class variation.
+fn buildTrainingGraphs(): GraphTensors[] =>
+  var samples: double[][] = {
+    {0.90, 0.10, 0.10, 0.10}, # class 0
+    {0.10, 0.90, 0.10, 0.10}, # class 1
+    {0.10, 0.10, 0.90, 0.10}, # class 2
+    {0.80, 0.20, 0.10, 0.10},
+    {0.20, 0.80, 0.10, 0.10},
+    {0.10, 0.20, 0.80, 0.10},
+    {0.70, 0.30, 0.10, 0.10},
+    {0.30, 0.70, 0.10, 0.10},
+    {0.10, 0.30, 0.70, 0.10},
+    {0.60, 0.40, 0.10, 0.10},
+    {0.40, 0.60, 0.10, 0.10},
+    {0.10, 0.40, 0.60, 0.10},
+    {0.85, 0.15, 0.10, 0.10},
+    {0.15, 0.85, 0.10, 0.10},
+    {0.10, 0.15, 0.85, 0.10},
+    {0.75, 0.25, 0.10, 0.10},
+    {0.25, 0.75, 0.10, 0.10},
+    {0.10, 0.25, 0.75, 0.10},
+    {0.65, 0.35, 0.10, 0.10},
+    {0.35, 0.65, 0.10, 0.10}
+  }
+  var graphs: GraphTensors[] = {}
+  for var i: int = 0; i < len(samples); i++ =>
+    graphs.push(singleNode(samples[i], 4))
+  return graphs
+
+# Labels matching buildTrainingGraphs(): cycle 0,1,2 across 20 samples,
+# one-hot encoded. 20 samples * 3 actions = 60 doubles total.
+fn buildLabels(): double[] =>
+  var labels: double[] = {}
+  for var i: int = 0; i < 20; i++ =>
+    var cls: int = i % 3
+    for var a: int = 0; a < 3; a++ =>
+      if a == cls =>
+        labels.push(1.0)
+      else =>
+        labels.push(0.0)
+  return labels
+
+fn buildWeights(n: int): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    w.push(1.0)
+  return w
+
+# Build per-parameter role labels matching the order Gnn.parameters()
+# emits them. For a numLayers-layer model:
+# gat: [weight, bias, attWeight, weight, bias, attWeight, ...,
+# classW1, classB1, classW2, classB2]
+# gcn: [weight, bias, weight, bias, ...,
+# classW1, classB1, classW2, classB2]
+# sage: same shape as gcn
+fn paramRoles(arch: str, numLayers: int): str[] =>
+  var roles: str[] = {}
+  for var i: int = 0; i < numLayers; i++ =>
+    roles.push("weight")
+    roles.push("bias")
+    if arch == "gat" =>
+      roles.push("attWeight")
+  roles.push("classW1")
+  roles.push("classB1")
+  roles.push("classW2")
+  roles.push("classB2")
+  return roles
+
+# Per-parameter max absolute elementwise delta between two flat arrays.
+fn maxAbsDelta(before: double[], after: double[]): double =>
+  var m: double = 0.0
+  for var i: int = 0; i < len(before); i++ =>
+    var d: double = after[i] - before[i]
+    if d < 0.0 =>
+      d = -d
+    if d > m =>
+      m = d
+  return m
+
+# absDouble is provided transitively via sindarin-pkg-sdk/src/core/math
+# (imported by ../src/gnn).
+
+# "Is this role a weight matrix that should pass the L2-norm-drift check?"
+# Biases and attWeight do not — biases are tiny, attWeight is the known
+# sub-bug from golden-path "Outstanding work" item 2.
+fn isWeightMatrixRole(role: str): bool =>
+  if role == "weight" =>
+    return true
+  if role == "classW1" =>
+    return true
+  if role == "classW2" =>
+    return true
+  return false
+
+# "Should this role be subject to the max-abs-delta > 1e-5 check?"
+# Everything except the known-broken attWeight.
+fn shouldUpdate(role: str): bool =>
+  if role == "attWeight" =>
+    return false
+  return true
+
+# ---------------------------------------------------------------------------
+# Per-architecture run
+# ---------------------------------------------------------------------------
+
+fn runArch(arch: str): void =>
+  println($"--- arch={arch} ---")
+
+  var numLayers: int = 2
+  var config: GnnConfig = {
+    inputDim: 4, hiddenDim: 8, numActions: 3,
+    numLayers: numLayers, arch: arch, dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  var graphs: GraphTensors[] = buildTrainingGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildWeights(len(graphs))
+
+  # --- Snapshot parameter data + L2 norms BEFORE training ---
+  var paramsBefore: Tensor[] = model.parameters()
+  var before: double[][] = {}
+  var normBefore: double[] = {}
+  for var i: int = 0; i < len(paramsBefore); i++ =>
+    before.push(paramsBefore[i].toDoubles())
+    normBefore.push(paramsBefore[i].norm())
+
+  # --- Train ---
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(
+    graphs, labels, weights, opt, 50, 4, 0.0, 42l)
+  println($"  train done: loss={result.loss} epochs={result.epochs}")
+
+  # --- Snapshot parameter data + L2 norms AFTER training ---
+  var paramsAfter: Tensor[] = model.parameters()
+  var after: double[][] = {}
+  var normAfter: double[] = {}
+  for var i: int = 0; i < len(paramsAfter); i++ =>
+    after.push(paramsAfter[i].toDoubles())
+    normAfter.push(paramsAfter[i].norm())
+
+  # --- Role vector for this arch ---
+  var roles: str[] = paramRoles(arch, numLayers)
+  assertEqualInt(len(roles), len(paramsAfter),
+    $"{arch}: role vector length matches Gnn.parameters() count")
+
+  # --- Assert: every non-attWeight parameter has elementwise drift ---
+  for var i: int = 0; i < len(paramsAfter); i++ =>
+    var role: str = roles[i]
+    if shouldUpdate(role) =>
+      var mad: double = maxAbsDelta(before[i], after[i])
+      assertTrue(mad > 0.00001,
+        $"{arch} param[{i}] ({role}) max-abs-delta={mad} should exceed 1e-5")
+
+  # --- Assert: every weight MATRIX has L2-norm drift ---
+  for var i: int = 0; i < len(paramsAfter); i++ =>
+    var role: str = roles[i]
+    if isWeightMatrixRole(role) =>
+      var d: double = absDouble(normAfter[i] - normBefore[i])
+      assertTrue(d > 0.0001,
+        $"{arch} weight-matrix[{i}] ({role}) |L2 delta|={d} should exceed 1e-4 (before={normBefore[i]}, after={normAfter[i]})")
+
+  # --- Phase C cross-check: TrainResult.paramNorm* and
+  # paramMaxAbsDelta must agree with the externally measured snapshots
+  # within float-roundtrip tolerance. This is the regression guard
+  # that the package-internal diagnostics report the same numbers a
+  # caller would compute themselves. ---
+  assertEqualInt(len(result.paramNormBefore), len(paramsAfter),
+    $"{arch}: result.paramNormBefore length matches param count")
+  assertEqualInt(len(result.paramNormAfter), len(paramsAfter),
+    $"{arch}: result.paramNormAfter length matches param count")
+  assertEqualInt(len(result.paramMaxAbsDelta), len(paramsAfter),
+    $"{arch}: result.paramMaxAbsDelta length matches param count")
+
+  for var i: int = 0; i < len(paramsAfter); i++ =>
+    assertApproxDouble(result.paramNormBefore[i], normBefore[i], 0.000001,
+      $"{arch} result.paramNormBefore[{i}] matches external L2")
+    assertApproxDouble(result.paramNormAfter[i], normAfter[i], 0.000001,
+      $"{arch} result.paramNormAfter[{i}] matches external L2")
+    var extMad: double = maxAbsDelta(before[i], after[i])
+    assertApproxDouble(result.paramMaxAbsDelta[i], extMad, 0.000001,
+      $"{arch} result.paramMaxAbsDelta[{i}] matches external max-abs-delta")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_weight_update_proven — Bug B3 regression guard ===")
+  println("")
+  runArch("gat")
+  println("")
+  runArch("gcn")
+  println("")
+  runArch("sage")
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

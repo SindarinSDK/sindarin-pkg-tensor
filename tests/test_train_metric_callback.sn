@@ -1,0 +1,241 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_train_metric_callback.sn — Phase J / §4.2
+#
+# Verifies that:
+# 1. A registered Sindarin lambda is invoked from C during
+# Gnn.train() with (metric_name, value) pairs.
+# 2. Per-epoch metrics (train_loss, grad_norm_l2) fire exactly once
+# per epoch and the values match the corresponding entries in
+# TrainResult.lossCurve / gradNormCurve to the limit of float
+# roundtrip precision.
+# 3. Scalar post-train metrics (weight_sum_in, weight_variance_in,
+# input_mean, input_std, accuracy) fire exactly once per train
+# and match the TrainResult fields.
+# 4. Per-parameter metrics (param_norm_before/{i},
+# param_norm_after/{i}, param_max_abs_delta/{i}) fire once each
+# and match the TrainResult per-parameter arrays.
+# 5. Clearing the callback stops further emissions — a second train
+# call after clear() pushes nothing into the capture buffers.
+#
+# Crash-on-fail via `failed() > 0 ⇒ 1/0`.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn singleNode(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 3),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 3
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  var samples: double[][] = {
+    {0.9, 0.1, 0.1},
+    {0.1, 0.9, 0.1},
+    {0.1, 0.1, 0.9},
+    {0.8, 0.2, 0.1},
+    {0.2, 0.8, 0.1},
+    {0.1, 0.2, 0.8}
+  }
+  var graphs: GraphTensors[] = {}
+  for var i: int = 0; i < len(samples); i++ =>
+    graphs.push(singleNode(samples[i]))
+  return graphs
+
+fn buildLabels(): double[] =>
+  var labels: double[] = {}
+  var classes: int[] = {0, 1, 2, 0, 1, 2}
+  for var i: int = 0; i < len(classes); i++ =>
+    for var a: int = 0; a < 3; a++ =>
+      if a == classes[i] =>
+        labels.push(1.0)
+      else =>
+        labels.push(0.0)
+  return labels
+
+fn buildWeights(n: int): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    w.push(1.0)
+  return w
+
+fn makeConfig(): GnnConfig =>
+  return GnnConfig {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+
+# Count entries in a str[] matching a target name.
+fn countMatches(names: str[], target: str): int =>
+  var c: int = 0
+  for var i: int = 0; i < len(names); i++ =>
+    if names[i] == target =>
+      c = c + 1
+  return c
+
+# Collect values from valueBuf where the corresponding name matches.
+fn valuesFor(names: str[], values: double[], target: str): double[] =>
+  var out: double[] = {}
+  for var i: int = 0; i < len(names); i++ =>
+    if names[i] == target =>
+      out.push(values[i])
+  return out
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_train_metric_callback — Phase J / §4.2 ===")
+  println("")
+
+  # Shared buffers the callback appends into. Sindarin closures
+  # capture by reference, so the lambda below mutates these when the
+  # C side fires it.
+  var nameBuf: str[] = {}
+  var valueBuf: double[] = {}
+
+  # Register the callback. Two-step: the Sindarin parser only accepts
+  # multi-arg lambda literals when bound to a named variable with an
+  # explicit function type, not inlined at a call site.
+  var captureCb: fn(str, double): void = fn(name: str, value: double): void =>
+    nameBuf.push(name)
+    valueBuf.push(value)
+  sn_graph_set_train_metric_callback(captureCb)
+
+  # Train.
+  var model: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildWeights(len(graphs))
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var epochs: int = 5
+  var result: TrainResult = model.train(
+    graphs, labels, weights, opt, epochs, 3, 0.0, 42l)
+  var nParams: int = len(model.parameters())
+
+  println($"  captured {len(nameBuf)} metric emissions across {epochs} epochs")
+  println($"  nParams={nParams}")
+
+  # --- Per-epoch assertions --------------------------------------------
+  assertEqualInt(countMatches(nameBuf, "train_loss"), epochs,
+    $"train_loss emitted exactly {epochs} times")
+  assertEqualInt(countMatches(nameBuf, "grad_norm_l2"), epochs,
+    $"grad_norm_l2 emitted exactly {epochs} times")
+
+  var capturedLoss: double[] = valuesFor(nameBuf, valueBuf, "train_loss")
+  assertEqualInt(len(capturedLoss), epochs,
+    "train_loss captured values count matches")
+  for var e: int = 0; e < epochs; e++ =>
+    assertApproxDouble(capturedLoss[e], result.lossCurve[e], 0.0000000001,
+      $"train_loss[{e}] callback value matches TrainResult.lossCurve[{e}]")
+
+  var capturedGrad: double[] = valuesFor(nameBuf, valueBuf, "grad_norm_l2")
+  assertEqualInt(len(capturedGrad), epochs,
+    "grad_norm_l2 captured values count matches")
+  for var e: int = 0; e < epochs; e++ =>
+    assertApproxDouble(capturedGrad[e], result.gradNormCurve[e], 0.0000000001,
+      $"grad_norm_l2[{e}] callback value matches TrainResult.gradNormCurve[{e}]")
+
+  # --- Scalar post-train assertions ------------------------------------
+  assertEqualInt(countMatches(nameBuf, "weight_sum_in"), 1,
+    "weight_sum_in emitted exactly once")
+  var wSum: double[] = valuesFor(nameBuf, valueBuf, "weight_sum_in")
+  assertApproxDouble(wSum[0], result.weightSumIn, 0.0000000001,
+    "weight_sum_in callback value matches TrainResult")
+
+  assertEqualInt(countMatches(nameBuf, "weight_variance_in"), 1,
+    "weight_variance_in emitted exactly once")
+  var wVar: double[] = valuesFor(nameBuf, valueBuf, "weight_variance_in")
+  assertApproxDouble(wVar[0], result.weightVarianceIn, 0.0000000001,
+    "weight_variance_in callback value matches TrainResult")
+
+  assertEqualInt(countMatches(nameBuf, "input_mean"), 1,
+    "input_mean emitted exactly once")
+  var iMean: double[] = valuesFor(nameBuf, valueBuf, "input_mean")
+  assertApproxDouble(iMean[0], result.inputMean, 0.0000000001,
+    "input_mean callback value matches TrainResult")
+
+  assertEqualInt(countMatches(nameBuf, "input_std"), 1,
+    "input_std emitted exactly once")
+  var iStd: double[] = valuesFor(nameBuf, valueBuf, "input_std")
+  assertApproxDouble(iStd[0], result.inputStd, 0.0000000001,
+    "input_std callback value matches TrainResult")
+
+  assertEqualInt(countMatches(nameBuf, "accuracy"), 1,
+    "accuracy emitted exactly once")
+  var accArr: double[] = valuesFor(nameBuf, valueBuf, "accuracy")
+  assertApproxDouble(accArr[0], result.accuracy, 0.0000000001,
+    "accuracy callback value matches TrainResult")
+
+  # --- Per-parameter assertions ----------------------------------------
+  for var i: int = 0; i < nParams; i++ =>
+    var nameBefore: str = $"param_norm_before/{i}"
+    var nameAfter: str = $"param_norm_after/{i}"
+    var nameDelta: str = $"param_max_abs_delta/{i}"
+
+    assertEqualInt(countMatches(nameBuf, nameBefore), 1,
+      $"{nameBefore} emitted exactly once")
+    assertEqualInt(countMatches(nameBuf, nameAfter), 1,
+      $"{nameAfter} emitted exactly once")
+    assertEqualInt(countMatches(nameBuf, nameDelta), 1,
+      $"{nameDelta} emitted exactly once")
+
+    var vBefore: double[] = valuesFor(nameBuf, valueBuf, nameBefore)
+    var vAfter: double[] = valuesFor(nameBuf, valueBuf, nameAfter)
+    var vDelta: double[] = valuesFor(nameBuf, valueBuf, nameDelta)
+    assertApproxDouble(vBefore[0], result.paramNormBefore[i], 0.0000000001,
+      $"{nameBefore} matches TrainResult")
+    assertApproxDouble(vAfter[0], result.paramNormAfter[i], 0.0000000001,
+      $"{nameAfter} matches TrainResult")
+    assertApproxDouble(vDelta[0], result.paramMaxAbsDelta[i], 0.0000000001,
+      $"{nameDelta} matches TrainResult")
+
+  # --- Clear the callback and retrain: no new emissions --------------
+  var bufLenBefore: int = len(nameBuf)
+  sn_graph_clear_train_metric_callback()
+
+  var model2: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
+  var result2: TrainResult = model2.train(
+    graphs, labels, weights, opt, 3, 3, 0.0, 42l)
+  # result2 is used just to avoid dead-code warnings if any — we care
+  # that no buffer growth occurred.
+  println($"  after clear: bufLen={len(nameBuf)} (was {bufLenBefore}), result2.loss={result2.loss}")
+
+  assertEqualInt(len(nameBuf), bufLenBefore,
+    "no new emissions after clear_train_metric_callback")
+
+  # --- Re-register a new callback, ensure emissions resume ------------
+  var resumeNames: str[] = {}
+  var resumeCb: fn(str, double): void = fn(name: str, value: double): void =>
+    resumeNames.push(name)
+  sn_graph_set_train_metric_callback(resumeCb)
+
+  var model3: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
+  var r3: TrainResult = model3.train(
+    graphs, labels, weights, opt, 2, 3, 0.0, 42l)
+  println($"  after re-register: resumeNames has {len(resumeNames)} entries, r3.loss={r3.loss}")
+
+  assertEqualInt(countMatches(resumeNames, "train_loss"), 2,
+    "re-registered callback received 2 train_loss emissions for 2-epoch run")
+
+  # Clean up the registration to avoid leaking the closure between
+  # tests if this test binary is run alongside others.
+  sn_graph_clear_train_metric_callback()
+
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

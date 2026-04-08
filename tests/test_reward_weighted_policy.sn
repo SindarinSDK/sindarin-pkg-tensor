@@ -1,0 +1,216 @@
+import "sindarin-pkg-test/src/assert"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_reward_weighted_policy.sn — Phase E / Part 3 Test 5
+#
+# Closed-form existence proof that per-sample reward weights in
+# Gnn.train() steer the gradient in the direction reward points, even
+# when the empirical label distribution says the opposite. This is the
+# smallest analogue to the REINFORCE use case skynet needs: "advantages"
+# as per-sample loss weights must override the imbalance in the raw
+# (state, action_taken) log.
+#
+# Setup: 2-state, 2-action toy.
+# - State A features [1, 0]: good action is 0, bad action is 1
+# - State B features [0, 1]: good action is 1, bad action is 0
+#
+# Deliberately imbalanced training set:
+# - 80% of State A samples took the BAD action (action 1, reward -5)
+# - 20% of State A samples took the GOOD action (action 0, reward +5)
+# - Symmetric split on State B
+#
+# Labels record the actually-taken action.
+# Weights record the per-sample reward (+5 for good action, -5 for bad).
+#
+# Two training runs, same seed, same model architecture, same data:
+#
+# Weighted run    — weights array = per-sample reward.
+# Expected: weighted loss steers away from bad-action labels
+# (negative weight * CE(bad_label) pushes model AWAY from that
+# label) and toward good-action labels (positive weight * CE(good)
+# pushes model TOWARD). Model learns the correct policy.
+#
+# Unweighted run  — weights array = all 1.0.
+# Expected: cross-entropy on the raw labels follows the empirical
+# frequency. Majority label (the BAD action) dominates. Model
+# learns the WRONG policy.
+#
+# Assertions:
+# Weighted:
+# - forward(StateA).probs[0] > 0.7 (correct action)
+# - forward(StateB).probs[1] > 0.7 (correct action)
+# Unweighted (wrong-policy contrast):
+# - forward(StateA).probs[1] > probs[0] (majority label = bad action 1)
+# - forward(StateB).probs[0] > probs[1] (majority label = bad action 0)
+# Contrast:
+# - Weighted and unweighted argmax predictions DIFFER on both states
+# (proves the weight vector is the deciding factor).
+#
+# If this test passes, the skynet trainer can feed per-sample advantages
+# straight into Gnn.train() and expect gradients to follow the rewards.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+fn sn2(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 2),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 2
+  }
+
+fn makeModel(): Gnn =>
+  var config: GnnConfig = {
+    inputDim: 2, hiddenDim: 8, numActions: 2,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  return Gnn.createWithSeed(config, 42l)
+
+# 20 training graphs matching the imbalance described in the header.
+# Order (used by buildLabels and buildRewardWeights):
+# [0..7]    State A, bad  action — features [1,0]
+# [8..9]    State A, good action — features [1,0]
+# [10..17]  State B, bad  action — features [0,1]
+# [18..19]  State B, good action — features [0,1]
+fn buildGraphs(): GraphTensors[] =>
+  var graphs: GraphTensors[] = {}
+  for var i: int = 0; i < 8; i++ =>
+    graphs.push(sn2({1.0, 0.0}))
+  for var i: int = 0; i < 2; i++ =>
+    graphs.push(sn2({1.0, 0.0}))
+  for var i: int = 0; i < 8; i++ =>
+    graphs.push(sn2({0.0, 1.0}))
+  for var i: int = 0; i < 2; i++ =>
+    graphs.push(sn2({0.0, 1.0}))
+  return graphs
+
+# One-hot labels for the actually-taken action, matching buildGraphs order.
+fn buildLabels(): double[] =>
+  var labels: double[] = {}
+  # State A bad: action 1 → [0, 1]
+  for var i: int = 0; i < 8; i++ =>
+    labels.push(0.0)
+    labels.push(1.0)
+  # State A good: action 0 → [1, 0]
+  for var i: int = 0; i < 2; i++ =>
+    labels.push(1.0)
+    labels.push(0.0)
+  # State B bad: action 0 → [1, 0]
+  for var i: int = 0; i < 8; i++ =>
+    labels.push(1.0)
+    labels.push(0.0)
+  # State B good: action 1 → [0, 1]
+  for var i: int = 0; i < 2; i++ =>
+    labels.push(0.0)
+    labels.push(1.0)
+  return labels
+
+# Per-sample reward weight: -5.0 for bad samples, +5.0 for good samples.
+fn buildRewardWeights(): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < 8; i++ =>
+    w.push(-5.0)
+  for var i: int = 0; i < 2; i++ =>
+    w.push(5.0)
+  for var i: int = 0; i < 8; i++ =>
+    w.push(-5.0)
+  for var i: int = 0; i < 2; i++ =>
+    w.push(5.0)
+  return w
+
+fn buildUnitWeights(): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < 20; i++ =>
+    w.push(1.0)
+  return w
+
+fn trainOnce(model: Gnn, weights: double[], epochs: int): TrainResult =>
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  return model.train(graphs, labels, weights, opt, epochs, 5, 0.0, 42l)
+
+fn argmax2(p: double[]): int =>
+  if p[1] > p[0] =>
+    return 1
+  return 0
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_reward_weighted_policy — Phase E (Bug B2 RL proof) ===")
+  println("")
+
+  var stateA: GraphTensors = sn2({1.0, 0.0})
+  var stateB: GraphTensors = sn2({0.0, 1.0})
+
+  # --- Weighted run: reward weights steer away from bad-action labels
+  println("--- Weighted run: per-sample +/-5 reward weights ---")
+  var weighted: Gnn = makeModel()
+  var wResult: TrainResult = trainOnce(weighted, buildRewardWeights(), 300)
+  println($"  final loss={wResult.loss} accuracy={wResult.accuracy}")
+
+  var wA: double[] = weighted.forward(stateA, false).probs.toDoubles()
+  var wB: double[] = weighted.forward(stateB, false).probs.toDoubles()
+  println($"  stateA probs=[{wA[0]}, {wA[1]}]")
+  println($"  stateB probs=[{wB[0]}, {wB[1]}]")
+  println("")
+
+  # --- Unweighted run: uniform weights, majority label dominates
+  println("--- Unweighted run: uniform weights (learns WRONG policy) ---")
+  var unweighted: Gnn = makeModel()
+  var uResult: TrainResult = trainOnce(unweighted, buildUnitWeights(), 300)
+  println($"  final loss={uResult.loss} accuracy={uResult.accuracy}")
+
+  var uA: double[] = unweighted.forward(stateA, false).probs.toDoubles()
+  var uB: double[] = unweighted.forward(stateB, false).probs.toDoubles()
+  println($"  stateA probs=[{uA[0]}, {uA[1]}]")
+  println($"  stateB probs=[{uB[0]}, {uB[1]}]")
+  println("")
+
+  # --- Assertions: weighted learned the CORRECT policy
+  assertTrue(wA[0] > 0.7,
+    $"weighted forward(stateA).probs[0]={wA[0]} > 0.7 (correct action 0)")
+  assertTrue(wB[1] > 0.7,
+    $"weighted forward(stateB).probs[1]={wB[1]} > 0.7 (correct action 1)")
+
+  # --- Assertions: unweighted learned the WRONG policy
+  # (majority label = the BAD action in each state)
+  assertTrue(uA[1] > uA[0],
+    $"unweighted forward(stateA).probs[1]={uA[1]} > probs[0]={uA[0]} — wrong policy, majority label is action 1")
+  assertTrue(uB[0] > uB[1],
+    $"unweighted forward(stateB).probs[0]={uB[0]} > probs[1]={uB[1]} — wrong policy, majority label is action 0")
+
+  # --- Contrast: the argmax predictions DIFFER on both states,
+  # proving the weight vector is what flipped the policy.
+  var wArgA: int = argmax2(wA)
+  var uArgA: int = argmax2(uA)
+  assertTrue(wArgA != uArgA,
+    $"weighted and unweighted stateA predictions differ (weighted argmax={wArgA}, unweighted argmax={uArgA})")
+
+  var wArgB: int = argmax2(wB)
+  var uArgB: int = argmax2(uB)
+  assertTrue(wArgB != uArgB,
+    $"weighted and unweighted stateB predictions differ (weighted argmax={wArgB}, unweighted argmax={uArgB})")
+
+  # --- Sanity: Phase C TrainResult.weightVarianceIn reflects the reward
+  # weights' spread (should be > 0) in the weighted run and == 0
+  # in the unweighted run.
+  assertTrue(wResult.weightVarianceIn > 0.0,
+    $"weighted run: TrainResult.weightVarianceIn={wResult.weightVarianceIn} > 0 (mixed reward magnitudes)")
+  assertTrue(uResult.weightVarianceIn == 0.0,
+    $"unweighted run: TrainResult.weightVarianceIn={uResult.weightVarianceIn} == 0 (uniform weights)")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

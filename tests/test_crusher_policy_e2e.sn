@@ -1,0 +1,262 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_crusher_policy_e2e.sn — Phase H / Part 3 Test 4
+#
+# Strict replacement for the previous tests/test_crusher_policy.sn. The
+# old test trained the crusher policy model and PRINTED "ALL PASS" /
+# "SOME FAILED" without any actual assertTrue calls, so a regression
+# could flip every prediction to wrong and `make test` would still
+# return exit 0. This version lives up to the doc's Part 3 Test 4
+# contract:
+#
+# - All 15 samples predict argmax == correct class (strict asserts).
+# - Jensen-Shannon divergence thresholds enforce learned separation:
+# * JSD(SpeedUp[0], SpeedDown[0]) > 0.4
+# * JSD(SpeedDown[0], Hold[0])    > 0.2
+# - Determinism rerun: a second model trained with the same seed
+# produces identical probability values to within 1e-6.
+# - Crash-on-fail via `failed() > 0 ⇒ 1/0` so regressions turn
+# `make test` red instead of green.
+#
+# The data, architecture, and optimizer settings match
+# `skynet/config/crusher/model-engine.yaml` and the original test so
+# that a pass here is a direct proof that the crusher production
+# configuration learns a state-conditional policy on canonical samples.
+#
+# 24 features: vsd_freq, amps (×6), weight, speed, iso (×6), flags (×5), kw (×3)
+# 3 actions: speed_up=0, speed_down=1, hold=2
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Raw sample data — hand-picked by the original test author to cover
+# the three canonical crusher regimes.
+# ---------------------------------------------------------------------------
+
+# SPEED UP samples (starved: low amps, low weight)
+fn rawSpeedUp(): double[][] =>
+  return {
+    {18.0, 62.0, 70.0, 28.0, 12.0, 38.0, 20.0, 15.0, 1.48, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 32.0, 18.0, 9.0},
+    {19.0, 64.0, 72.0, 29.0, 12.5, 39.0, 21.0, 17.0, 1.48, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 33.0, 18.5, 9.5},
+    {20.0, 66.0, 74.0, 30.0, 13.0, 40.0, 22.0, 19.0, 1.49, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 34.0, 19.0, 10.0},
+    {20.5, 67.0, 75.0, 30.5, 13.0, 40.5, 22.5, 20.0, 1.49, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 35.0, 19.0, 10.0},
+    {21.0, 68.0, 76.0, 31.0, 13.5, 41.0, 23.0, 21.0, 1.49, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 36.0, 19.5, 10.5}
+  }
+
+# SPEED DOWN samples (overloaded: high amps, high weight)
+fn rawSpeedDown(): double[][] =>
+  return {
+    {47.0, 145.0, 185.0, 78.0, 32.0, 95.0, 72.0, 155.0, 1.52, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 92.0, 48.0, 34.0},
+    {48.0, 148.0, 190.0, 80.0, 33.0, 97.0, 74.0, 160.0, 1.53, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 95.0, 49.0, 35.0},
+    {48.5, 150.0, 195.0, 82.0, 34.0, 98.0, 76.0, 165.0, 1.53, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 97.0, 50.0, 36.0},
+    {49.0, 152.0, 198.0, 83.0, 34.5, 99.0, 77.0, 168.0, 1.54, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 99.0, 51.0, 37.0},
+    {49.5, 155.0, 202.0, 85.0, 35.0, 100.0, 78.0, 172.0, 1.54, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 101.0, 52.0, 38.0}
+  }
+
+# HOLD samples (dangerously high amps, approaching shutdown)
+fn rawHold(): double[][] =>
+  return {
+    {42.0, 17.6, 195.0, 46.0, 5.5, 68.0, 36.0, 126.0, 1.51, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 146.0, 27.0, 14.0},
+    {43.0, 18.1, 205.0, 47.0, 5.6, 72.0, 37.0, 130.0, 1.52, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 154.0, 29.0, 14.8},
+    {44.0, 18.5, 215.0, 48.0, 5.8, 75.0, 38.0, 135.0, 1.52, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 161.0, 30.0, 15.2},
+    {44.0, 18.5, 210.0, 48.0, 13.5, 75.0, 38.0, 133.0, 1.52, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 158.0, 30.0, 15.2},
+    {45.0, 18.9, 225.0, 49.0, 5.9, 78.0, 39.0, 140.0, 1.53, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 169.0, 31.0, 15.8}
+  }
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+struct Normalizer =>
+  mins: double[]
+  maxs: double[]
+
+fn computeNormalizer(allSamples: double[][]): Normalizer =>
+  var fd: int = 24
+  var mins: double[] = {}
+  var maxs: double[] = {}
+  for var f: int = 0; f < fd; f++ =>
+    mins.push(999999.0)
+    maxs.push(-999999.0)
+  for var s: int = 0; s < len(allSamples); s++ =>
+    for var f: int = 0; f < fd; f++ =>
+      if allSamples[s][f] < mins[f] =>
+        mins[f] = allSamples[s][f]
+      if allSamples[s][f] > maxs[f] =>
+        maxs[f] = allSamples[s][f]
+  return Normalizer {
+    mins: mins,
+    maxs: maxs
+  }
+
+fn normalize(sample: double[], norm: Normalizer): double[] =>
+  var out: double[] = {}
+  for var f: int = 0; f < len(sample); f++ =>
+    var range: double = norm.maxs[f] - norm.mins[f]
+    if range > 0.001 =>
+      out.push((sample[f] - norm.mins[f]) / range)
+    else =>
+      out.push(0.5)
+  return out
+
+fn singleNode(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 24),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 24
+  }
+
+fn argmax3(p: double[]): int =>
+  var idx: int = 0
+  if p[1] > p[idx] =>
+    idx = 1
+  if p[2] > p[idx] =>
+    idx = 2
+  return idx
+
+# Aggregate all raw samples (speedUp first, then speedDown, then hold),
+# normalise them with a shared min/max across the entire set, and
+# return the per-sample singleNode GraphTensors list matching
+# speedUp[0..4] → samples[0..4], speedDown[0..4] → samples[5..9],
+# hold[0..4] → samples[10..14].
+fn buildAllGraphs(): GraphTensors[] =>
+  var allSamples: double[][] = {}
+  var su: double[][] = rawSpeedUp()
+  var sd: double[][] = rawSpeedDown()
+  var hd: double[][] = rawHold()
+  for var i: int = 0; i < len(su); i++ =>
+    allSamples.push(su[i])
+  for var i: int = 0; i < len(sd); i++ =>
+    allSamples.push(sd[i])
+  for var i: int = 0; i < len(hd); i++ =>
+    allSamples.push(hd[i])
+  var norm: Normalizer = computeNormalizer(allSamples)
+  var graphs: GraphTensors[] = {}
+  for var s: int = 0; s < len(allSamples); s++ =>
+    graphs.push(singleNode(normalize(allSamples[s], norm)))
+  return graphs
+
+# One-hot labels matching buildAllGraphs ordering:
+# [0..4] → [1,0,0], [5..9] → [0,1,0], [10..14] → [0,0,1]
+fn buildAllLabels(): double[] =>
+  var labels: double[] = {}
+  for var i: int = 0; i < 5; i++ =>
+    labels.push(1.0)
+    labels.push(0.0)
+    labels.push(0.0)
+  for var i: int = 0; i < 5; i++ =>
+    labels.push(0.0)
+    labels.push(1.0)
+    labels.push(0.0)
+  for var i: int = 0; i < 5; i++ =>
+    labels.push(0.0)
+    labels.push(0.0)
+    labels.push(1.0)
+  return labels
+
+fn buildUnitWeights(n: int): double[] =>
+  var w: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    w.push(1.0)
+  return w
+
+fn trainCrusher(seed: long): Gnn =>
+  var config: GnnConfig = {
+    inputDim: 24, hiddenDim: 32, numActions: 3,
+    numLayers: 3, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, seed)
+  var graphs: GraphTensors[] = buildAllGraphs()
+  var labels: double[] = buildAllLabels()
+  var weights: double[] = buildUnitWeights(len(graphs))
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(
+    graphs, labels, weights, opt, 200, 5, 0.0, 42l)
+  println($"  seed={seed} final loss={result.loss} accuracy={result.accuracy}")
+  return model
+
+# Predict every training sample via predictBatch (Phase F). Returns a
+# flat per-sample probs array: probs[0..4] for speed_up, probs[5..9]
+# for speed_down, probs[10..14] for hold.
+fn predictAll(model: Gnn): double[][] =>
+  var graphs: GraphTensors[] = buildAllGraphs()
+  var outputs: GnnOutput[] = model.predictBatch(graphs)
+  var probs: double[][] = {}
+  for var i: int = 0; i < len(outputs); i++ =>
+    probs.push(outputs[i].probs.toDoubles())
+  return probs
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_crusher_policy_e2e — Phase H ===")
+  println("")
+
+  # --- Training run 1 ---
+  println("--- Training run 1 (seed=42) ---")
+  var model1: Gnn = trainCrusher(42l)
+  var probs1: double[][] = predictAll(model1)
+
+  # Print the prediction table for eyeballing.
+  var classNames: str[] = {"speed_up  ", "speed_down", "hold      "}
+  println("  sample predictions:")
+  for var i: int = 0; i < 15; i++ =>
+    var cls: int = i / 5
+    var arg: int = argmax3(probs1[i])
+    var tag: str = "OK"
+    if arg != cls =>
+      tag = "FAIL"
+    println($"    [{classNames[cls]}] [{probs1[i][0]}, {probs1[i][1]}, {probs1[i][2]}] → action {arg} {tag}")
+  println("")
+
+  # --- Assert every sample lands on the correct argmax. ---
+  for var i: int = 0; i < 5; i++ =>
+    assertEqualInt(argmax3(probs1[i]), 0,
+      $"speed_up sample {i} predicts action 0")
+  for var i: int = 0; i < 5; i++ =>
+    assertEqualInt(argmax3(probs1[5 + i]), 1,
+      $"speed_down sample {i} predicts action 1")
+  for var i: int = 0; i < 5; i++ =>
+    assertEqualInt(argmax3(probs1[10 + i]), 2,
+      $"hold sample {i} predicts action 2")
+
+  # --- JSD separation thresholds between canonical samples. ---
+  var jsdUpDown: double = distributionDivergence(probs1[0], probs1[5], "js")
+  println($"  JSD(SpeedUp[0], SpeedDown[0]) = {jsdUpDown}")
+  assertTrue(jsdUpDown > 0.4,
+    $"JSD(SpeedUp[0], SpeedDown[0]) = {jsdUpDown} > 0.4 (learned separation)")
+
+  var jsdDownHold: double = distributionDivergence(probs1[5], probs1[10], "js")
+  println($"  JSD(SpeedDown[0], Hold[0])    = {jsdDownHold}")
+  assertTrue(jsdDownHold > 0.2,
+    $"JSD(SpeedDown[0], Hold[0]) = {jsdDownHold} > 0.2 (learned separation)")
+
+  # --- Determinism rerun: a fresh model trained with the same seed
+  # must produce identical predictions to model1 within 1e-6. ---
+  println("")
+  println("--- Training run 2 (same seed=42, determinism rerun) ---")
+  var model2: Gnn = trainCrusher(42l)
+  var probs2: double[][] = predictAll(model2)
+
+  assertEqualInt(len(probs1), len(probs2),
+    "determinism: same number of predictions")
+  for var i: int = 0; i < len(probs1); i++ =>
+    assertEqualInt(len(probs1[i]), len(probs2[i]),
+      $"determinism: sample {i} vector length matches")
+    for var j: int = 0; j < len(probs1[i]); j++ =>
+      assertApproxDouble(probs1[i][j], probs2[i][j], 0.000001,
+        $"determinism: sample {i} probs[{j}] identical to 1e-6")
+
+  println("")
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero

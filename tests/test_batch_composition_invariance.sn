@@ -1,0 +1,346 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_batch_composition_invariance.sn — Phase G / Part 3 Test 6
+#
+# Reformulated from the original golden-path.md Test 6 "train/predict
+# shape contract" (which was written under the homogeneous-batch
+# assumption and became largely vacuous after heterogeneous batching
+# landed) to the canonical invariance property that every production
+# GNN test suite checks:
+#
+# **A graph's prediction must be independent of which other graphs
+# it is batched with.**
+#
+# Formally, for any model M and any set of graphs G_1..G_K:
+#
+# M.forward(G_i)  ==  M.forward(batchGraphs([G_1..G_K]))[i]
+#
+# up to float32 precision, for every i. This catches the entire
+# category of bugs that heterogeneous batching introduces:
+#
+# - batchIndex / mean_pool leakage (nodes from graph B contributing
+# to graph A's pooled embedding)
+# - Edge index offset bugs (edges in graph B pointing at row indices
+# that happen to land in graph A's slot)
+# - Padding contamination (zero-padded rows bleeding through
+# aggregation or pool)
+# - Normalization mode mismatch (e.g. sum_normalized computed over
+# the whole batch instead of per-graph)
+# - Permutation dependence (reordering the batch changing
+# predictions)
+#
+# The test is structured in three parts:
+#
+# Part A — Batch composition invariance
+# Compute per-graph probs via three solo forward() calls.
+# Compute the same probs via a single forward(batchGraphs(...))
+# call. Assert row-by-row equivalence to 1e-5.
+#
+# Part B — Permutation invariance
+# Rebuild the merged graph with the inputs in a DIFFERENT order.
+# Assert the per-graph probs still match the original solo probs
+# (just at different rows of the batched output).
+#
+# Part C — Post-train consistency
+# Train the model briefly on the three graphs. Assert Part A
+# still holds on the trained model. This is the Bug B1 spirit
+# test: if train's internal forward path saw something different
+# from what predict sees for the same graph, the trained model's
+# predictions would diverge between the two paths.
+#
+# Sanity checks precede every assertion block:
+# - Each solo prediction has length == numActions
+# - The batched output has length == K * numActions
+# - Per-graph probs sum to 1.0 (softmax sanity)
+# - Solo predictions for the three distinct graphs are NOT identical
+# (otherwise the invariance check would pass trivially)
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Graph builders — three heterogeneous graphs with different numNodes,
+# different numEdges, and distinct feature distributions.
+# ---------------------------------------------------------------------------
+
+# 3 nodes, chain 0→1→2 + self-loops. 5 edges total.
+fn buildG1(): GraphTensors =>
+  var feats: double[] = {
+    1.0, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0
+  }
+  # edgeIndex layout: row 0 = sources, row 1 = destinations
+  var edges: double[] = {
+    0.0, 1.0, 2.0, 0.0, 1.0,
+    0.0, 1.0, 2.0, 1.0, 2.0
+  }
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, 3, 3),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 5),
+    edgeWeight: Tensor.fromDoubles({1.0, 1.0, 1.0, 1.0, 1.0}, 1, 5),
+    batchIndex: Tensor.fromDoubles({0.0, 0.0, 0.0}, 3, 1),
+    numNodes: 3, numEdges: 5, featureDim: 3
+  }
+
+# 5 nodes, denser — self-loops + chain 0→1→2→3→4 + shortcut 0→4.
+# 10 edges total.
+fn buildG2(): GraphTensors =>
+  var feats: double[] = {
+    0.9, 0.1, 0.0,
+    0.5, 0.5, 0.0,
+    0.1, 0.9, 0.0,
+    0.0, 0.5, 0.5,
+    0.0, 0.0, 1.0
+  }
+  var edges: double[] = {
+    0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 1.0, 2.0, 3.0, 0.0,
+    0.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 4.0
+  }
+  var w: double[] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, 5, 3),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 10),
+    edgeWeight: Tensor.fromDoubles(w, 1, 10),
+    batchIndex: Tensor.fromDoubles({0.0, 0.0, 0.0, 0.0, 0.0}, 5, 1),
+    numNodes: 5, numEdges: 10, featureDim: 3
+  }
+
+# 2 nodes, edge 0→1 + two self-loops. 3 edges total.
+fn buildG3(): GraphTensors =>
+  var feats: double[] = {
+    0.3, 0.3, 0.4,
+    0.2, 0.5, 0.3
+  }
+  var edges: double[] = {
+    0.0, 1.0, 0.0,
+    0.0, 1.0, 1.0
+  }
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(feats, 2, 3),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 3),
+    edgeWeight: Tensor.fromDoubles({1.0, 1.0, 1.0}, 1, 3),
+    batchIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    numNodes: 2, numEdges: 3, featureDim: 3
+  }
+
+# ---------------------------------------------------------------------------
+# Slicing helpers
+# ---------------------------------------------------------------------------
+
+# Extract row i from a flat row-major double[] of length rows*cols,
+# returning cols doubles.
+fn sliceRow(flat: double[], row: int, cols: int): double[] =>
+  var out: double[] = {}
+  for var k: int = 0; k < cols; k++ =>
+    out.push(flat[row * cols + k])
+  return out
+
+fn probsSum(p: double[]): double =>
+  var s: double = 0.0
+  for var i: int = 0; i < len(p); i++ =>
+    s = s + p[i]
+  return s
+
+fn probsDiffer(a: double[], b: double[]): bool =>
+  if len(a) != len(b) =>
+    return true
+  for var i: int = 0; i < len(a); i++ =>
+    var d: double = a[i] - b[i]
+    if d < 0.0 =>
+      d = -d
+    if d > 0.01 =>
+      return true
+  return false
+
+# Compare two probability vectors elementwise within tolerance, emitting
+# one assertion per dimension labeled with `msg`.
+fn assertProbsClose(actual: double[], expected: double[],
+  tol: double, msg: str): void =>
+  assertEqualInt(len(actual), len(expected),
+    $"{msg}: vector length matches")
+  for var i: int = 0; i < len(actual); i++ =>
+    assertApproxDouble(actual[i], expected[i], tol,
+      $"{msg}: element [{i}]")
+
+# ---------------------------------------------------------------------------
+# Part A — Batch composition invariance (pre-train)
+# ---------------------------------------------------------------------------
+
+fn partA(model: Gnn, label: str): void =>
+  println($"--- Part A: batch composition invariance ({label}) ---")
+  var numActions: int = 3
+
+  # Build fresh graphs for each call so Tensor pool slots don't alias
+  # across forward() invocations.
+  var g1: GraphTensors = buildG1()
+  var g2: GraphTensors = buildG2()
+  var g3: GraphTensors = buildG3()
+
+  # Solo forwards — read probs as plain double[] so the Tensor lifetime
+  # stops mattering.
+  var solo1: double[] = model.forward(g1, false).probs.toDoubles()
+  var solo2: double[] = model.forward(g2, false).probs.toDoubles()
+  var solo3: double[] = model.forward(g3, false).probs.toDoubles()
+
+  println($"  solo1=[{solo1[0]}, {solo1[1]}, {solo1[2]}]")
+  println($"  solo2=[{solo2[0]}, {solo2[1]}, {solo2[2]}]")
+  println($"  solo3=[{solo3[0]}, {solo3[1]}, {solo3[2]}]")
+
+  # Sanity: each solo row has the right shape and sums to 1.
+  assertEqualInt(len(solo1), numActions,
+    $"{label}: solo1 length == numActions")
+  assertEqualInt(len(solo2), numActions,
+    $"{label}: solo2 length == numActions")
+  assertEqualInt(len(solo3), numActions,
+    $"{label}: solo3 length == numActions")
+  assertApproxDouble(probsSum(solo1), 1.0, 0.00001,
+    $"{label}: solo1 is a probability distribution (sums to 1)")
+  assertApproxDouble(probsSum(solo2), 1.0, 0.00001,
+    $"{label}: solo2 is a probability distribution")
+  assertApproxDouble(probsSum(solo3), 1.0, 0.00001,
+    $"{label}: solo3 is a probability distribution")
+
+  # Sanity: the three distinct graphs produce distinct predictions
+  # (otherwise the invariance check would pass trivially on uniform
+  # outputs).
+  assertTrue(probsDiffer(solo1, solo2),
+    $"{label}: solo1 and solo2 predictions actually differ")
+  assertTrue(probsDiffer(solo2, solo3),
+    $"{label}: solo2 and solo3 predictions actually differ")
+  assertTrue(probsDiffer(solo1, solo3),
+    $"{label}: solo1 and solo3 predictions actually differ")
+
+  # Batched forward. Fresh graph builders so edge indices aren't
+  # mutated by any internal copy.
+  var merged: GraphTensors = batchGraphs({buildG1(), buildG2(), buildG3()})
+  var batchedFlat: double[] = model.forward(merged, false).probs.toDoubles()
+
+  assertEqualInt(len(batchedFlat), 3 * numActions,
+    $"{label}: batched output has 3 * numActions entries")
+
+  var batched1: double[] = sliceRow(batchedFlat, 0, numActions)
+  var batched2: double[] = sliceRow(batchedFlat, 1, numActions)
+  var batched3: double[] = sliceRow(batchedFlat, 2, numActions)
+
+  println($"  batched1=[{batched1[0]}, {batched1[1]}, {batched1[2]}]")
+  println($"  batched2=[{batched2[0]}, {batched2[1]}, {batched2[2]}]")
+  println($"  batched3=[{batched3[0]}, {batched3[1]}, {batched3[2]}]")
+
+  # Sanity: each batched row sums to 1 (per-graph softmax).
+  assertApproxDouble(probsSum(batched1), 1.0, 0.00001,
+    $"{label}: batched[0] sums to 1 (per-graph softmax)")
+  assertApproxDouble(probsSum(batched2), 1.0, 0.00001,
+    $"{label}: batched[1] sums to 1")
+  assertApproxDouble(probsSum(batched3), 1.0, 0.00001,
+    $"{label}: batched[2] sums to 1")
+
+  # THE invariance assertions: batched[i] must match solo_i.
+  assertProbsClose(batched1, solo1, 0.00001,
+    $"{label}: batched[0] matches forward(G1)")
+  assertProbsClose(batched2, solo2, 0.00001,
+    $"{label}: batched[1] matches forward(G2)")
+  assertProbsClose(batched3, solo3, 0.00001,
+    $"{label}: batched[2] matches forward(G3)")
+
+# ---------------------------------------------------------------------------
+# Part B — Permutation invariance
+# ---------------------------------------------------------------------------
+
+fn partB(model: Gnn): void =>
+  println("--- Part B: permutation invariance ---")
+  var numActions: int = 3
+
+  # Solo baselines.
+  var solo1: double[] = model.forward(buildG1(), false).probs.toDoubles()
+  var solo2: double[] = model.forward(buildG2(), false).probs.toDoubles()
+  var solo3: double[] = model.forward(buildG3(), false).probs.toDoubles()
+
+  # Merged in swapped order: [G3, G1, G2].
+  var merged: GraphTensors = batchGraphs({buildG3(), buildG1(), buildG2()})
+  var batchedFlat: double[] = model.forward(merged, false).probs.toDoubles()
+
+  assertEqualInt(len(batchedFlat), 3 * numActions,
+    "permuted batched output has 3 * numActions entries")
+
+  var permuted0: double[] = sliceRow(batchedFlat, 0, numActions)
+  var permuted1: double[] = sliceRow(batchedFlat, 1, numActions)
+  var permuted2: double[] = sliceRow(batchedFlat, 2, numActions)
+
+  println($"  permuted[0]=[{permuted0[0]}, {permuted0[1]}, {permuted0[2]}] (expect solo3)")
+  println($"  permuted[1]=[{permuted1[0]}, {permuted1[1]}, {permuted1[2]}] (expect solo1)")
+  println($"  permuted[2]=[{permuted2[0]}, {permuted2[1]}, {permuted2[2]}] (expect solo2)")
+
+  # Permuted batch must yield the solo predictions at their new slots.
+  assertProbsClose(permuted0, solo3, 0.00001,
+    "permuted[0] matches forward(G3)")
+  assertProbsClose(permuted1, solo1, 0.00001,
+    "permuted[1] matches forward(G1)")
+  assertProbsClose(permuted2, solo2, 0.00001,
+    "permuted[2] matches forward(G2)")
+
+# ---------------------------------------------------------------------------
+# Part C — Post-train consistency (Bug B1 spirit)
+# ---------------------------------------------------------------------------
+
+fn partC(): void =>
+  println("--- Part C: post-train batch composition invariance ---")
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 2, arch: "gat", dropoutRate: 0.0
+  }
+  var model: Gnn = Gnn.createWithSeed(config, 7l)
+
+  # Train briefly on the three heterogeneous graphs so the weights
+  # move off their Kaiming init. 30 epochs is plenty to exercise the
+  # pad-to-max / per-batch-upload path; we don't care about
+  # convergence, only that the model reaches a non-trivial state.
+  var labels: double[] = {
+    1.0, 0.0, 0.0, # G1 � � � action 0
+    0.0, 1.0, 0.0, # G2 � � � action 1
+    0.0, 0.0, 1.0 # G3 � � � action 2
+  }
+  var weights: double[] = {1.0, 1.0, 1.0}
+  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var result: TrainResult = model.train(
+    {buildG1(), buildG2(), buildG3()},
+    labels, weights, opt, 30, 3, 0.0, 42l)
+  println($"  trained: loss={result.loss} accuracy={result.accuracy}")
+
+  # The trained model must still show batch composition invariance.
+  # If train's internal pad-to-max forward saw something different
+  # from what predict sees for the same graph, the invariance would
+  # break here (this is the Bug B1 spirit: same code path for train
+  # and predict on identical inputs).
+  partA(model, "trained")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+fn main(): void =>
+  println("=== test_batch_composition_invariance — Phase G ===")
+  println("")
+
+  # Pre-train model with Kaiming init → non-trivial distinct
+  # per-graph predictions out of the box.
+  var config: GnnConfig = {
+    inputDim: 3, hiddenDim: 8, numActions: 3,
+    numLayers: 2, arch: "gat", dropoutRate: 0.0
+  }
+  var preModel: Gnn = Gnn.createWithSeed(config, 7l)
+
+  partA(preModel, "pre-train")
+  println("")
+  partB(preModel)
+  println("")
+  partC()
+  println("")
+
+  summary()
+
+  if failed() > 0 =>
+    var zero: int = 0
+    var _crash: int = 1 / zero
