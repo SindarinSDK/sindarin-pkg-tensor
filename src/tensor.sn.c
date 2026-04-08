@@ -234,8 +234,11 @@ static struct ggml_tensor   *g_opt_weights_tensor   = NULL;
  * walks the registry every batch to upload freshly assembled host buffers.
  *
  * See docs/issues/heterogeneous-graph-batching.md for the rationale. */
-#define PB_KIND_ADJ  1
-#define PB_KIND_POOL 2
+#define PB_KIND_ADJ       1
+#define PB_KIND_POOL      2
+#define PB_KIND_ATT_MASK  3  /* Phase L: attention mask derived from adj_buf:
+                              * 0.0f where adj_buf[d,s] > 0 (edge exists),
+                              * -1e9f otherwise (non-edge → softmax zeros it). */
 #define PB_MODE_SUM            0
 #define PB_MODE_SUM_NORMALIZED 1
 #define PB_MODE_MEAN           2
@@ -413,12 +416,17 @@ static struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata) {
 }
 
 /* ============================================================================
- * Phase J: training metric callback
+ * Phase J / Phase M: training metric callback
  *
  * Consumers (skynet's MetricsClient) register a Sindarin lambda via
  * sn_graph_set_train_metric_callback. During Gnn.train() the package
- * emits (name, value) pairs via sn_graph_emit_train_metric, which
- * invokes the registered closure if one is set.
+ * emits (name, value, labels) tuples via sn_graph_emit_train_metric,
+ * which invokes the registered closure if one is set.
+ *
+ * The `labels` arg is a Sindarin StringField[] — an SnArray of (key,
+ * value) string pairs. It is passed as an opaque SnArray pointer
+ * through the C→closure boundary; the callback's compiled Sindarin
+ * body receives it back as StringField[] and can iterate.
  *
  * Closure ABI is copied from sindarin-pkg-threads/src/threads_internal.h:
  *   [0]              void *fn       — function pointer
@@ -458,12 +466,12 @@ void sn_graph_clear_train_metric_callback(void)
     if (g_train_metric_cb) { free(g_train_metric_cb); g_train_metric_cb = NULL; }
 }
 
-void sn_graph_emit_train_metric(char *name, double value)
+void sn_graph_emit_train_metric(char *name, double value, SnArray *labels)
 {
     if (!g_train_metric_cb) return;
-    typedef void (*CbFn)(void *closure, char *name, double value);
+    typedef void (*CbFn)(void *closure, char *name, double value, SnArray *labels);
     CbFn fn = (CbFn)(*(void **)g_train_metric_cb);
-    fn(g_train_metric_cb, name, value);
+    fn(g_train_metric_cb, name, value, labels);
 }
 
 /* ======================================================================
@@ -604,6 +612,7 @@ double sn_graph_train_epoch(
 
     float *features_buf = (float *)calloc((size_t)features_per_batch, sizeof(float));
     float *adj_buf      = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
+    float *att_mask_buf = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
     float *pool_buf     = (float *)calloc((size_t)n_per_batch * (size_t)nodes_per_batch, sizeof(float));
     float *labels_buf   = (float *)malloc(labels_bytes);
     float *weights_buf  = (float *)malloc(weights_bytes);
@@ -689,6 +698,24 @@ double sn_graph_train_epoch(
             weights_buf[i] = (float)(*w);
         }
 
+        /* Derive the Phase L attention additive mask from adj_buf:
+         * 0.0f where adj_buf > 0 (edge exists), -10.0f elsewhere
+         * (non-edge). Added to the logits before softmax. -10 is
+         * chosen (instead of the naive -1e9) because -1e9 is
+         * numerically extreme enough to make the softmax-backward's
+         * gradient effectively zero at edge positions too (the
+         * softmax output concentrates to ~0/1/num_edges per dest,
+         * and the `y*(dy - dot(y,dy))` backward produces vanishing
+         * values for the edge slots). -10 is still enough to
+         * suppress non-edge attention (exp(-10) ≈ 4e-5) while
+         * preserving gradient flow. */
+        {
+            const long long nn2 = nodes_per_batch * nodes_per_batch;
+            for (long long k = 0; k < nn2; k++) {
+                att_mask_buf[k] = (adj_buf[k] > 0.0f) ? 0.0f : -10.0f;
+            }
+        }
+
         /* Allocate the OPT graph for this batch (cached after first call) */
         ggml_opt_alloc(g_opt_ctx, /*backward =*/ true);
 
@@ -697,11 +724,14 @@ double sn_graph_train_epoch(
         ggml_backend_tensor_set(g_opt_labels_tensor,   labels_buf,   0, labels_bytes);
         ggml_backend_tensor_set(g_opt_weights_tensor,  weights_buf,  0, weights_bytes);
 
-        /* Upload the batched adjacency / pool matrix to every tensor in the
-         * per-batch registry. Within a single Gnn.train() call all ADJ
-         * tensors share the same edgeIndex/edgeWeight + mode (because every
-         * layer's `aggregate()` is called with the same args), so they all
-         * receive the same buffer; same story for the (single) POOL tensor. */
+        /* Upload the batched adjacency / pool matrix / attention mask
+         * to every tensor in the per-batch registry. Within a single
+         * Gnn.train() call all ADJ tensors share the same
+         * edgeIndex/edgeWeight + mode (every layer's aggregate()
+         * sees the same args), so they all receive the same buffer;
+         * same story for the (single) POOL tensor. ATT_MASK tensors
+         * (one per attention layer) all receive the same mask
+         * buffer. */
         for (int r = 0; r < g_pb_count; r++) {
             int pool_idx = g_pb_pool_idx[r];
             struct ggml_tensor *gt = g_record_map[pool_idx];
@@ -715,6 +745,10 @@ double sn_graph_train_epoch(
                 size_t want = pool_bytes;
                 size_t have = ggml_nbytes(gt);
                 ggml_backend_tensor_set(gt, pool_buf, 0, want < have ? want : have);
+            } else if (g_pb_kind[r] == PB_KIND_ATT_MASK) {
+                size_t want = adj_bytes; /* same shape as adj_buf */
+                size_t have = ggml_nbytes(gt);
+                ggml_backend_tensor_set(gt, att_mask_buf, 0, want < have ? want : have);
             }
         }
 
@@ -729,6 +763,7 @@ double sn_graph_train_epoch(
 
     free(features_buf);
     free(adj_buf);
+    free(att_mask_buf);
     free(pool_buf);
     free(labels_buf);
     free(weights_buf);
@@ -1400,34 +1435,187 @@ RtTensor *sn_tensor_sparse_aggregate(RtTensor *features, RtTensor *edge_index,
 }
 
 RtTensor *sn_tensor_attention_aggregate(RtTensor *features, RtTensor *edge_index,
-                                        RtTensor *edge_weight, RtTensor *att_weight)
+                                        RtTensor *edge_weight, RtTensor *att_src, RtTensor *att_dst)
 {
     TPool *px  = unwrap(features);
     TPool *pei = unwrap(edge_index);
-    TPool *paw = unwrap(att_weight);
+    TPool *pas = unwrap(att_src);
+    TPool *pad = unwrap(att_dst);
 
     int64_t num_nodes = px->ne[1];
     int64_t feat_dim  = px->ne[0];
     int64_t num_edges = pei->ne[0];
 
-    if (g_record_mode) return sn_tensor_sparse_aggregate(features, edge_index, edge_weight, "sum");
-    int64_t att_dim   = paw->n_elem;
+    if (g_record_mode) {
+        /* Phase L: attention as a differentiable ggml subgraph.
+         *
+         * The previous record-mode implementation fell back to
+         * sparse_aggregate with "sum", which (a) silently degraded
+         * GAT training to sum aggregation and (b) never referenced
+         * the attention parameters, so they received no gradients
+         * and stayed at their init value forever. At inference time
+         * the full attention code then ran with zero attention
+         * weights, producing a degenerate uniform-attention pass
+         * that looked like mean aggregation. Net effect: `arch:
+         * "gat"` was sum-train / mean-infer with no learned edge
+         * weighting. Closed out as part of
+         * docs/issues/golden-path.md Phase L.
+         *
+         * Attention weights are stored as TWO separate parameter
+         * tensors (att_src and att_dst, each shape (feat_dim, 1))
+         * rather than one (feat_dim*2, 1) tensor split by view.
+         * ggml's VIEW op backward path does accumulate into the
+         * source via ggml_acc_or_set, but empirically (verified by
+         * test_weight_update_proven.sn Phase L) gradients from the
+         * forward chain `view → reshape_2d → mul_mat → …` did not
+         * reach the PARAM tensor behind the view — the updated
+         * values after training exactly equaled the init values,
+         * max-abs-delta = 0. Splitting the parameter sidesteps this
+         * entirely: each half is a standalone ggml PARAM tensor
+         * used directly in mul_mat, and gradients flow through the
+         * standard backward path.
+         *
+         * Implementation sketch (all ggml ops with known backward):
+         *
+         *   1. src_scores[s] = sum_f features[f, s] * att_src[f]
+         *      via ggml_mul_mat(features, att_src).
+         *   2. dst_scores[d] = sum_f features[f, d] * att_dst[f] same.
+         *   3. Broadcast src_scores → h_src_rows[s, d] = src_scores[s]
+         *      via ggml_repeat onto a (nn, nn) template (the mask).
+         *   4. Reshape + broadcast dst_scores → h_dst_cols[s, d] =
+         *      dst_scores[d] similarly.
+         *   5. scores = h_src_rows + h_dst_cols.
+         *   6. scores_leaky = relu(scores) - 0.2 * relu(-scores)
+         *      (LEAKY_RELU has no backward in this fork).
+         *   7. Per-destination softmax with a per-batch-uploaded
+         *      attention mask: mask[d, s] = 0 for edges, -1e9 for
+         *      non-edges. ggml_soft_max_ext with max_bias=0 adds the
+         *      mask to the logits before softmax, so non-edge
+         *      positions collapse to ~0 probability.
+         *   8. out[f, d] = sum_s features[f, s] * alpha[s, d] via
+         *      ggml_mul_mat(features_T, alpha), same contraction
+         *      sparse_aggregate uses.
+         *
+         * The attention mask tensor is registered as PB_KIND_ATT_MASK
+         * and uploaded per batch from att_mask_buf, which is derived
+         * from adj_buf inside sn_graph_train_epoch (non-zero adj cell
+         * → edge exists → mask cell = 0; else -1e9).
+         */
+        int64_t nn = num_nodes;
+        int64_t fd = feat_dim;
+
+        /* Per-batch uploaded edge indicator mask: 1.0 at edges, 0.0
+         * elsewhere. Applied multiplicatively (not additively) so
+         * non-edge positions zero out the attention weights after
+         * softmax, followed by per-destination renormalization. */
+        int mask_idx = pool_alloc(nn, nn, 2);
+        TPool *mask_pool = &g_pool[mask_idx];
+        memset(mask_pool->data, 0, (size_t)(nn * nn) * sizeof(float));
+        struct ggml_tensor *gmask = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, nn, nn);
+        ggml_set_name(gmask, "att_edge_mask");
+        ggml_set_input(gmask);
+        g_record_map[mask_idx] = gmask;
+        track_per_batch(mask_idx, PB_KIND_ATT_MASK, 0);
+
+        /* Dedicated (nn, nn) zero tensor used ONLY as the shape
+         * template for broadcast-add when building the score matrix.
+         * Separate from gmask so gmask is referenced only once in the
+         * forward graph. */
+        int zero_idx = pool_alloc(nn, nn, 2);
+        TPool *zero_pool = &g_pool[zero_idx];
+        memset(zero_pool->data, 0, (size_t)(nn * nn) * sizeof(float));
+        struct ggml_tensor *gzero = ggml_new_tensor_2d(g_param_ctx, GGML_TYPE_F32, nn, nn);
+        ggml_set_name(gzero, "att_zero_base");
+        ggml_set_input(gzero);
+        g_record_map[zero_idx] = gzero;
+
+        /* Reference the existing recorded tensors. Both att_src and
+         * att_dst are registered as PARAM tensors via sn_graph_param
+         * by Gnn.train(), so rec_tensor returns their ggml handles. */
+        struct ggml_tensor *gfeat    = rec_tensor(features); /* ne[0]=fd, ne[1]=nn */
+        struct ggml_tensor *gatt_src = rec_tensor(att_src);  /* ne[0]=fd, ne[1]=1 */
+        struct ggml_tensor *gatt_dst = rec_tensor(att_dst);  /* ne[0]=fd, ne[1]=1 */
+
+        /* Full Phase L attention subgraph.
+         *
+         * The attention mask is baked into the logits as a MODEST
+         * additive bias (-10 for non-edges, 0 for edges) rather than
+         * the naive -1e9. Bisected finding: values of -1e9 (or
+         * anything large enough to hard-zero the softmax output at
+         * non-edge positions) numerically kill the gradient of the
+         * softmax backward pass even at edge positions — the
+         * `y*(dy - dot(y,dy))` formula produces effectively-zero
+         * outputs once the softmax concentrates to near-0/near-1.
+         * -10 is still enough to suppress non-edge attention
+         * (exp(-10) ≈ 4.5e-5 per position) while preserving a
+         * meaningful gradient path back to att_src / att_dst.
+         *
+         * Other hard-learned constraints from the bisect:
+         *  - ggml_soft_max_ext(a, mask, ...) with a per-batch-uploaded
+         *    mask breaks gradient flow upstream; fold the mask into
+         *    the logits manually via ggml_add and use plain
+         *    ggml_soft_max instead. Mathematically identical when
+         *    max_bias=0 and scale=1, because soft_max_ext adds the
+         *    mask to the scaled logits (ops.cpp::soft_max_f32:5301).
+         *  - The (nn, nn) score matrix is built via broadcast-add
+         *    against a dedicated zero tensor (gzero), not the mask
+         *    itself — referencing gmask more than once in the graph
+         *    empirically correlated with gradient loss.
+         */
+        struct ggml_tensor *src_scores = ggml_mul_mat(g_record_ctx, gfeat, gatt_src); /* (nn,1) */
+        struct ggml_tensor *dst_scores = ggml_mul_mat(g_record_ctx, gfeat, gatt_dst); /* (nn,1) */
+
+        /* Build the (nn, nn) score matrix S[s,d] = src_scores[s] + dst_scores[d]
+         * via broadcast-add. gzero is the dedicated zero-valued shape
+         * template; gmask is kept pristine for its single use in the
+         * softmax mask-fold below. */
+        struct ggml_tensor *score_plus_src = ggml_add(g_record_ctx, gzero, src_scores);
+        struct ggml_tensor *dst_row = ggml_reshape_2d(g_record_ctx, dst_scores, 1, nn);
+        struct ggml_tensor *scores_t = ggml_add(g_record_ctx, score_plus_src, dst_row);
+
+        /* LeakyReLU (manual composition — LEAKY_RELU has no backward
+         * pass in this fork). */
+        struct ggml_tensor *pos_part = ggml_relu(g_record_ctx, scores_t);
+        struct ggml_tensor *neg_in   = ggml_neg(g_record_ctx, scores_t);
+        struct ggml_tensor *neg_relu = ggml_relu(g_record_ctx, neg_in);
+        struct ggml_tensor *neg_part = ggml_scale(g_record_ctx, neg_relu, 0.2f);
+        struct ggml_tensor *scores_leaky = ggml_sub(g_record_ctx, pos_part, neg_part);
+
+        /* Fold the mask into the logits manually. gmask has 0 for
+         * edges, -1e9 for non-edges. Adding it to scores_leaky forces
+         * non-edge positions to a very negative logit so the softmax
+         * output at those positions is ~0 (correctly zeroing out
+         * non-edge attention). */
+        struct ggml_tensor *scores_masked = ggml_add(g_record_ctx, scores_leaky, gmask);
+
+        /* Per-destination softmax over ne[0] (sources). Plain
+         * ggml_soft_max (not soft_max_ext with mask) to preserve
+         * gradient flow through the scores_masked chain. */
+        struct ggml_tensor *alpha = ggml_soft_max(g_record_ctx, scores_masked);
+
+        /* Aggregate: out[f, d] = sum_s features[f, s] * alpha[s, d]
+         * Same contraction pattern sparse_aggregate uses at its tail. */
+        struct ggml_tensor *gfeat_t = ggml_cont(g_record_ctx,
+            ggml_transpose(g_record_ctx, gfeat));
+        ggml_set_name(gfeat_t, "att_feat_T");
+        struct ggml_tensor *result = ggml_mul_mat(g_record_ctx, gfeat_t, alpha);
+        ggml_set_name(result, "att_result");
+        return rec_wrap(result, fd, nn);
+    }
 
     int idx = pool_alloc(feat_dim, num_nodes, 2);
     TPool *out = &g_pool[idx];
 
-    /* Compute attention scores */
+    /* Compute attention scores using split att_src/att_dst params.
+     * Each param is a flat (feat_dim,) vector in memory. */
     float *scores = (float *)calloc((size_t)num_edges, sizeof(float));
     for (int64_t i = 0; i < num_edges; i++) {
         int64_t s = (int64_t)pei->data[i];
         int64_t d = (int64_t)pei->data[num_edges + i];
         float score = 0.0f;
-        /* Dot product of concat(features[s], features[d]) with att_weight */
-        for (int64_t f = 0; f < feat_dim && f < att_dim; f++) {
-            score += px->data[s * feat_dim + f] * paw->data[f];
-        }
-        for (int64_t f = 0; f < feat_dim && (feat_dim + f) < att_dim; f++) {
-            score += px->data[d * feat_dim + f] * paw->data[feat_dim + f];
+        for (int64_t f = 0; f < feat_dim; f++) {
+            score += px->data[s * feat_dim + f] * pas->data[f];
+            score += px->data[d * feat_dim + f] * pad->data[f];
         }
         /* LeakyReLU */
         scores[i] = score > 0.0f ? score : score * 0.2f;

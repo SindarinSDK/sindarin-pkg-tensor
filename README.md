@@ -303,27 +303,42 @@ signal. Covered by `tests/test_predict_batch_and_divergence.sn`.
 
 For continuous metric streaming into a consumer-side metrics store
 (e.g. skynet's Postgres-backed dashboard), register a callback via
-`sn_graph_set_train_metric_callback`. The package emits named metrics
-per epoch and once more at end-of-train.
+`sn_graph_set_train_metric_callback`. The package emits structured
+`(name, value, labels)` tuples per epoch and once more at
+end-of-train. `labels` is a `StringField[]` where each entry is a
+`{key, value}` pair — labels follow the Prometheus-style convention
+so consumers can filter and group metrics by dimension.
 
 ```sindarin
-var cb: fn(str, double): void = fn(name: str, value: double): void =>
-  # forward into your MetricsClient, log, etc.
-  println($"{name} = {value}")
+var cb: fn(str, double, StringField[]): void =
+  fn(name: str, value: double, labels: StringField[]): void =>
+    # forward into your MetricsClient, log, etc.
+    var labelStr: str = ""
+    for var i: int = 0; i < len(labels); i++ =>
+      if i > 0 =>
+        labelStr = labelStr + ","
+      labelStr = labelStr + labels[i].key + "=" + labels[i].value
+    println($"{name}[{labelStr}] = {value}")
 sn_graph_set_train_metric_callback(cb)
 
 var result: TrainResult = model.train(graphs, labels, weights, opt, ...)
-# cb was invoked per epoch with train_loss + grad_norm_l2,
-# and once at the end with weight_sum_in, weight_variance_in,
-# input_mean, input_std, accuracy, and per-parameter
-# param_norm_before/{i}, param_norm_after/{i}, param_max_abs_delta/{i}.
+# cb was invoked:
+#   - per epoch with ("train_loss", v, [{epoch, "E"}])
+#     and ("grad_norm_l2", v, [{epoch, "E"}])
+#   - once at end with ("weight_sum_in", v, []), ("weight_variance_in", v, []),
+#     ("input_mean", v, []), ("input_std", v, []), ("accuracy", v, [])
+#   - per layer param with ("param_norm_before", v, [{layer, "L"}, {kind, "K"}])
+#     where K ∈ {weight, bias, attSrc, attDst}
+#   - per classifier param with ("param_norm_before", v, [{kind, "classW1|classB1|classW2|classB2"}])
+#   - same set for "param_norm_after" and "param_max_abs_delta"
 
 sn_graph_clear_train_metric_callback()
 ```
 
-The callback is deep-copied on registration and survives across
-multiple `train()` calls until explicitly cleared. Covered by
-`tests/test_train_metric_callback.sn`.
+`StringField` is a small local struct in `src/tensor.sn` with two
+fields: `key: str` and `value: str`. The callback is deep-copied on
+registration and survives across multiple `train()` calls until
+explicitly cleared. Covered by `tests/test_train_metric_callback.sn`.
 
 ## Backend
 

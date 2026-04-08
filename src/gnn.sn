@@ -56,7 +56,16 @@ struct GnnOutput =>
 struct GnnLayer =>
   weight: Tensor
   bias: Tensor
-  attWeight: Tensor
+  # Phase L: attention weights are stored as TWO separate parameter
+  # tensors rather than one (2*outputDim) tensor split by ggml_view.
+  # The view-based layout broke gradient flow to the underlying PARAM
+  # tensor during training (max-abs-delta stayed at zero after 50
+  # epochs of backprop). Splitting into standalone params sidesteps
+  # ggml's view-backprop path and each half is used directly in its
+  # own ggml_mul_mat. See the docstring on sn_tensor_attention_aggregate
+  # in tensor.sn.c for the full record-mode subgraph.
+  attSrc: Tensor
+  attDst: Tensor
   inputDim: int
   outputDim: int
   arch: str
@@ -66,31 +75,38 @@ struct GnnLayer =>
     var layer: GnnLayer = GnnLayer {
       weight: Tensor.zeros(outputDim, inputDim),
       bias: Tensor.zeros(1, outputDim),
-      attWeight: Tensor.zeros(1, 2 * outputDim),
+      attSrc: Tensor.zeros(1, outputDim),
+      attDst: Tensor.zeros(1, outputDim),
       inputDim: inputDim,
       outputDim: outputDim,
       arch: arch,
       dropoutRate: dropoutRate
     }
     layer.weight.initKaiming()
+    layer.attSrc.initKaiming()
+    layer.attDst.initKaiming()
     return layer
 
   # Deterministic variant of create(): seeds the weight tensor's Kaiming
   # init from the given value so two runs with the same seed produce
-  # bit-identical layers. bias and attWeight remain at zeros (matching
-  # create()).
+  # bit-identical layers. bias remains at zero; attSrc/attDst are
+  # Kaiming-seeded with distinct per-role seed offsets so the attention
+  # head starts in a non-degenerate regime from epoch 0.
   static fn createWithSeed(arch: str, inputDim: int, outputDim: int,
     dropoutRate: double, seed: long): GnnLayer =>
     var layer: GnnLayer = GnnLayer {
       weight: Tensor.zeros(outputDim, inputDim),
       bias: Tensor.zeros(1, outputDim),
-      attWeight: Tensor.zeros(1, 2 * outputDim),
+      attSrc: Tensor.zeros(1, outputDim),
+      attDst: Tensor.zeros(1, outputDim),
       inputDim: inputDim,
       outputDim: outputDim,
       arch: arch,
       dropoutRate: dropoutRate
     }
     layer.weight.initKaimingSeeded(seed)
+    layer.attSrc.initKaimingSeeded(seed + 100000l)
+    layer.attDst.initKaimingSeeded(seed + 200000l)
     return layer
 
   fn forward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
@@ -128,7 +144,7 @@ struct GnnLayer =>
 
   fn gatForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
     var h: Tensor = x.gnnMatmul(self.weight).add(self.bias)
-    h = h.attentionAggregate(edgeIndex, edgeWeight, self.attWeight)
+    h = h.attentionAggregate(edgeIndex, edgeWeight, self.attSrc, self.attDst)
     h = h.relu().dropout(self.dropoutRate, training)
     if self.inputDim == self.outputDim =>
       h = h.add(x)
@@ -136,7 +152,7 @@ struct GnnLayer =>
 
   fn parameters(): Tensor[] =>
     if self.arch == "gat" =>
-      return {self.weight, self.bias, self.attWeight}
+      return {self.weight, self.bias, self.attSrc, self.attDst}
     return {self.weight, self.bias}
 
 # ---------------------------------------------------------------------------
@@ -289,7 +305,10 @@ struct Gnn =>
         idx = idx + 1
       if self.layers[i].arch == "gat" =>
         if idx < len(loaded) =>
-          self.layers[i].attWeight = loaded[idx]
+          self.layers[i].attSrc = loaded[idx]
+          idx = idx + 1
+        if idx < len(loaded) =>
+          self.layers[i].attDst = loaded[idx]
           idx = idx + 1
     if idx < len(loaded) =>
       self.classifierW1 = loaded[idx]
@@ -640,8 +659,14 @@ struct Gnn =>
           optimizer.weightDecay)
         lossCurve.push(epochLoss)
 
-        # --- Phase J: emit per-epoch train_loss to the metric callback.
-        sn_graph_emit_train_metric("train_loss", epochLoss)
+        # --- Phase M: emit per-epoch train_loss with {epoch} label.
+        var epochLabels: StringField[] = {
+          StringField {
+            key: "epoch",
+            value: $"{epoch}"
+          }
+        }
+        sn_graph_emit_train_metric("train_loss", epochLoss, epochLabels)
 
         # --- Phase C: per-epoch param-delta L2 norm.
         # gradNormCurve[epoch] = L2(params_after_epoch -
@@ -660,8 +685,8 @@ struct Gnn =>
         var gradThisEpoch: double = sqrt(deltaSqEpoch)
         gradNormCurve.push(gradThisEpoch)
 
-        # --- Phase J: emit per-epoch grad_norm_l2 to the metric callback.
-        sn_graph_emit_train_metric("grad_norm_l2", gradThisEpoch)
+        # --- Phase M: emit per-epoch grad_norm_l2 with {epoch} label.
+        sn_graph_emit_train_metric("grad_norm_l2", gradThisEpoch, epochLabels)
 
     sn_graph_end()
 
@@ -707,19 +732,66 @@ struct Gnn =>
     # "final training loss"). Use lossCurve for the full trajectory.
     var finalLoss: double = lossCurve[len(lossCurve) - 1]
 
-    # --- Phase J: post-train scalar and per-parameter emissions.
+    # --- Phase M: post-train scalar and per-parameter emissions.
     # These fire once per train() call, after all epoch metrics have
     # been streamed. The consumer can reconstruct the full TrainResult
     # contents purely from the callback stream if they want to.
-    sn_graph_emit_train_metric("weight_sum_in", weightSumIn)
-    sn_graph_emit_train_metric("weight_variance_in", weightVarianceIn)
-    sn_graph_emit_train_metric("input_mean", inputMean)
-    sn_graph_emit_train_metric("input_std", inputStd)
-    sn_graph_emit_train_metric("accuracy", accuracy)
+    var noLabels: StringField[] = {}
+    sn_graph_emit_train_metric("weight_sum_in", weightSumIn, noLabels)
+    sn_graph_emit_train_metric("weight_variance_in", weightVarianceIn, noLabels)
+    sn_graph_emit_train_metric("input_mean", inputMean, noLabels)
+    sn_graph_emit_train_metric("input_std", inputStd, noLabels)
+    sn_graph_emit_train_metric("accuracy", accuracy, noLabels)
+
+    # Per-parameter emissions with structured (layer, kind) labels.
+    # The parameters() ordering is: layer params in order (weight,
+    # bias, [attSrc, attDst] for gat), then classifier params
+    # (classW1, classB1, classW2, classB2). Compute the label vector
+    # for each index.
+    var paramsPerLayer: int = 2
+    if self.config.arch == "gat" =>
+      paramsPerLayer = 4
+    var layerParamsTotal: int = len(self.layers) * paramsPerLayer
     for var i: int = 0; i < nParams; i++ =>
-      sn_graph_emit_train_metric($"param_norm_before/{i}", paramNormBefore[i])
-      sn_graph_emit_train_metric($"param_norm_after/{i}", paramNormAfter[i])
-      sn_graph_emit_train_metric($"param_max_abs_delta/{i}", paramMaxAbsDelta[i])
+      var plabels: StringField[] = {}
+      if i < layerParamsTotal =>
+        var layerIdx: int = i / paramsPerLayer
+        var kindIdx: int = i % paramsPerLayer
+        var kindName: str = "weight"
+        if kindIdx == 1 =>
+          kindName = "bias"
+        if kindIdx == 2 =>
+          kindName = "attSrc"
+        if kindIdx == 3 =>
+          kindName = "attDst"
+        plabels = {
+          StringField {
+            key: "layer",
+            value: $"{layerIdx}"
+          },
+          StringField {
+            key: "kind",
+            value: kindName
+          }
+        }
+      else =>
+        var clsIdx: int = i - layerParamsTotal
+        var clsName: str = "classW1"
+        if clsIdx == 1 =>
+          clsName = "classB1"
+        if clsIdx == 2 =>
+          clsName = "classW2"
+        if clsIdx == 3 =>
+          clsName = "classB2"
+        plabels = {
+          StringField {
+            key: "kind",
+            value: clsName
+          }
+        }
+      sn_graph_emit_train_metric("param_norm_before", paramNormBefore[i], plabels)
+      sn_graph_emit_train_metric("param_norm_after", paramNormAfter[i], plabels)
+      sn_graph_emit_train_metric("param_max_abs_delta", paramMaxAbsDelta[i], plabels)
 
     return TrainResult {
       loss: finalLoss,

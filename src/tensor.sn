@@ -91,8 +91,8 @@ native struct Tensor as ref =>
   fn aggregate(edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor =>
     return sn_tensor_sparse_aggregate(self, edgeIndex, edgeWeight, mode)
 
-  fn attentionAggregate(edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor =>
-    return sn_tensor_attention_aggregate(self, edgeIndex, edgeWeight, attWeight)
+  fn attentionAggregate(edgeIndex: Tensor, edgeWeight: Tensor, attSrc: Tensor, attDst: Tensor): Tensor =>
+    return sn_tensor_attention_aggregate(self, edgeIndex, edgeWeight, attSrc, attDst)
 
   fn meanPool(batchIndex: Tensor): Tensor =>
     return sn_tensor_mean_pool(self, batchIndex)
@@ -138,7 +138,7 @@ native fn sn_tensor_norm(t: Tensor): double
 native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
 native fn sn_tensor_argmax(t: Tensor, dim: int): int
 native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor
-native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attWeight: Tensor): Tensor
+native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attSrc: Tensor, attDst: Tensor): Tensor
 native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
 native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weights: Tensor): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
@@ -163,35 +163,44 @@ native fn sn_graph_param(t: Tensor): Tensor
 native fn sn_graph_compute_loss(t: Tensor): double
 
 # ---------------------------------------------------------------------------
-# Phase J: training metric callback (§4.2 of docs/issues/golden-path.md)
+# Phase J / Phase M: training metric callback (§4.2 of docs/issues/golden-path.md)
 #
-# Register a Sindarin lambda that receives (metric_name, value) pairs
-# emitted during Gnn.train(). Use for continuous metric streaming into
-# a consumer-side MetricsClient.
+# Register a Sindarin lambda that receives (metric_name, value, labels)
+# tuples emitted during Gnn.train(). Use for continuous metric streaming
+# into a consumer-side MetricsClient.
 #
-# Deviation from §4.2's doc spec: the doc called for
-# fn(name: str, value: double, labels: StringField[]): void
-# but StringField is not yet in the SDK. This two-arg form is the
-# stable subset — callers can pack label values into the metric name
-# ("param_norm_before/layer_0/weight") until the full form lands.
+# Phase M closed the Phase J deviation: the callback now takes the
+# full three-argument form matching the doc spec exactly. StringField
+# is a small local struct (key + value) defined in this file; when
+# sindarin-pkg-sdk grows a canonical StringField it can replace the
+# local form without breaking the callback signature.
 #
 # Emitted metrics in this release:
-# - "train_loss"           (per-epoch, matches TrainResult.lossCurve[e])
-# - "grad_norm_l2"         (per-epoch, matches TrainResult.gradNormCurve[e])
-# - "weight_sum_in"        (once per train)
-# - "weight_variance_in"   (once per train)
-# - "input_mean"           (once per train)
-# - "input_std"            (once per train)
-# - "accuracy"             (once per train)
-# - "param_norm_before/{i}"    (one per parameter)
-# - "param_norm_after/{i}"     (one per parameter)
-# - "param_max_abs_delta/{i}"  (one per parameter)
+# - "train_loss"           per epoch, labels=[{epoch, "E"}]
+# - "grad_norm_l2"         per epoch, labels=[{epoch, "E"}]
+# - "weight_sum_in"        once,      labels=[]
+# - "weight_variance_in"   once,      labels=[]
+# - "input_mean"           once,      labels=[]
+# - "input_std"            once,      labels=[]
+# - "accuracy"             once,      labels=[]
+# - "param_norm_before"    per layer+kind param, labels=[{layer,"L"},{kind,"K"}]
+# (kind ∈ {weight, bias, attSrc, attDst,
+# classW1, classB1, classW2, classB2};
+# classifier kinds have no layer label)
+# - "param_norm_after"     same labels as param_norm_before
+# - "param_max_abs_delta"  same labels as param_norm_before
 #
 # The callback is deep-copied on registration and survives across
-# multiple train() calls until explicitly cleared.
-native fn sn_graph_set_train_metric_callback(cb: fn(str, double): void): void
+# multiple train() calls until explicitly cleared. Consumers can filter
+# by metric name and then look up label values by key.
+
+struct StringField =>
+  key: str
+  value: str
+
+native fn sn_graph_set_train_metric_callback(cb: fn(str, double, StringField[]): void): void
 native fn sn_graph_clear_train_metric_callback(): void
-native fn sn_graph_emit_train_metric(name: str, value: double): void
+native fn sn_graph_emit_train_metric(name: str, value: double, labels: StringField[]): void
 
 # Per-epoch training driver. Lazy-initializes a static-graph ggml_opt
 # context on the first call within a sn_graph_begin/end cycle, runs one

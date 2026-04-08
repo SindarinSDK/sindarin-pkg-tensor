@@ -23,6 +23,8 @@ backing it.
 | I — Strict save/load roundtrip under train | Strict replacement for the 0.01-tolerance predecessor; 1e-6 tolerance + full save→load→continue-train vs never-saved reference | `tests/test_save_load_roundtrip_under_train.sn` (701 assertions) |
 | J — Metric callback API | `sn_graph_set_train_metric_callback` / `_clear_` / `_emit_` — consumer registers `fn(str, double): void`, package emits per-epoch and post-train | `tests/test_train_metric_callback.sn` (68 assertions) |
 | K — Cleanup + release | Deleted legacy `sn_graph_train` (~145 LOC dead C code), stale accessors, obsolete exploratory test, stale comments. Docs updated. | full suite stays 19/19 after deletion |
+| L — attWeight gradient fix | Record-mode GAT attention is now a differentiable ggml subgraph. `attWeight` split into standalone `attSrc`/`attDst` params. Three gradient-killing failure modes (view chains, extreme mask values, `soft_max_ext` + per-batch mask) bisected and documented. | `tests/test_weight_update_proven.sn` (140 assertions, all archs including attSrc/attDst) |
+| M — StringField[] metric signature | Callback signature upgraded to doc spec: `fn(str, double, StringField[]): void`. Per-epoch metrics get `{epoch, "E"}` labels; per-param metrics get `{layer, "L"}, {kind, "weight\|bias\|attSrc\|attDst\|classW1\|...\|classB2"}`. `StringField` struct defined locally in `src/tensor.sn`. | `tests/test_train_metric_callback.sn` updated (83 assertions, Phase L nParams=8) |
 
 ### Bugs found beyond the original audit
 
@@ -68,10 +70,19 @@ The skynet-side work to consume all of this is tracked in `skynet/docs/issues/go
    scrambling the static-topology slot binding, not a ggml or weighted-CE
    bug. Fix was replacing it with an across-batch shuffle. See
    `docs/issues/ggml-issue.md` "Final status".
-2. **Bug B3 attWeight sub-bug** (called out in Step 0): GAT attention weights
-   never receive gradients because `sn_tensor_attention_aggregate` falls back
-   to `sparse_aggregate` in record mode and never references `attWeight`.
-   Separate from B1; tracked but not yet fixed.
+2. ~~**Bug B3 attWeight sub-bug**~~ **DONE (Phase L).** GAT attention weights
+   now receive real gradients. The record-mode path used to fall back to
+   `sparse_aggregate` with "sum" — ignoring `attWeight` entirely — and
+   inference then ran the full attention code with zero-init weights,
+   producing a silent sum-train / mean-infer hybrid. Phase L
+   reimplemented the record-mode attention as a differentiable ggml
+   subgraph and split the old `attWeight` tensor into two standalone
+   parameters (`attSrc`, `attDst`) to sidestep view-backprop issues.
+   Three subtle gradient-killing failure modes (view chains, extreme
+   softmax masks, soft_max_ext with per-batch mask) were bisected and
+   documented in §4.2. Regression guard:
+   `tests/test_weight_update_proven.sn` asserts every parameter
+   including `attSrc`/`attDst` updates across gat/gcn/sage.
 3. **Steps 2c.4 onwards** — `TrainResult` diagnostics, `predictBatch` /
    `distributionDivergence`, metric callback API, release tagging.
 4. ~~**Heterogeneous-graph batching**~~ **DONE.** `Gnn.train()` now
@@ -480,24 +491,51 @@ The C side calls back into the Sindarin callback once per epoch with `(name, val
 
 The consumer registers a callback that forwards into its existing `MetricsClient` (skynet's `metrics_client.sn`). The package itself is unaware of how the metrics are stored; it just emits.
 
-**Implementation deviation (Phase J):** the shipped signature is the two-argument form
+**Phase M (resolved):** the shipped signature now matches the doc spec exactly:
 
 ```sindarin
-native fn sn_graph_set_train_metric_callback(cb: fn(str, double): void): void
+struct StringField =>
+  key: str
+  value: str
+
+native fn sn_graph_set_train_metric_callback(cb: fn(str, double, StringField[]): void): void
 native fn sn_graph_clear_train_metric_callback(): void
+native fn sn_graph_emit_train_metric(name: str, value: double, labels: StringField[]): void
 ```
 
-without the `labels: StringField[]` parameter. Rationale:
+`StringField` is defined locally in `src/tensor.sn` (a small `{key, value}` struct). When `sindarin-pkg-sdk` grows a canonical `StringField` it can replace the local form without breaking the callback signature.
 
-1. `StringField` is not in the SDK yet and the cost of building it for one consumer is outsized versus the value.
-2. Callers can pack the label values into the metric name string (`"param_norm_before/layer_0/weight"` in place of the structured `[{"layer","0"},{"kind","weight"}]`). This is what skynet's `metrics_client.sn` already does for its own metric registry.
-3. The two-arg form is forward-compatible: a future `_v2` entry point with `StringField[]` can be added alongside without breaking this surface.
+The metric **set** shipped in Phase M:
 
-The metric **set** shipped in Phase J matches the doc list above minus the labels: `train_loss`, `grad_norm_l2`, `weight_sum_in`, `weight_variance_in`, `input_mean`, `input_std`, `accuracy`, `param_norm_before/{i}`, `param_norm_after/{i}`, `param_max_abs_delta/{i}`. Per-param metrics use `{i}` in the name because `{i}` indexes `Gnn.parameters()` and is the contract that lets the caller correlate emissions back to `TrainResult.paramNormBefore[i]` etc.
+| Metric | Emit frequency | Labels |
+|---|---|---|
+| `train_loss` | per epoch | `[{epoch, "E"}]` |
+| `grad_norm_l2` | per epoch | `[{epoch, "E"}]` |
+| `weight_sum_in` | once per train | `[]` |
+| `weight_variance_in` | once per train | `[]` |
+| `input_mean` | once per train | `[]` |
+| `input_std` | once per train | `[]` |
+| `accuracy` | once per train | `[]` |
+| `param_norm_before` | once per layer param | `[{layer, "L"}, {kind, "weight\|bias\|attSrc\|attDst"}]` |
+| `param_norm_after` | once per layer param | same |
+| `param_max_abs_delta` | once per layer param | same |
+| `param_norm_before` | once per classifier param | `[{kind, "classW1\|classB1\|classW2\|classB2"}]` (no layer label) |
+| `param_norm_after` | once per classifier param | same |
+| `param_max_abs_delta` | once per classifier param | same |
 
-Behaviour: the callback is deep-copied on registration (so it survives across multiple `train()` calls), invoked synchronously from Sindarin-side `Gnn.train()` at epoch boundaries and once more at the end of the train call for the scalar and per-parameter fields, and cleanly detached via `sn_graph_clear_train_metric_callback()`.
+Per-param metrics are indexed in `model.parameters()` order. For a gat model with N layers, the ordering is layer[0..N-1] (each contributing weight/bias/attSrc/attDst), then classifierW1/classB1/classW2/classB2. For gcn/sage, each layer contributes weight/bias only (no attention).
 
-Regression guard: `tests/test_train_metric_callback.sn`.
+**Phase L (closed in tandem):** `arch: "gat"` is now an honest GAT. The previous implementation fell back to sum-aggregation in record mode and used zero-init attention weights at inference — a sum-train / mean-infer hybrid with no learned edge weighting. Phase L reimplements the record-mode attention aggregation as a differentiable ggml subgraph (`mul_mat` for per-node src/dst scores, broadcast-add for the score matrix, manual leaky-relu decomposition, `ggml_soft_max` with a pre-folded additive mask, and the standard `mul_mat` aggregation tail). The attention weights are stored as two separate parameters `attSrc` and `attDst` (each `(1, outputDim)`) rather than a single `(1, 2*outputDim)` tensor split by `ggml_view_1d`, because the view-based layout did not propagate gradients back to the underlying PARAM tensor in this ggml fork.
+
+Three subtle failure modes bisected during Phase L, recorded here so the lessons survive:
+
+1. **View backprop on PARAMs.** `ggml_view_1d` / `ggml_reshape_2d` chained over a PARAM tensor had working forward values but produced zero gradient at the PARAM slot. The ggml source has explicit backward cases for VIEW and RESHAPE (ggml.c:6619, 6625), but in the combination used here the gradient did not reach the leaf. Fix: split attention into two standalone parameters.
+2. **Extreme softmax masks kill backprop numerically.** The textbook `-1e9` mask value makes `ggml_soft_max_ext`'s backward formula `y * (dy - dot(y, dy))` produce zero at edge positions too (once `y` concentrates to near-0/near-1). Fix: use `-10.0f` as the mask value. `exp(-10)` ≈ `4.5e-5` — still negligible relative to an unmasked edge — while keeping the backward numerically alive.
+3. **`ggml_soft_max_ext(logits, mask, ...)`** with a per-batch-uploaded mask blocks gradient flow through `logits`. Fix: fold the mask into the logits manually via `ggml_add` and use plain `ggml_soft_max`. Mathematically identical for `max_bias=0` and `scale=1`.
+
+Behaviour: the callback is deep-copied on registration (survives across multiple `train()` calls), invoked synchronously from Sindarin-side `Gnn.train()` at epoch boundaries and once more at the end of the train call, and cleanly detached via `sn_graph_clear_train_metric_callback()`.
+
+Regression guards: `tests/test_train_metric_callback.sn` (callback firing + label correctness + TrainResult cross-check), `tests/test_weight_update_proven.sn` (all params including attSrc/attDst update across gat/gcn/sage).
 
 **Why this matters:** with this in place, skynet's Tier 2 #8 (per-train weight L2 trajectory) and Tier 2 #9 (per-batch input/label/weight summary) are automatic. The skynet-side trainer only has to register a callback and the dashboard panels light up.
 

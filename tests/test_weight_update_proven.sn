@@ -40,19 +40,41 @@ import "../src/gnn"
 # Helpers
 # ---------------------------------------------------------------------------
 
-fn singleNode(features: double[], featureDim: int): GraphTensors =>
+# Build a 2-node graph with the same features on both nodes, connected
+# by a bidirectional edge plus self-loops on each node. Each
+# destination receives TWO candidate sources (itself and the other
+# node), which is the minimal topology that exercises attention
+# non-trivially — a destination with a single incoming source has
+# softmax of a singleton = 1, so gradients flow through the softmax
+# as zero regardless of the scores, and attention-parameter gradients
+# are mathematically zero even when the forward/backward ops are all
+# correct. 2-node graphs sidestep this degeneracy.
+fn twoNode(features: double[], featureDim: int): GraphTensors =>
+  var feats: double[] = {}
+  for var i: int = 0; i < featureDim; i++ =>
+    feats.push(features[i])
+  for var i: int = 0; i < featureDim; i++ =>
+    feats.push(features[i])
+  # 4 edges: self-loop 0→0, self-loop 1→1, cross 0→1, cross 1→0
+  var edges: double[] = {
+    0.0, 1.0, 0.0, 1.0, # sources
+    0.0, 1.0, 1.0, 0.0 # destinations
+  }
+  var ew: double[] = {1.0, 1.0, 1.0, 1.0}
   return GraphTensors {
-    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
-    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
-    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
-    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
-    numNodes: 1, numEdges: 1, featureDim: featureDim
+    nodeFeatures: Tensor.fromDoubles(feats, 2, featureDim),
+    edgeIndex: Tensor.fromDoubles(edges, 2, 4),
+    edgeWeight: Tensor.fromDoubles(ew, 1, 4),
+    batchIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    numNodes: 2, numEdges: 4, featureDim: featureDim
   }
 
 # 20 hand-picked 4-feature samples cycling across 3 classes (class index
 # = i % 3). Hermetic — no RNG — so the test is bit-reproducible under
 # the same seed across runs. Features are chosen so each class has a
 # clear signal on one dimension, with some intra-class variation.
+# Each sample is a 2-node graph so that attention aggregation sees
+# multiple candidate sources per destination.
 fn buildTrainingGraphs(): GraphTensors[] =>
   var samples: double[][] = {
     {0.90, 0.10, 0.10, 0.10}, # class 0
@@ -78,7 +100,7 @@ fn buildTrainingGraphs(): GraphTensors[] =>
   }
   var graphs: GraphTensors[] = {}
   for var i: int = 0; i < len(samples); i++ =>
-    graphs.push(singleNode(samples[i], 4))
+    graphs.push(twoNode(samples[i], 4))
   return graphs
 
 # Labels matching buildTrainingGraphs(): cycle 0,1,2 across 20 samples,
@@ -101,8 +123,8 @@ fn buildWeights(n: int): double[] =>
   return w
 
 # Build per-parameter role labels matching the order Gnn.parameters()
-# emits them. For a numLayers-layer model:
-# gat: [weight, bias, attWeight, weight, bias, attWeight, ...,
+# emits them. For a numLayers-layer model (post Phase L split):
+# gat: [weight, bias, attSrc, attDst, weight, bias, attSrc, attDst, ...,
 # classW1, classB1, classW2, classB2]
 # gcn: [weight, bias, weight, bias, ...,
 # classW1, classB1, classW2, classB2]
@@ -113,7 +135,8 @@ fn paramRoles(arch: str, numLayers: int): str[] =>
     roles.push("weight")
     roles.push("bias")
     if arch == "gat" =>
-      roles.push("attWeight")
+      roles.push("attSrc")
+      roles.push("attDst")
   roles.push("classW1")
   roles.push("classB1")
   roles.push("classW2")
@@ -135,10 +158,16 @@ fn maxAbsDelta(before: double[], after: double[]): double =>
 # (imported by ../src/gnn).
 
 # "Is this role a weight matrix that should pass the L2-norm-drift check?"
-# Biases and attWeight do not — biases are tiny, attWeight is the known
-# sub-bug from golden-path "Outstanding work" item 2.
+# All learned matrices qualify. Phase L closed the attWeight sub-bug
+# by splitting the old (2*outputDim) tensor into two standalone
+# attSrc/attDst parameters — they now receive real gradients via the
+# differentiable ggml attention subgraph.
 fn isWeightMatrixRole(role: str): bool =>
   if role == "weight" =>
+    return true
+  if role == "attSrc" =>
+    return true
+  if role == "attDst" =>
     return true
   if role == "classW1" =>
     return true
@@ -147,10 +176,8 @@ fn isWeightMatrixRole(role: str): bool =>
   return false
 
 # "Should this role be subject to the max-abs-delta > 1e-5 check?"
-# Everything except the known-broken attWeight.
+# Everything, post-Phase L.
 fn shouldUpdate(role: str): bool =>
-  if role == "attWeight" =>
-    return false
   return true
 
 # ---------------------------------------------------------------------------
