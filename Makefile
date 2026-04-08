@@ -30,7 +30,7 @@ endif
 BIN_DIR := bin
 SN      ?= sn
 
-SRC_SOURCES := $(wildcard src/*.sn) $(wildcard src/*.sn.c)
+SRC_SOURCES := $(wildcard src/*.sn) $(wildcard src/*.sn.c) $(wildcard src/native/*.sn.c) $(wildcard src/native/*.h)
 
 TEST_SRCS := $(wildcard tests/test_*.sn)
 TEST_BINS := $(patsubst tests/%.sn,$(BIN_DIR)/%$(EXE_EXT),$(TEST_SRCS))

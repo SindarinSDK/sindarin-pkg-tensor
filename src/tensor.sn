@@ -24,7 +24,15 @@ import "sindarin-pkg-sdk/src/core/fields"
 @link gomp
 @link m
 @link pthread
-@source "tensor.sn.c"
+@source "native/tensor_pool.sn.c"
+@source "native/tensor_backend.sn.c"
+@source "native/tensor_record.sn.c"
+@source "native/tensor_ops.sn.c"
+@source "native/tensor_gnn_ops.sn.c"
+@source "native/tensor_loss.sn.c"
+@source "native/tensor_train.sn.c"
+@source "native/tensor_init.sn.c"
+@source "native/tensor_persistence.sn.c"
 
 import "sindarin-pkg-sdk/src/core/math"
 
