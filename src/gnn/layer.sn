@@ -1,0 +1,127 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/gnn/layer.sn — single GNN message-passing layer
+# ==============================================================================
+#
+# `GnnLayer` is one layer in a multi-layer GNN: weight + bias + (for
+# GAT) two attention parameter vectors, plus the architecture tag
+# that selects between GCN, GraphSAGE, and GAT forward paths.
+#
+# The Gnn struct in ../gnn.sn stacks these into a full model:
+#
+# GnnLayer{arch="gat", inputDim=5, outputDim=64}
+# -> GnnLayer{arch="gat", inputDim=64, outputDim=64}
+# -> GnnLayer{arch="gat", inputDim=64, outputDim=64}
+# -> meanPool -> classifier head
+#
+# This file carries only the single-layer code. Stacking, readout, and
+# classification live in src/gnn.sn; the trainer lives in
+# src/gnn/trainer.sn once step 8 lands.
+#
+# Attention layout note (Phase L, docs/issues/golden-path.md):
+# attention weights are stored as TWO separate parameter tensors
+# (attSrc, attDst, each shape (1, outputDim)) rather than one
+# (2, outputDim) tensor split by `ggml_view`. The view-based layout
+# broke gradient flow to the underlying PARAM tensor during training
+# (max-abs-delta stayed at zero after 50 epochs of backprop).
+# Splitting into standalone params sidesteps ggml's view-backprop
+# path — each half is used directly in its own ggml_mul_mat, and
+# gradients flow through the standard backward path. See the
+# docstring on sn_tensor_attention_aggregate in
+# src/native/tensor_gnn_ops.sn.c for the record-mode subgraph.
+# ==============================================================================
+
+import "../tensor"
+
+struct GnnLayer =>
+  weight: Tensor
+  bias: Tensor
+  attSrc: Tensor
+  attDst: Tensor
+  inputDim: int
+  outputDim: int
+  arch: str
+  dropoutRate: double
+
+  static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
+    var layer: GnnLayer = GnnLayer {
+      weight: Tensor.zeros(outputDim, inputDim),
+      bias: Tensor.zeros(1, outputDim),
+      attSrc: Tensor.zeros(1, outputDim),
+      attDst: Tensor.zeros(1, outputDim),
+      inputDim: inputDim,
+      outputDim: outputDim,
+      arch: arch,
+      dropoutRate: dropoutRate
+    }
+    layer.weight.initKaiming()
+    layer.attSrc.initKaiming()
+    layer.attDst.initKaiming()
+    return layer
+
+  # Deterministic variant of create(): seeds the weight tensor's Kaiming
+  # init from the given value so two runs with the same seed produce
+  # bit-identical layers. bias remains at zero; attSrc/attDst are
+  # Kaiming-seeded with distinct per-role seed offsets so the attention
+  # head starts in a non-degenerate regime from epoch 0.
+  static fn createWithSeed(arch: str, inputDim: int, outputDim: int,
+    dropoutRate: double, seed: long): GnnLayer =>
+    var layer: GnnLayer = GnnLayer {
+      weight: Tensor.zeros(outputDim, inputDim),
+      bias: Tensor.zeros(1, outputDim),
+      attSrc: Tensor.zeros(1, outputDim),
+      attDst: Tensor.zeros(1, outputDim),
+      inputDim: inputDim,
+      outputDim: outputDim,
+      arch: arch,
+      dropoutRate: dropoutRate
+    }
+    layer.weight.initKaimingSeeded(seed)
+    layer.attSrc.initKaimingSeeded(seed + 100000l)
+    layer.attDst.initKaimingSeeded(seed + 200000l)
+    return layer
+
+  fn forward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    if self.arch == "gcn" =>
+      return self.gcnForward(x, edgeIndex, edgeWeight, training)
+    if self.arch == "sage" =>
+      return self.sageForward(x, edgeIndex, edgeWeight, training)
+    if self.arch == "gat" =>
+      return self.gatForward(x, edgeIndex, edgeWeight, training)
+    return x
+
+  fn gcnForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var h: Tensor = x.gnnMatmul(self.weight).add(self.bias)
+    h = h.aggregate(edgeIndex, edgeWeight, "sum_normalized")
+    h = h.relu().dropout(self.dropoutRate, training)
+    if self.inputDim == self.outputDim =>
+      h = h.add(x)
+    return h
+
+  fn sageForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var agg: Tensor = x.aggregate(edgeIndex, edgeWeight, "mean")
+    # NOTE: must use gnnMatmul, not matmul. Weight is stored in GNN
+    # layout (ne0=inputDim, ne1=outputDim), which sn_tensor_matmul's
+    # host-side pre-transpose misinterprets — it both (a) garbles the
+    # weight shape (produces (inputDim, numNodes) instead of
+    # (outputDim, numNodes), so the subsequent .add(bias) broadcast
+    # fails) and (b) disconnects gradients via the pool-slot copy
+    # (Bug B3 in docs/issues/weight-update-failure.md). gnnMatmul
+    # consumes the weight PARAM tensor directly.
+    var h: Tensor = agg.gnnMatmul(self.weight).add(self.bias)
+    h = h.relu().dropout(self.dropoutRate, training)
+    if self.inputDim == self.outputDim =>
+      h = h.add(x)
+    return h
+
+  fn gatForward(x: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, training: bool): Tensor =>
+    var h: Tensor = x.gnnMatmul(self.weight).add(self.bias)
+    h = h.attentionAggregate(edgeIndex, edgeWeight, self.attSrc, self.attDst)
+    h = h.relu().dropout(self.dropoutRate, training)
+    if self.inputDim == self.outputDim =>
+      h = h.add(x)
+    return h
+
+  fn parameters(): Tensor[] =>
+    if self.arch == "gat" =>
+      return {self.weight, self.bias, self.attSrc, self.attDst}
+    return {self.weight, self.bias}
