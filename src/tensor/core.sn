@@ -1,0 +1,438 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/core.sn — Tensor, Optimizer, TrainResult,
+# distributionDivergence, native decls
+# ==============================================================================
+#
+# This is the core of the tensor package: the opaque `Tensor` handle + the
+# native fn declarations + the C-side `@source` pragmas. Other `tensor/*.sn`
+# files import this one to get the `Tensor` type. The top-level
+# `src/tensor.sn` file re-exports everything as a facade.
+#
+# Usage (from consumers):
+# import "sindarin-pkg-tensor/src/tensor"
+# var a: Tensor = Tensor.zeros(3, 4)
+# ==============================================================================
+
+import "sindarin-pkg-sdk/src/core/fields"
+import "sindarin-pkg-sdk/src/core/math"
+
+@link ggml
+@link ggml-base
+@link ggml-cpu
+@link stdc++
+@link gomp
+@link m
+@link pthread
+@source "../native/tensor_pool.sn.c"
+@source "../native/tensor_backend.sn.c"
+@source "../native/tensor_record.sn.c"
+@source "../native/tensor_ops.sn.c"
+@source "../native/tensor_gnn_ops.sn.c"
+@source "../native/tensor_loss.sn.c"
+@source "../native/tensor_train.sn.c"
+@source "../native/tensor_init.sn.c"
+@source "../native/tensor_persistence.sn.c"
+
+# ---------------------------------------------------------------------------
+# Opaque tensor handle
+# ---------------------------------------------------------------------------
+
+@alias "RtTensor"
+native struct Tensor as ref =>
+  _handle: long
+
+  # --- Creation ---
+
+  static fn zeros(rows: int, cols: int): Tensor =>
+    return sn_tensor_zeros(rows, cols)
+
+  static fn fromDoubles(data: double[], rows: int, cols: int): Tensor =>
+    return sn_tensor_from_doubles(data, rows, cols)
+
+  # --- Data access ---
+
+  fn toDoubles(): double[] =>
+    return sn_tensor_to_doubles(self)
+
+  fn shape(): int[] =>
+    return sn_tensor_shape(self)
+
+  fn dispose(): void =>
+    sn_tensor_free(self)
+
+  # --- Arithmetic (chainable) ---
+
+  fn matmul(other: Tensor): Tensor =>
+    return sn_tensor_matmul(self, other)
+
+  fn gnnMatmul(weight: Tensor): Tensor =>
+    return sn_tensor_gnn_matmul(self, weight)
+
+  fn add(other: Tensor): Tensor =>
+    return sn_tensor_add(self, other)
+
+  fn scale(s: double): Tensor =>
+    return sn_tensor_scale(self, s)
+
+  # --- Activations (chainable) ---
+
+  fn relu(): Tensor =>
+    return sn_tensor_relu(self)
+
+  fn softmax(dim: int): Tensor =>
+    return sn_tensor_softmax(self, dim)
+
+  fn dropout(rate: double, training: bool): Tensor =>
+    return sn_tensor_dropout(self, rate, training)
+
+  # --- Normalization ---
+
+  fn batchNorm(weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor =>
+    return sn_tensor_batch_norm(self, weight, bias, runningMean, runningVar, training)
+
+  fn layerNorm(weight: Tensor, bias: Tensor): Tensor =>
+    return sn_tensor_layer_norm(self, weight, bias)
+
+  # --- GNN aggregation ---
+
+  fn aggregate(edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor =>
+    return sn_tensor_sparse_aggregate(self, edgeIndex, edgeWeight, mode)
+
+  fn attentionAggregate(edgeIndex: Tensor, edgeWeight: Tensor, attSrc: Tensor, attDst: Tensor): Tensor =>
+    return sn_tensor_attention_aggregate(self, edgeIndex, edgeWeight, attSrc, attDst)
+
+  fn meanPool(batchIndex: Tensor): Tensor =>
+    return sn_tensor_mean_pool(self, batchIndex)
+
+  # --- Reduction ---
+
+  fn argmax(dim: int): int =>
+    return sn_tensor_argmax(self, dim)
+
+  fn norm(): double =>
+    return sn_tensor_norm(self)
+
+  fn crossEntropy(targets: Tensor): Tensor =>
+    return sn_tensor_cross_entropy(self, targets)
+
+  # --- Initialization ---
+
+  fn initKaiming(): void =>
+    sn_tensor_init_kaiming(self)
+
+  fn initKaimingSeeded(seed: long): void =>
+    sn_tensor_init_kaiming_seeded(self, seed)
+
+  # Small-scale uniform init for the policy output layer of an RL actor.
+  # Andrychowicz et al. 2021 ("What Matters in On-Policy Reinforcement
+  # Learning") established std=0.01 as the standard for centring the
+  # initial action distribution near uniform — without this, the policy
+  # can collapse to a deterministic action on the first training round
+  # when the action prior is imbalanced. See skynet Phase 6/6.1/6.2
+  # collapse reports for the empirical motivation.
+  fn initSmallScale(std: double): void =>
+    sn_tensor_init_small_scale(self, std)
+
+  fn initSmallScaleSeeded(std: double, seed: long): void =>
+    sn_tensor_init_small_scale_seeded(self, std, seed)
+
+# ---------------------------------------------------------------------------
+# Native function declarations
+# ---------------------------------------------------------------------------
+
+native fn sn_tensor_zeros(rows: int, cols: int): Tensor
+native fn sn_tensor_from_doubles(data: double[], rows: int, cols: int): Tensor
+native fn sn_tensor_to_doubles(t: Tensor): double[]
+native fn sn_tensor_shape(t: Tensor): int[]
+native fn sn_tensor_free(t: Tensor): void
+native fn sn_tensor_matmul(a: Tensor, b: Tensor): Tensor
+native fn sn_tensor_add(a: Tensor, b: Tensor): Tensor
+native fn sn_tensor_scale(t: Tensor, scalar: double): Tensor
+native fn sn_tensor_relu(t: Tensor): Tensor
+native fn sn_tensor_softmax(t: Tensor, dim: int): Tensor
+native fn sn_tensor_dropout(t: Tensor, rate: double, training: bool): Tensor
+native fn sn_tensor_gnn_matmul(features: Tensor, weight: Tensor): Tensor
+native fn sn_tensor_batch_norm(t: Tensor, weight: Tensor, bias: Tensor, runningMean: Tensor, runningVar: Tensor, training: bool): Tensor
+native fn sn_tensor_layer_norm(t: Tensor, weight: Tensor, bias: Tensor): Tensor
+native fn sn_tensor_norm(t: Tensor): double
+native fn sn_tensor_mean_pool(nodeEmbeddings: Tensor, batchIndex: Tensor): Tensor
+native fn sn_tensor_argmax(t: Tensor, dim: int): int
+native fn sn_tensor_sparse_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, mode: str): Tensor
+native fn sn_tensor_attention_aggregate(features: Tensor, edgeIndex: Tensor, edgeWeight: Tensor, attSrc: Tensor, attDst: Tensor): Tensor
+native fn sn_tensor_cross_entropy(probs: Tensor, targets: Tensor): Tensor
+native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weights: Tensor): Tensor
+
+# PPO-clipped surrogate loss (Schulman et al. 2017) — the long-term fix for
+# the weighted-CE unboundedness documented in docs/issues/ppo-clipped-objective.md.
+#
+# Shapes (same convention as weighted_cross_entropy):
+# logits        : (numClasses, batchRows) — current policy π_θ logits
+# oldLogProbs   : (1,          batchRows) — log π_old(a_i|s_i), DETACHED
+# (caller computes with a
+# pre-train forward pass)
+# actionsOneHot : (numClasses, batchRows) — one-hot mask of chosen actions
+# advantages    : (1,          batchRows) — A_i (already normalized)
+# epsilon       : clip range (typically 0.2)
+# Returns a scalar loss tensor. Works in both direct and record modes; the
+# record-mode path is driven by Gnn.trainPpo() for multi-epoch RL training
+# on the same batch without the weighted-CE divergence pathology.
+native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double, entropyCoeff: double): Tensor
+native fn sn_tensor_init_kaiming(t: Tensor): void
+native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
+native fn sn_tensor_init_small_scale(t: Tensor, std: double): void
+native fn sn_tensor_init_small_scale_seeded(t: Tensor, std: double, seed: long): void
+native fn sn_gpu_available(): bool
+native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
+native fn sn_model_save(params: Tensor[], path: str): void
+native fn sn_model_load(path: str): Tensor[]
+native fn sn_tensor_pool_reset(): void
+native fn sn_tensor_pool_checkpoint(): long
+native fn sn_tensor_pool_restore(checkpoint: long): void
+
+# ---------------------------------------------------------------------------
+# Graph recording mode (for training)
+# ---------------------------------------------------------------------------
+
+native fn sn_graph_begin(): void
+native fn sn_graph_end(): void
+native fn sn_graph_input(rows: int, cols: int): Tensor
+native fn sn_graph_input_data(data: double[], rows: int, cols: int): Tensor
+native fn sn_graph_param(t: Tensor): Tensor
+native fn sn_graph_compute_loss(t: Tensor): double
+
+# ---------------------------------------------------------------------------
+# Phase J / Phase M: training metric callback (§4.2 of docs/issues/golden-path.md)
+#
+# Register a Sindarin lambda that receives (metric_name, value, labels)
+# tuples emitted during Gnn.train(). Use for continuous metric streaming
+# into a consumer-side MetricsClient.
+#
+# Phase M closed the Phase J deviation: the callback now takes the
+# full three-argument form matching the doc spec exactly. The
+# `StringField` label type comes from the SDK
+# (`sindarin-pkg-sdk/src/core/fields`); a local copy used to live here
+# but was promoted into the SDK to eliminate a cross-package struct
+# name collision (compiler-problems.32 item 51).
+#
+# Emitted metrics in this release:
+# - "train_loss"           per epoch, labels=[{epoch, "E"}]
+# - "grad_norm_l2"         per epoch, labels=[{epoch, "E"}]
+# - "weight_sum_in"        once,      labels=[]
+# - "weight_variance_in"   once,      labels=[]
+# - "input_mean"           once,      labels=[]
+# - "input_std"            once,      labels=[]
+# - "accuracy"             once,      labels=[]
+# - "param_norm_before"    per layer+kind param, labels=[{layer,"L"},{kind,"K"}]
+# (kind ∈ {weight, bias, attSrc, attDst,
+# classW1, classB1, classW2, classB2};
+# classifier kinds have no layer label)
+# - "param_norm_after"     same labels as param_norm_before
+# - "param_max_abs_delta"  same labels as param_norm_before
+#
+# The callback is deep-copied on registration and survives across
+# multiple train() calls until explicitly cleared. Consumers can filter
+# by metric name and then look up label values by key.
+
+native fn sn_graph_set_train_metric_callback(cb: fn(str, double, StringField[]): void): void
+native fn sn_graph_clear_train_metric_callback(): void
+native fn sn_graph_emit_train_metric(name: str, value: double, labels: StringField[]): void
+
+# Per-epoch training driver. Lazy-initializes a static-graph ggml_opt
+# context on the first call within a sn_graph_begin/end cycle, runs one
+# epoch's worth of minibatches with manual data uploads, and returns the
+# average per-batch loss. Caller owns the permutation array (shuffled by
+# the caller per epoch for deterministic-but-shuffled training).
+#
+# Heterogeneous-batching contract:
+# featuresHost     : totalSamples * maxNodesPerGraph * featureDim doubles, zero-padded
+# adjHost          : totalSamples * maxNodesPerGraph * maxNodesPerGraph doubles, zero-padded,
+# with the layer's normalization mode already applied at host build time
+# realNodeCountHost: totalSamples doubles (one per sample, the REAL node count)
+# maxNodesPerGraph : the padding ceiling — max(numNodes) over the training set
+# The recorded forward graph must have been built against a (batchSize * maxNodesPerGraph)-node
+# template. See docs/issues/heterogeneous-graph-batching.md.
+native fn sn_graph_train_epoch(
+  loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
+  featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  adjHost: double[], realNodeCountHost: double[],
+  batchPerm: double[],
+  featureDim: int, labelsPerSample: int, nPerBatch: int,
+  maxNodesPerGraph: int,
+  optimizer: str,
+  lr: double, beta1: double, beta2: double, eps: double, wd: double): double
+
+# PPO variant of sn_graph_train_epoch. Adds the detached oldLogProbs
+# tensor + host buffer (one log π_old(a_i|s_i) per sample) on top of the
+# weighted-CE contract. Both share a single C-level implementation in
+# tensor.sn.c (sn_graph_train_epoch_impl); the two native fns are thin
+# wrappers over that shared impl — no duplicated per-batch code path.
+# See docs/issues/ppo-clipped-objective.md for the design note.
+native fn sn_graph_train_epoch_ppo(
+  loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
+  oldLogProbs: Tensor,
+  featuresHost: double[], labelsHost: double[], weightsHost: double[],
+  oldLogProbsHost: double[],
+  adjHost: double[], realNodeCountHost: double[],
+  batchPerm: double[],
+  featureDim: int, labelsPerSample: int, nPerBatch: int,
+  maxNodesPerGraph: int,
+  optimizer: str,
+  lr: double, beta1: double, beta2: double, eps: double, wd: double): double
+
+# ---------------------------------------------------------------------------
+# Optimizer configuration
+# ---------------------------------------------------------------------------
+
+struct Optimizer =>
+  kind: str
+  learningRate: double
+  weightDecay: double
+  beta1: double
+  beta2: double
+
+  static fn adamw(lr: double, wd: double): Optimizer =>
+    return Optimizer {
+      kind: "adamw",
+      learningRate: lr,
+      weightDecay: wd,
+      beta1: 0.9,
+      beta2: 0.999
+    }
+
+  static fn sgd(lr: double): Optimizer =>
+    return Optimizer {
+      kind: "sgd",
+      learningRate: lr,
+      weightDecay: 0.0,
+      beta1: 0.0,
+      beta2: 0.0
+    }
+
+# ---------------------------------------------------------------------------
+# Training result
+#
+# Returned by Gnn.train(). Top-line scalars (loss, accuracy, epochs) are
+# the headline values; the *Curve / *Norm* / *Delta arrays are the
+# Phase C "Bug B4" diagnostics from docs/issues/golden-path.md §2.4 and
+# Part 7. Use them to detect:
+#
+# - Loss diverging or NaNing            -> lossCurve
+# - Optimizer not moving the params     -> gradNormCurve, paramMaxAbsDelta
+# - Garbage in / garbage out            -> inputMean, inputStd
+# - Caller dropped the weight vector    -> weightSumIn, weightVarianceIn
+# - Bug B3 weight-update regression     -> paramNormBefore vs paramNormAfter
+#
+# All Per-parameter arrays (paramNorm*, paramMaxAbsDelta) are indexed in
+# the same order as Gnn.parameters() returns them.
+#
+# Semantic note on `loss`: this is the FINAL EPOCH average loss (the
+# tail of lossCurve), not the across-epoch average. Use lossCurve for
+# the full trajectory.
+#
+# Semantic note on `gradNormCurve`: this is the per-epoch L2 of the
+# parameter DELTA, i.e. L2(params_after_epoch - params_before_epoch).
+# For AdamW this is proportional to the optimizer's effective step
+# magnitude over the epoch (lr * L2(sum_of_adamw_steps)). It is not
+# the L2 of the raw gradient. Both answer the same diagnostic
+# question — "is the model moving?" — and the param-delta form is
+# robust against ggml zeroing the .grad field after backward.
+# ---------------------------------------------------------------------------
+
+struct TrainResult =>
+  loss: double
+  accuracy: double
+  epochs: int
+  lossCurve: double[]
+  gradNormCurve: double[]
+  paramNormBefore: double[]
+  paramNormAfter: double[]
+  paramMaxAbsDelta: double[]
+  weightSumIn: double
+  weightVarianceIn: double
+  inputMean: double
+  inputStd: double
+
+# ---------------------------------------------------------------------------
+# Distribution divergence — compare two discrete probability distributions.
+#
+# Phase F (§2.5 of docs/issues/golden-path.md): generic metric function
+# callers can use to quantify "how different are these two predictions"
+# without rolling their own implementation. The canonical consumer is
+# skynet's canonical-pair JSD probe, which runs forward() on two fixed
+# graphs and reports the divergence between the resulting action
+# distributions as a learning-progress signal.
+#
+# Inputs:
+# a, b   — same-length double[] containing the two distributions
+# kind   — one of "l1", "l2", "kl", "js"
+#
+# Semantics:
+# "l1" : sum_i |a[i] - b[i]|
+# "l2" : sqrt(sum_i (a[i] - b[i])^2)
+# "kl" : Kullback-Leibler KL(a || b) = sum_i a[i] * log(a[i] / b[i])
+# Uses natural log. Terms where a[i] == 0 are skipped (0*log0=0).
+# A tiny epsilon floor is applied to b[i] to avoid log(0) when
+# b has exact zeros — in that regime KL is formally infinite,
+# but returning a large finite value is more useful for a
+# metric consumer than crashing.
+# "js" : Jensen-Shannon divergence
+# JSD(a, b) = 0.5*KL(a || m) + 0.5*KL(b || m)  where m = (a+b)/2
+# Uses natural log (so the maximum for disjoint distributions
+# is ln(2) ≈ 0.693, not 1). Symmetric, always finite.
+#
+# The function is pure Sindarin — no FFI, no tensor allocation. Cheap
+# to call in a tight loop.
+#
+# Unknown `kind` strings return 0.0.
+# ---------------------------------------------------------------------------
+fn distributionDivergence(a: double[], b: double[], kind: str): double =>
+  var n: int = len(a)
+  if n == 0 || len(b) != n =>
+    return 0.0
+
+  if kind == "l1" =>
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var d: double = a[i] - b[i]
+      if d < 0.0 =>
+        d = -d
+      s = s + d
+    return s
+
+  if kind == "l2" =>
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var d: double = a[i] - b[i]
+      s = s + d * d
+    return sqrt(s)
+
+  if kind == "kl" =>
+    var eps: double = 0.000000000001
+    var s: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      if a[i] > 0.0 =>
+        var bi: double = b[i]
+        if bi < eps =>
+          bi = eps
+        s = s + a[i] * log(a[i] / bi)
+    return s
+
+  if kind == "js" =>
+    var eps: double = 0.000000000001
+    var klAm: double = 0.0
+    var klBm: double = 0.0
+    for var i: int = 0; i < n; i++ =>
+      var m: double = (a[i] + b[i]) * 0.5
+      if a[i] > 0.0 =>
+        var md: double = m
+        if md < eps =>
+          md = eps
+        klAm = klAm + a[i] * log(a[i] / md)
+      if b[i] > 0.0 =>
+        var md2: double = m
+        if md2 < eps =>
+          md2 = eps
+        klBm = klBm + b[i] * log(b[i] / md2)
+    return 0.5 * klAm + 0.5 * klBm
+
+  return 0.0

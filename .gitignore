@@ -8,6 +8,7 @@ bin/
 .claude/
 .mcp.json
 
-# Core dumps from ggml aborts / test crashes
-core
-core.*
+# Core dumps from ggml aborts / test crashes.
+# Anchored to the repo root so they don't collide with e.g. src/tensor/core.sn.
+/core
+/core.[0-9]*

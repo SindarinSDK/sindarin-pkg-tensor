@@ -1,0 +1,147 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/graph.sn — GraphTensors + validation + batching
+# ==============================================================================
+#
+# `GraphTensors` is the caller-facing description of a graph for a GNN:
+# node features, edge list, edge weights, and a per-node batch index.
+#
+# Construction goes through `GraphTensors.create(...)`, which runs a
+# built-in validation pipeline before handing the struct back to the
+# caller. Direct struct-literal construction (`GraphTensors { ... }`)
+# is still valid but skips validation; prefer `create` unless you have
+# a specific reason to bypass it (e.g., test fixtures that deliberately
+# construct malformed inputs).
+#
+# Design note — validator shape:
+#
+# The refactor plan originally called for a pluggable "array of
+# Validator structs with closure-typed check/message fields" so new
+# rules could be dropped in by pushing to the validator array. That
+# shape is blocked on docs/issues/compiler-problems.34.md item 53 —
+# module-boundary lambda emission misplaces the closure body into
+# main.c's static namespace, and the imported module's TU can't link
+# to it. Until that's fixed, validation is a hand-unrolled sequence
+# of direct `panic()` calls inside `create()`. The set of rules is
+# small enough that the loss of pluggability is minor; new rules get
+# added by editing `create()` directly.
+#
+# Layout conventions (same as the previous value-struct form):
+# nodeFeatures : fromDoubles(data, rows=numNodes, cols=featureDim)
+# edgeIndex    : fromDoubles(data, rows=2,        cols=numEdges),
+# row 0 = sources, row 1 = destinations
+# edgeWeight   : fromDoubles(data, rows=1,        cols=numEdges)
+# batchIndex   : fromDoubles(data, rows=numNodes, cols=1),
+# value per row = source graph index
+# ==============================================================================
+
+import "./panic"
+import "./core"
+
+struct GraphTensors =>
+  nodeFeatures: Tensor
+  edgeIndex: Tensor
+  edgeWeight: Tensor
+  batchIndex: Tensor
+  numNodes: int
+  numEdges: int
+  featureDim: int
+
+  static fn create(
+    nodeFeatures: Tensor, edgeIndex: Tensor,
+    edgeWeight: Tensor, batchIndex: Tensor,
+    numNodes: int, numEdges: int, featureDim: int): GraphTensors =>
+    # Hand-unrolled validation pipeline. See the module comment for
+    # why this isn't an iterable array of validator closures today.
+    if numNodes <= 0 =>
+      panic($"GraphTensors.create: numNodes={numNodes}; must be > 0")
+    if numEdges < 0 =>
+      panic($"GraphTensors.create: numEdges={numEdges}; must be >= 0")
+    if featureDim <= 0 =>
+      panic($"GraphTensors.create: featureDim={featureDim}; must be > 0")
+    return GraphTensors {
+      nodeFeatures: nodeFeatures,
+      edgeIndex: edgeIndex,
+      edgeWeight: edgeWeight,
+      batchIndex: batchIndex,
+      numNodes: numNodes,
+      numEdges: numEdges,
+      featureDim: featureDim
+    }
+
+  # -------------------------------------------------------------------------
+  # Concatenate a list of GraphTensors into one batched graph. Edge
+  # indices in the output are offset so each input graph's edges still
+  # point at the right rows of the concatenated nodeFeatures tensor.
+  # batchIndex maps every row of the concatenated tensor back to its
+  # source graph index.
+  #
+  # All input graphs must share the same featureDim. Per-graph numNodes
+  # and numEdges may vary freely.
+  # -------------------------------------------------------------------------
+  static fn batch(graphs: GraphTensors[]): GraphTensors =>
+    if len(graphs) == 0 =>
+      panic("GraphTensors.batch: graph list is empty")
+
+    var featureDim: int = graphs[0].featureDim
+
+    for var k: int = 0; k < len(graphs); k++ =>
+      if graphs[k].featureDim != featureDim =>
+        panic($"GraphTensors.batch: graph {k} has featureDim={graphs[k].featureDim}, expected {featureDim} (matching graph 0)")
+      if graphs[k].numNodes <= 0 =>
+        panic($"GraphTensors.batch: graph {k} has numNodes={graphs[k].numNodes}; must be > 0")
+
+    # --- Compute totals and per-graph node offsets ---
+    var totalNodes: int = 0
+    var totalEdges: int = 0
+    var nodeOffsets: int[] = {}
+    for var k: int = 0; k < len(graphs); k++ =>
+      nodeOffsets.push(totalNodes)
+      totalNodes = totalNodes + graphs[k].numNodes
+      totalEdges = totalEdges + graphs[k].numEdges
+
+    # --- Concatenate node features (row-major append) ---
+    var allFeatures: double[] = {}
+    for var k: int = 0; k < len(graphs); k++ =>
+      var f: double[] = graphs[k].nodeFeatures.toDoubles()
+      for var i: int = 0; i < len(f); i++ =>
+        allFeatures.push(f[i])
+
+    # --- Concatenate edges with per-graph offsets ---
+    # Sources first (with offset), then destinations (with offset).
+    var allSources: double[] = {}
+    var allDests: double[] = {}
+    var allWeights: double[] = {}
+    for var k: int = 0; k < len(graphs); k++ =>
+      var ne: int = graphs[k].numEdges
+      if ne > 0 =>
+        var ei: double[] = graphs[k].edgeIndex.toDoubles()
+        var offset: double = nodeOffsets[k].toDouble()
+        for var i: int = 0; i < ne; i++ =>
+          allSources.push(ei[i] + offset)
+        for var i: int = 0; i < ne; i++ =>
+          allDests.push(ei[ne + i] + offset)
+        var ew: double[] = graphs[k].edgeWeight.toDoubles()
+        for var i: int = 0; i < ne; i++ =>
+          allWeights.push(ew[i])
+
+    var edgeData: double[] = {}
+    for var i: int = 0; i < len(allSources); i++ =>
+      edgeData.push(allSources[i])
+    for var i: int = 0; i < len(allDests); i++ =>
+      edgeData.push(allDests[i])
+
+    # --- Build batchIndex: each row points to its source graph ---
+    var batch: double[] = {}
+    for var k: int = 0; k < len(graphs); k++ =>
+      for var n: int = 0; n < graphs[k].numNodes; n++ =>
+        batch.push(k.toDouble())
+
+    return GraphTensors {
+      nodeFeatures: Tensor.fromDoubles(allFeatures, totalNodes, featureDim),
+      edgeIndex: Tensor.fromDoubles(edgeData, 2, totalEdges),
+      edgeWeight: Tensor.fromDoubles(allWeights, 1, totalEdges),
+      batchIndex: Tensor.fromDoubles(batch, totalNodes, 1),
+      numNodes: totalNodes,
+      numEdges: totalEdges,
+      featureDim: featureDim
+    }
