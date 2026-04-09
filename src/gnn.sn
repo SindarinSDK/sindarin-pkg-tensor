@@ -18,6 +18,7 @@ import "./tensor"
 import "./tensor/panic"
 import "./gnn/layer"
 import "./gnn/strategy"
+import "./gnn/trainer"
 import "sindarin-pkg-sdk/src/core/random"
 import "sindarin-pkg-sdk/src/core/math"
 

@@ -1,0 +1,538 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/gnn/trainer.sn — Trainer<M, S, O> + TrainConfig + TrainResult
+# ==============================================================================
+#
+# The canonical training path. `Trainer<M, S, O>` owns one complete
+# training loop that is strategy-aware via its type parameter `S:
+# TrainStrategy`. The old `Gnn.trainCore` — ~500 lines branching on
+# `lossKind: str` for supervised vs PPO — is replaced by this single
+# implementation, with the four loss-kind-specific spots delegated to
+# the strategy:
+#
+# 1. Pre-record forward-prob snapshot   -> strategy.prepare(...)
+# 2. Extra static input tensor alloc    -> strategy.buildLoss(...)
+# 3. Loss op construction               -> strategy.buildLoss(...)
+# 4. Per-epoch native driver dispatch   -> strategy.runEpoch(ctx)
+#
+# Type parameters:
+#
+# M : model type. Unconstrained — Sindarin's structural method
+# dispatch resolves `self.model.forward(...)` / `.parameters()`
+# / `.config.numActions` at instantiation time. Keeping M
+# unconstrained means this file does not need to `import "../gnn"`
+# for the Gnn struct, which would create an import cycle with
+# the gnn.sn facade.
+#
+# S : train strategy. WeightedCrossEntropy or PpoClipped (or any
+# struct satisfying the TrainStrategy interface).
+#
+# O : optimizer. AdamW, Sgd, or OptimizerParams itself (all satisfy
+# the Optimizer interface via a params() method).
+#
+# TrainResult lives in this file because it is the canonical return
+# type of Trainer.run() — every caller-visible training entry point
+# funnels through here.
+# ==============================================================================
+
+import "../tensor"
+import "../tensor/panic"
+import "../tensor/record"
+import "../tensor/metrics"
+import "../tensor/optim"
+import "./strategy"
+import "sindarin-pkg-sdk/src/core/random"
+import "sindarin-pkg-sdk/src/core/math"
+import "sindarin-pkg-sdk/src/core/fields"
+
+# ---------------------------------------------------------------------------
+# TrainConfig — caller-facing training hyperparameters.
+# ---------------------------------------------------------------------------
+
+struct TrainConfig =>
+  epochs: int
+  batchSize: int
+  seed: long
+  valSplit: double
+
+  static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
+    return TrainConfig {
+      epochs: epochs,
+      batchSize: batchSize,
+      seed: seed,
+      valSplit: 0.0
+    }
+
+# ---------------------------------------------------------------------------
+# TrainResult — diagnostics + headline scalars returned by Trainer.run().
+#
+# Top-line scalars (loss, accuracy, epochs) are the headline values;
+# the *Curve / *Norm* / *Delta arrays are the Phase C diagnostics
+# from docs/issues/golden-path.md §2.4 and Part 7. Use them to detect:
+#
+# loss diverging or NaNing           -> lossCurve
+# optimizer not moving the params    -> gradNormCurve, paramMaxAbsDelta
+# garbage in / garbage out           -> inputMean, inputStd
+# caller dropped the weight vector   -> weightSumIn, weightVarianceIn
+# weight-update regression           -> paramNormBefore vs paramNormAfter
+#
+# Per-parameter arrays (paramNorm*, paramMaxAbsDelta) are indexed in
+# the same order as the model's parameters() method returns them.
+#
+# Semantic note on `loss`: this is the FINAL EPOCH average loss (the
+# tail of lossCurve), not the across-epoch average. Use lossCurve for
+# the full trajectory.
+#
+# Semantic note on `gradNormCurve`: this is the per-epoch L2 of the
+# parameter DELTA, i.e. L2(params_after_epoch - params_before_epoch).
+# For AdamW this is proportional to the optimizer's effective step
+# magnitude over the epoch. Both answer "is the model moving?" — the
+# param-delta form is robust against ggml zeroing the .grad field
+# after backward.
+# ---------------------------------------------------------------------------
+
+struct TrainResult =>
+  loss: double
+  accuracy: double
+  epochs: int
+  lossCurve: double[]
+  gradNormCurve: double[]
+  paramNormBefore: double[]
+  paramNormAfter: double[]
+  paramMaxAbsDelta: double[]
+  weightSumIn: double
+  weightVarianceIn: double
+  inputMean: double
+  inputStd: double
+
+# ---------------------------------------------------------------------------
+# Trainer<M, S, O>
+# ---------------------------------------------------------------------------
+
+struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
+  model: M
+  config: TrainConfig
+  optimizer: O
+  strategy: S
+
+  # Note: construct via struct literal, not a static factory. The
+  # `static fn create(model: M, ...): Trainer<M, S, O>` form triggers
+  # a "Trainer.create argument 1: type mismatch" error in the current
+  # Sindarin compiler when instantiated with a concrete model type —
+  # the type-checker doesn't bind M to the argument. Struct-literal
+  # construction works correctly and is the idiomatic form:
+  #
+  # var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> =
+  # Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> {
+  # model: model, config: cfg, optimizer: opt, strategy: strat
+  # }
+
+  # -------------------------------------------------------------------------
+  # Run the full training loop.
+  #
+  # `targets` is either one-hot labels (supervised) or one-hot actions
+  # (RL), depending on the strategy. `weights` is either sample weights
+  # (supervised) or per-sample advantages (RL). Shape conventions match
+  # the native training driver's contract.
+  #
+  # Heterogeneous batching: this entry point handles graphs with
+  # VARIABLE `numNodes` and `numEdges`. The only precondition is that
+  # every graph share the same `featureDim`. Internally each sample is
+  # padded to `maxNodes = max(graphs[i].numNodes)` with zero features
+  # and a zero adjacency, then re-uploaded per minibatch into a
+  # fixed-shape recorded graph. The mean-pool denominator uses the
+  # REAL node count per graph, so padded rows do not dilute the
+  # per-graph embedding. See docs/issues/heterogeneous-graph-batching.md.
+  # -------------------------------------------------------------------------
+  fn run(graphs: GraphTensors[], targets: double[], weights: double[]): TrainResult =>
+    var optParams: OptimizerParams = self.optimizer.params()
+    var epochs: int = self.config.epochs
+    var batchSize: int = self.config.batchSize
+
+    # --- Early return for empty / degenerate inputs. -----------------------
+    if len(graphs) == 0 || epochs <= 0 || batchSize <= 0 =>
+      var emptyD: double[] = {}
+      var emptyD2: double[] = {}
+      var emptyD3: double[] = {}
+      var emptyD4: double[] = {}
+      var emptyD5: double[] = {}
+      return TrainResult {
+        loss: 0.0,
+        accuracy: 0.0,
+        epochs: 0,
+        lossCurve: emptyD,
+        gradNormCurve: emptyD2,
+        paramNormBefore: emptyD3,
+        paramNormAfter: emptyD4,
+        paramMaxAbsDelta: emptyD5,
+        weightSumIn: 0.0,
+        weightVarianceIn: 0.0,
+        inputMean: 0.0,
+        inputStd: 0.0
+      }
+
+    var totalSamples: int = len(graphs)
+    var featureDim: int = graphs[0].featureDim
+    var numClasses: int = self.model.config.numActions
+
+    # --- featureDim is the only true shape precondition. --------------------
+    for var i: int = 1; i < totalSamples; i++ =>
+      if graphs[i].featureDim != featureDim =>
+        panic($"Trainer.run: graph {i} has featureDim={graphs[i].featureDim}, expected {featureDim} (matching graph 0). All training graphs must share featureDim.")
+      if graphs[i].numNodes <= 0 =>
+        panic($"Trainer.run: graph {i} has numNodes={graphs[i].numNodes}; must be > 0.")
+
+    # --- Compute maxNodes for the padding ceiling. -------------------------
+    var maxNodes: int = graphs[0].numNodes
+    for var i: int = 1; i < totalSamples; i++ =>
+      if graphs[i].numNodes > maxNodes =>
+        maxNodes = graphs[i].numNodes
+
+    # --- Strategy prep: run forward in inference mode over every sample,
+    # flatten the resulting probabilities into one double[], and hand
+    # them to the strategy so PpoClipped can derive oldLogProbsHost.
+    # WeightedCrossEntropy ignores the call. The forward pass runs
+    # BEFORE sn_graph_begin() so the pool slots it allocates aren't
+    # record-mode tensors.
+    var allProbsFlat: double[] = {}
+    for var i: int = 0; i < totalSamples; i++ =>
+      var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+      for var j: int = 0; j < len(probs); j++ =>
+        allProbsFlat.push(probs[j])
+    self.strategy.prepare(allProbsFlat, totalSamples, numClasses, targets)
+
+    # --- Aggregation normalization mode: gat -> sum, gcn -> sum_normalized,
+    # sage -> mean. All layers in one model share an architecture.
+    var normMode: str = "sum"
+    if self.model.config.arch == "gcn" =>
+      normMode = "sum_normalized"
+    if self.model.config.arch == "sage" =>
+      normMode = "mean"
+
+    # --- Build per-sample padded host buffers. ------------------------------
+    var featuresHost: double[] = {}
+    var adjHost: double[] = {}
+    var realNodeCountHost: double[] = {}
+
+    for var i: int = 0; i < totalSamples; i++ =>
+      var nNodes: int = graphs[i].numNodes
+      var nEdges: int = graphs[i].numEdges
+      realNodeCountHost.push(nNodes.toDouble())
+
+      # Pad features: copy real (nNodes * featureDim) doubles, then
+      # push zeros for the (maxNodes - nNodes) padding rows.
+      var srcFeats: double[] = graphs[i].nodeFeatures.toDoubles()
+      var realLen: int = nNodes * featureDim
+      for var j: int = 0; j < realLen; j++ =>
+        featuresHost.push(srcFeats[j])
+      for var j: int = realLen; j < maxNodes * featureDim; j++ =>
+        featuresHost.push(0.0)
+
+      # Build the per-sample dense adjacency (maxNodes * maxNodes),
+      # zero beyond the real node count, with normalization baked in.
+      var adj: double[] = {}
+      for var j: int = 0; j < maxNodes * maxNodes; j++ =>
+        adj.push(0.0)
+
+      var ei: double[] = graphs[i].edgeIndex.toDoubles()
+      var ew: double[] = graphs[i].edgeWeight.toDoubles()
+
+      # edgeIndex layout: row 0 = sources, row 1 = destinations.
+      for var k: int = 0; k < nEdges; k++ =>
+        var s: int = ei[k].toInt()
+        var d: int = ei[nEdges + k].toInt()
+        var w: double = ew[k]
+        if s >= 0 && s < nNodes && d >= 0 && d < nNodes =>
+          adj[d * maxNodes + s] = adj[d * maxNodes + s] + w
+
+      # Apply per-row normalization for "mean" / "sum_normalized" modes.
+      if normMode == "mean" || normMode == "sum_normalized" =>
+        var cnt: double[] = {}
+        for var d: int = 0; d < maxNodes; d++ =>
+          cnt.push(0.0)
+        for var k: int = 0; k < nEdges; k++ =>
+          var d: int = ei[nEdges + k].toInt()
+          if d >= 0 && d < nNodes =>
+            cnt[d] = cnt[d] + 1.0
+        for var d: int = 0; d < nNodes; d++ =>
+          var c: double = cnt[d]
+          if c <= 0.0 =>
+            c = 1.0
+          for var s: int = 0; s < nNodes; s++ =>
+            adj[d * maxNodes + s] = adj[d * maxNodes + s] / c
+
+      for var j: int = 0; j < maxNodes * maxNodes; j++ =>
+        adjHost.push(adj[j])
+
+    # --- Build a padded template for the recorded forward graph. ----------
+    var nodesPerBatch: int = batchSize * maxNodes
+
+    var initFeatures: double[] = {}
+    for var i: int = 0; i < nodesPerBatch * featureDim; i++ =>
+      initFeatures.push(0.0)
+
+    var templateEdges: double[] = {}
+    for var i: int = 0; i < nodesPerBatch; i++ =>
+      templateEdges.push(i.toDouble())
+    for var i: int = 0; i < nodesPerBatch; i++ =>
+      templateEdges.push(i.toDouble())
+    var templateWeights: double[] = {}
+    for var i: int = 0; i < nodesPerBatch; i++ =>
+      templateWeights.push(1.0)
+
+    var templateBatchIndex: double[] = {}
+    for var b: int = 0; b < batchSize; b++ =>
+      for var n: int = 0; n < maxNodes; n++ =>
+        templateBatchIndex.push(b.toDouble())
+
+    var initLabels: double[] = {}
+    for var i: int = 0; i < batchSize * numClasses; i++ =>
+      initLabels.push(0.0)
+    var initWeights: double[] = {}
+    for var i: int = 0; i < batchSize; i++ =>
+      initWeights.push(0.0)
+
+    # --- Phase C: input + weight statistics over the host buffers. --------
+    var inputMean: double = 0.0
+    var inputStd: double = 0.0
+    var nFeat: int = len(featuresHost)
+    if nFeat > 0 =>
+      var sumIn: double = 0.0
+      for var i: int = 0; i < nFeat; i++ =>
+        sumIn = sumIn + featuresHost[i]
+      inputMean = sumIn / nFeat.toDouble()
+      var sqDiff: double = 0.0
+      for var i: int = 0; i < nFeat; i++ =>
+        var d: double = featuresHost[i] - inputMean
+        sqDiff = sqDiff + d * d
+      inputStd = sqrt(sqDiff / nFeat.toDouble())
+
+    var weightSumIn: double = 0.0
+    var weightVarianceIn: double = 0.0
+    var nW: int = len(weights)
+    if nW > 0 =>
+      for var i: int = 0; i < nW; i++ =>
+        weightSumIn = weightSumIn + weights[i]
+      var wMean: double = weightSumIn / nW.toDouble()
+      var wSqDiff: double = 0.0
+      for var i: int = 0; i < nW; i++ =>
+        var d: double = weights[i] - wMean
+        wSqDiff = wSqDiff + d * d
+      weightVarianceIn = wSqDiff / nW.toDouble()
+
+    # --- Open a record session and build the static training graph. -------
+    var session: RecordSession = RecordSession.open()
+
+    # Register PARAMs (DISCARD return — see docs/issues/compiler-problems.29.md).
+    var params: Tensor[] = self.model.parameters()
+    for var i: int = 0; i < len(params); i++ =>
+      session.param(params[i])
+
+    # --- Phase C: snapshot per-parameter pre-train state. ------------------
+    var nParams: int = len(params)
+    var initialData: double[][] = {}
+    var rollingData: double[][] = {}
+    var paramNormBefore: double[] = {}
+    for var i: int = 0; i < nParams; i++ =>
+      var snap: double[] = params[i].toDoubles()
+      initialData.push(snap)
+      rollingData.push(snap)
+      paramNormBefore.push(params[i].norm())
+
+    var nodeFeaturesInput: Tensor = session.inputData(initFeatures, nodesPerBatch, featureDim)
+    var labelsInput: Tensor = session.inputData(initLabels, batchSize, numClasses)
+    var weightsInput: Tensor = session.inputData(initWeights, batchSize, 1)
+
+    var inputGraph: GraphTensors = {
+      nodeFeatures: nodeFeaturesInput,
+      edgeIndex: Tensor.fromDoubles(templateEdges, 2, nodesPerBatch),
+      edgeWeight: Tensor.fromDoubles(templateWeights, 1, nodesPerBatch),
+      batchIndex: Tensor.fromDoubles(templateBatchIndex, nodesPerBatch, 1),
+      numNodes: nodesPerBatch,
+      numEdges: nodesPerBatch,
+      featureDim: featureDim
+    }
+
+    var output = self.model.forward(inputGraph, true)
+
+    # Strategy builds the loss. PpoClipped allocates its extra
+    # oldLogProbsInput tensor via session.inputData here and stashes
+    # it on self for runEpoch.
+    var loss: Tensor = self.strategy.buildLoss(session, output.logits, labelsInput, weightsInput, batchSize)
+
+    # --- Epoch loop with deterministic across-batch shuffling. -------------
+    var nBatches: int = totalSamples / batchSize
+    if nBatches < 1 =>
+      nBatches = 1
+    var batchOrder: double[] = {}
+    for var i: int = 0; i < nBatches; i++ =>
+      batchOrder.push(i.toDouble())
+
+    var perm: double[] = {}
+    for var i: int = 0; i < totalSamples; i++ =>
+      perm.push(i.toDouble())
+    var permTarget: int = nBatches * batchSize
+    var cyc: int = 0
+    while len(perm) < permTarget =>
+      perm.push((cyc % totalSamples).toDouble())
+      cyc = cyc + 1
+
+    var lossCurve: double[] = {}
+    var gradNormCurve: double[] = {}
+
+    using rng = Random.createWithSeed(self.config.seed) =>
+      for var epoch: int = 0; epoch < epochs; epoch++ =>
+        rng.shuffleDouble(batchOrder)
+        for var b: int = 0; b < nBatches; b++ =>
+          var srcBatch: int = batchOrder[b].toInt()
+          for var k: int = 0; k < batchSize; k++ =>
+            var srcIdx: int = srcBatch * batchSize + k
+            if srcIdx >= totalSamples =>
+              srcIdx = srcIdx % totalSamples
+            perm[b * batchSize + k] = srcIdx.toDouble()
+
+        # Bundle up the per-epoch context and hand it to the strategy's
+        # dispatcher. WeightedCrossEntropy calls sn_graph_train_epoch;
+        # PpoClipped calls sn_graph_train_epoch_ppo with its extras.
+        var ctx: EpochContext = EpochContext {
+          loss: loss,
+          features: nodeFeaturesInput,
+          labels: labelsInput,
+          weights: weightsInput,
+          featuresHost: featuresHost,
+          targetsHost: targets,
+          weightsHost: weights,
+          adjHost: adjHost,
+          realNodeCountHost: realNodeCountHost,
+          perm: perm,
+          featureDim: featureDim,
+          labelsPerSample: numClasses,
+          batchSize: batchSize,
+          maxNodes: maxNodes,
+          optimizer: optParams
+        }
+        var epochLoss: double = self.strategy.runEpoch(ctx)
+        lossCurve.push(epochLoss)
+
+        var epochLabels: StringField[] = {
+          StringField {
+            key: "epoch",
+            value: $"{epoch}"
+          }
+        }
+        MetricEmitter.emit("train_loss", epochLoss, epochLabels)
+
+        # Phase C: per-epoch param-delta L2 norm.
+        var deltaSqEpoch: double = 0.0
+        for var i: int = 0; i < nParams; i++ =>
+          var curr: double[] = params[i].toDoubles()
+          for var j: int = 0; j < len(curr); j++ =>
+            var dd: double = curr[j] - rollingData[i][j]
+            deltaSqEpoch = deltaSqEpoch + dd * dd
+          rollingData[i] = curr
+        var gradThisEpoch: double = sqrt(deltaSqEpoch)
+        gradNormCurve.push(gradThisEpoch)
+
+        MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
+
+    session.dispose()
+
+    # --- Phase C: post-train per-parameter snapshots. ----------------------
+    var paramNormAfter: double[] = {}
+    var paramMaxAbsDelta: double[] = {}
+    for var i: int = 0; i < nParams; i++ =>
+      paramNormAfter.push(params[i].norm())
+      var curr: double[] = params[i].toDoubles()
+      var m: double = 0.0
+      for var j: int = 0; j < len(curr); j++ =>
+        var dd: double = curr[j] - initialData[i][j]
+        if dd < 0.0 =>
+          dd = -dd
+        if dd > m =>
+          m = dd
+      paramMaxAbsDelta.push(m)
+
+    # --- Phase C: training-set accuracy after the final epoch. -------------
+    var correct: int = 0
+    for var i: int = 0; i < totalSamples; i++ =>
+      var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+      var predIdx: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if probs[j] > probs[predIdx] =>
+          predIdx = j
+      var trueIdx: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if targets[i * numClasses + j] > targets[i * numClasses + trueIdx] =>
+          trueIdx = j
+      if predIdx == trueIdx =>
+        correct = correct + 1
+    var accuracy: double = correct.toDouble() / totalSamples.toDouble()
+
+    var finalLoss: double = lossCurve[len(lossCurve) - 1]
+
+    # --- Phase M: post-train scalar and per-parameter metric emissions. ---
+    var noLabels: StringField[] = {}
+    MetricEmitter.emit("weight_sum_in", weightSumIn, noLabels)
+    MetricEmitter.emit("weight_variance_in", weightVarianceIn, noLabels)
+    MetricEmitter.emit("input_mean", inputMean, noLabels)
+    MetricEmitter.emit("input_std", inputStd, noLabels)
+    MetricEmitter.emit("accuracy", accuracy, noLabels)
+
+    var paramsPerLayer: int = 2
+    if self.model.config.arch == "gat" =>
+      paramsPerLayer = 4
+    var layerParamsTotal: int = len(self.model.layers) * paramsPerLayer
+    for var i: int = 0; i < nParams; i++ =>
+      var plabels: StringField[] = {}
+      if i < layerParamsTotal =>
+        var layerIdx: int = i / paramsPerLayer
+        var kindIdx: int = i % paramsPerLayer
+        var kindName: str = "weight"
+        if kindIdx == 1 =>
+          kindName = "bias"
+        if kindIdx == 2 =>
+          kindName = "attSrc"
+        if kindIdx == 3 =>
+          kindName = "attDst"
+        plabels = {
+          StringField {
+            key: "layer",
+            value: $"{layerIdx}"
+          },
+          StringField {
+            key: "kind",
+            value: kindName
+          }
+        }
+      else =>
+        var clsIdx: int = i - layerParamsTotal
+        var clsName: str = "classW1"
+        if clsIdx == 1 =>
+          clsName = "classB1"
+        if clsIdx == 2 =>
+          clsName = "classW2"
+        if clsIdx == 3 =>
+          clsName = "classB2"
+        plabels = {
+          StringField {
+            key: "kind",
+            value: clsName
+          }
+        }
+      MetricEmitter.emit("param_norm_before", paramNormBefore[i], plabels)
+      MetricEmitter.emit("param_norm_after", paramNormAfter[i], plabels)
+      MetricEmitter.emit("param_max_abs_delta", paramMaxAbsDelta[i], plabels)
+
+    return TrainResult {
+      loss: finalLoss,
+      accuracy: accuracy,
+      epochs: epochs,
+      lossCurve: lossCurve,
+      gradNormCurve: gradNormCurve,
+      paramNormBefore: paramNormBefore,
+      paramNormAfter: paramNormAfter,
+      paramMaxAbsDelta: paramMaxAbsDelta,
+      weightSumIn: weightSumIn,
+      weightVarianceIn: weightVarianceIn,
+      inputMean: inputMean,
+      inputStd: inputStd
+    }

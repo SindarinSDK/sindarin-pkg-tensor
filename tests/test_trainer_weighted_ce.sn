@@ -1,0 +1,70 @@
+# test_trainer_weighted_ce — smoke test for the new Trainer<M, S, O> API
+# using the WeightedCrossEntropy strategy on a tiny supervised problem.
+#
+# Mirrors test_opt_fit.sn's setup but exercises the Trainer-driven
+# code path instead of the legacy Gnn.train wrapper. Once step 10
+# rewrites the rest of the tests, this file becomes one of many
+# Trainer-based tests and the old wrapper tests go away.
+
+import "../src/tensor"
+import "../src/gnn"
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn main(): void =>
+  println("=== Test Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> ===")
+
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+
+  var trainGraphs: GraphTensors[] = {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2)
+  }
+  var labels: double[] = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+  var weights: double[] = {1.0, 1.0, 1.0, 1.0}
+
+  # The caller-facing shape of the new training API:
+  #
+  # 1. Build a TrainConfig with the hyperparameters.
+  # 2. Pick an Optimizer (AdamW or Sgd) and flatten to OptimizerParams
+  # via `.params()`.
+  # 3. Pick a strategy (WeightedCrossEntropy for supervised, PpoClipped
+  # for RL).
+  # 4. Construct `Trainer<Model, Strategy, OptType>.create(...)`.
+  # 5. Call `.run(graphs, targets, weights)`.
+  var cfg: TrainConfig = TrainConfig.create(50, 1, 42l)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
+  var result: TrainResult = trainer.run(trainGraphs, labels, weights)
+
+  println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")
+  println($"  lossCurve length: {len(result.lossCurve)} (expect 50)")
+
+  if result.epochs != 50 =>
+    println("  FAIL: epochs != 50")
+    return
+  if len(result.lossCurve) != 50 =>
+    println("  FAIL: lossCurve length != 50")
+    return
+  if result.loss > 0.7 =>
+    println($"  FAIL: final loss {result.loss} too high (expected < 0.7 after 50 epochs on a learnable 4-sample set)")
+    return
+
+  println("  Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> PASS")

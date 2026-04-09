@@ -282,49 +282,8 @@ native fn sn_graph_train_epoch_ppo(
 # ---------------------------------------------------------------------------
 # Optimizer is now defined in ./optim.sn. Imported by the src/tensor.sn facade.
 # ---------------------------------------------------------------------------
-# Training result
-#
-# Returned by Gnn.train(). Top-line scalars (loss, accuracy, epochs) are
-# the headline values; the *Curve / *Norm* / *Delta arrays are the
-# Phase C "Bug B4" diagnostics from docs/issues/golden-path.md §2.4 and
-# Part 7. Use them to detect:
-#
-# - Loss diverging or NaNing            -> lossCurve
-# - Optimizer not moving the params     -> gradNormCurve, paramMaxAbsDelta
-# - Garbage in / garbage out            -> inputMean, inputStd
-# - Caller dropped the weight vector    -> weightSumIn, weightVarianceIn
-# - Bug B3 weight-update regression     -> paramNormBefore vs paramNormAfter
-#
-# All Per-parameter arrays (paramNorm*, paramMaxAbsDelta) are indexed in
-# the same order as Gnn.parameters() returns them.
-#
-# Semantic note on `loss`: this is the FINAL EPOCH average loss (the
-# tail of lossCurve), not the across-epoch average. Use lossCurve for
-# the full trajectory.
-#
-# Semantic note on `gradNormCurve`: this is the per-epoch L2 of the
-# parameter DELTA, i.e. L2(params_after_epoch - params_before_epoch).
-# For AdamW this is proportional to the optimizer's effective step
-# magnitude over the epoch (lr * L2(sum_of_adamw_steps)). It is not
-# the L2 of the raw gradient. Both answer the same diagnostic
-# question — "is the model moving?" — and the param-delta form is
-# robust against ggml zeroing the .grad field after backward.
-# ---------------------------------------------------------------------------
-
-struct TrainResult =>
-  loss: double
-  accuracy: double
-  epochs: int
-  lossCurve: double[]
-  gradNormCurve: double[]
-  paramNormBefore: double[]
-  paramNormAfter: double[]
-  paramMaxAbsDelta: double[]
-  weightSumIn: double
-  weightVarianceIn: double
-  inputMean: double
-  inputStd: double
-
+# TrainResult is now defined in src/gnn/trainer.sn alongside Trainer<M, S, O>.
+# It remains reachable through the gnn.sn facade.
 # ---------------------------------------------------------------------------
 # Distribution divergence — compare two discrete probability distributions.
 #
