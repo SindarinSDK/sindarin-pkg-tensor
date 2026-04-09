@@ -1,0 +1,62 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/params.sn — ParameterSet save/load wrapper
+# ==============================================================================
+#
+# Every trainable model in the package exposes a `parameters(): Tensor[]`
+# method that returns a flat ordered list of its learnable weight/bias
+# tensors. Persistence (save to disk, load back) operates on that list.
+#
+# `ParameterSet` is a light wrapper around `Tensor[]` + the save/load
+# native entry points. It exists for two reasons:
+#
+# 1. Call-site readability. Instead of
+#
+# sn_model_save(self.parameters(), path)
+# var loaded: Tensor[] = sn_model_load(path)
+# # ... manually index-walk loaded back into self.layers[i].weight, etc.
+#
+# callers write
+#
+# ParameterSet.fromModel(self).save(path)
+# var ps: ParameterSet = ParameterSet.load(path)
+# # ... ps.get(i) with a bounds check
+#
+# 2. Bounds-checked access. `get(i)` panics with a clear message on
+# out-of-bounds rather than returning a garbage pointer. The
+# current `Gnn.load` does a hand-rolled `if idx < len(loaded) =>`
+# dance on every assignment; a `ParameterSet` method hides that
+# check behind one call.
+#
+# The binary format is owned by src/native/tensor_persistence.sn.c
+# (`SNTN` magic, count, per-tensor n_dims/shape/data). `ParameterSet`
+# is a pure Sindarin wrapper — no format knowledge leaks out.
+# ==============================================================================
+
+import "./core"
+import "./panic"
+
+struct ParameterSet =>
+  params: Tensor[]
+
+  # --- Construction ---
+
+  static fn create(params: Tensor[]): ParameterSet =>
+    return ParameterSet { params: params }
+
+  # --- Persistence ---
+
+  fn save(path: str): void =>
+    sn_model_save(self.params, path)
+
+  static fn load(path: str): ParameterSet =>
+    return ParameterSet { params: sn_model_load(path) }
+
+  # --- Access ---
+
+  fn count(): int =>
+    return len(self.params)
+
+  fn get(i: int): Tensor =>
+    if i < 0 || i >= len(self.params) =>
+      panic($"ParameterSet.get: index {i} out of bounds (count={len(self.params)})")
+    return self.params[i]

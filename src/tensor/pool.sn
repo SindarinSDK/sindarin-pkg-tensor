@@ -1,0 +1,61 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/pool.sn — TensorPool lifecycle wrapper
+# ==============================================================================
+#
+# The tensor package maintains a global pool of host-side float arrays
+# (see src/native/tensor_pool.sn.c). Every Tensor handle is a slot in
+# that pool. Intermediate ops that run outside of `using` scopes leave
+# live slots behind, which slowly grows memory across long-running
+# inference loops.
+#
+# `TensorPool` wraps the checkpoint/restore/reset natives in three
+# shapes the rest of the package uses:
+#
+# 1. `TensorPool.reset()` — free every slot. Call between unrelated
+# phases of a long-running program.
+#
+# 2. `TensorPool.checkpoint()` / `TensorPool.restore(cp)` — take a
+# snapshot, do some work, free only what the work allocated. The
+# checkpoint is an opaque long.
+#
+# 3. `using session = TensorPool.scope() => ...` — idiomatic
+# automatic-cleanup form. `scope()` takes a checkpoint on entry;
+# the `dispose()` hook restores it on block exit, reclaiming every
+# slot allocated inside the block. Use this for per-iteration
+# inference work inside a long loop.
+#
+# The scope form is the recommended pattern. The checkpoint/restore
+# form stays available for consumers that need to hold a checkpoint
+# across non-lexical boundaries.
+# ==============================================================================
+
+import "./core"
+
+struct TensorPool =>
+  _cp: long
+
+  # --- Raw operations ---
+
+  static fn reset(): void =>
+    sn_tensor_pool_reset()
+
+  static fn checkpoint(): long =>
+    return sn_tensor_pool_checkpoint()
+
+  static fn restore(cp: long): void =>
+    sn_tensor_pool_restore(cp)
+
+  # --- using-block scope ---
+  #
+  # Usage:
+  #
+  # using _scope = TensorPool.scope() =>
+  # var t: Tensor = Tensor.zeros(4, 4)
+  # ...
+  # # every pool slot allocated inside the block is now reclaimed.
+
+  static fn scope(): TensorPool =>
+    return TensorPool { _cp: sn_tensor_pool_checkpoint() }
+
+  fn dispose(): void =>
+    sn_tensor_pool_restore(self._cp)

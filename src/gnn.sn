@@ -298,38 +298,39 @@ struct Gnn =>
     sn_tensor_pool_restore(cp)
 
   fn save(path: str): void =>
-    sn_model_save(self.parameters(), path)
+    ParameterSet.create(self.parameters()).save(path)
 
   fn load(path: str): void =>
-    var loaded: Tensor[] = sn_model_load(path)
-    # Assign loaded tensors directly into model structure.
-    # Parameter order matches parameters(): layer weights in order, then classifier.
+    var ps: ParameterSet = ParameterSet.load(path)
+    var n: int = ps.count()
+    # Assign loaded tensors into model structure in parameters() order:
+    # per-layer {weight, bias [, attSrc, attDst]} then classifier W1/B1/W2/B2.
     var idx: int = 0
     for var i: int = 0; i < len(self.layers); i++ =>
-      if idx < len(loaded) =>
-        self.layers[i].weight = loaded[idx]
+      if idx < n =>
+        self.layers[i].weight = ps.get(idx)
         idx = idx + 1
-      if idx < len(loaded) =>
-        self.layers[i].bias = loaded[idx]
+      if idx < n =>
+        self.layers[i].bias = ps.get(idx)
         idx = idx + 1
       if self.layers[i].arch == "gat" =>
-        if idx < len(loaded) =>
-          self.layers[i].attSrc = loaded[idx]
+        if idx < n =>
+          self.layers[i].attSrc = ps.get(idx)
           idx = idx + 1
-        if idx < len(loaded) =>
-          self.layers[i].attDst = loaded[idx]
+        if idx < n =>
+          self.layers[i].attDst = ps.get(idx)
           idx = idx + 1
-    if idx < len(loaded) =>
-      self.classifierW1 = loaded[idx]
+    if idx < n =>
+      self.classifierW1 = ps.get(idx)
       idx = idx + 1
-    if idx < len(loaded) =>
-      self.classifierB1 = loaded[idx]
+    if idx < n =>
+      self.classifierB1 = ps.get(idx)
       idx = idx + 1
-    if idx < len(loaded) =>
-      self.classifierW2 = loaded[idx]
+    if idx < n =>
+      self.classifierW2 = ps.get(idx)
       idx = idx + 1
-    if idx < len(loaded) =>
-      self.classifierB2 = loaded[idx]
+    if idx < n =>
+      self.classifierB2 = ps.get(idx)
 
   # Train the GNN against a list of caller-supplied graphs.
   #
@@ -796,7 +797,7 @@ struct Gnn =>
             value: $"{epoch}"
           }
         }
-        sn_graph_emit_train_metric("train_loss", epochLoss, epochLabels)
+        MetricEmitter.emit("train_loss", epochLoss, epochLabels)
 
         # --- Phase C: per-epoch param-delta L2 norm.
         # gradNormCurve[epoch] = L2(params_after_epoch -
@@ -816,7 +817,7 @@ struct Gnn =>
         gradNormCurve.push(gradThisEpoch)
 
         # --- Phase M: emit per-epoch grad_norm_l2 with {epoch} label.
-        sn_graph_emit_train_metric("grad_norm_l2", gradThisEpoch, epochLabels)
+        MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
 
     sn_graph_end()
 
@@ -867,11 +868,11 @@ struct Gnn =>
     # been streamed. The consumer can reconstruct the full TrainResult
     # contents purely from the callback stream if they want to.
     var noLabels: StringField[] = {}
-    sn_graph_emit_train_metric("weight_sum_in", weightSumIn, noLabels)
-    sn_graph_emit_train_metric("weight_variance_in", weightVarianceIn, noLabels)
-    sn_graph_emit_train_metric("input_mean", inputMean, noLabels)
-    sn_graph_emit_train_metric("input_std", inputStd, noLabels)
-    sn_graph_emit_train_metric("accuracy", accuracy, noLabels)
+    MetricEmitter.emit("weight_sum_in", weightSumIn, noLabels)
+    MetricEmitter.emit("weight_variance_in", weightVarianceIn, noLabels)
+    MetricEmitter.emit("input_mean", inputMean, noLabels)
+    MetricEmitter.emit("input_std", inputStd, noLabels)
+    MetricEmitter.emit("accuracy", accuracy, noLabels)
 
     # Per-parameter emissions with structured (layer, kind) labels.
     # The parameters() ordering is: layer params in order (weight,
@@ -919,9 +920,9 @@ struct Gnn =>
             value: clsName
           }
         }
-      sn_graph_emit_train_metric("param_norm_before", paramNormBefore[i], plabels)
-      sn_graph_emit_train_metric("param_norm_after", paramNormAfter[i], plabels)
-      sn_graph_emit_train_metric("param_max_abs_delta", paramMaxAbsDelta[i], plabels)
+      MetricEmitter.emit("param_norm_before", paramNormBefore[i], plabels)
+      MetricEmitter.emit("param_norm_after", paramNormAfter[i], plabels)
+      MetricEmitter.emit("param_max_abs_delta", paramMaxAbsDelta[i], plabels)
 
     return TrainResult {
       loss: finalLoss,

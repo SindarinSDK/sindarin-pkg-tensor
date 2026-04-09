@@ -1,0 +1,76 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/record.sn — RecordSession (graph recording)
+# ==============================================================================
+#
+# Record mode turns tensor ops into deferred ggml graph nodes instead
+# of executing them immediately. The recorded graph is what ggml_opt
+# differentiates during training. Native entry points are:
+#
+# sn_graph_begin()       — switch the package into record mode
+# sn_graph_end()          — tear it down
+# sn_graph_input(r, c)    — create a record-mode-only input tensor
+# sn_graph_input_data(..) — same, but pre-loads host data into the slot
+# sn_graph_param(t)       — promote a pool tensor to ggml_opt PARAM
+# sn_graph_compute_loss(loss_t) — run forward + read scalar (tests only)
+#
+# `RecordSession` is a thin Sindarin wrapper over those natives with
+# two ergonomic improvements:
+#
+# 1. `RecordSession.open()` + `dispose()` let callers write
+#
+# using _rec = RecordSession.open() =>
+# var x = _rec.inputData(hostX, rows, cols)
+# ...
+# # sn_graph_end() runs automatically at block exit
+#
+# instead of the manual sn_graph_begin() / sn_graph_end() pair.
+# This matches the idiomatic Sindarin resource pattern.
+#
+# 2. The input/param/computeLoss methods have the same names as the
+# natives but read as methods on a session object, so the intent
+# at the call site is visible ("this belongs to THIS recording")
+# instead of looking like free-function calls into a global.
+#
+# The underlying native API is still global (there's only ever one
+# active recording at a time), so nesting RecordSession scopes is not
+# supported and will produce surprising behaviour. Callers should
+# structure their code so only one scope is live at a time.
+# ==============================================================================
+
+import "./core"
+
+struct RecordSession =>
+  # A structural placeholder — Sindarin struct literals need at least
+  # one field. The actual recording state lives in the C-side globals
+  # (g_record_mode, g_param_ctx, g_compute_ctx, ...) defined in
+  # src/native/tensor_record.sn.c.
+  _active: bool
+
+  static fn open(): RecordSession =>
+    sn_graph_begin()
+    return RecordSession { _active: true }
+
+  fn dispose(): void =>
+    sn_graph_end()
+
+  # --- Input / param builders ---
+
+  fn input(rows: int, cols: int): Tensor =>
+    return sn_graph_input(rows, cols)
+
+  fn inputData(data: double[], rows: int, cols: int): Tensor =>
+    return sn_graph_input_data(data, rows, cols)
+
+  fn param(t: Tensor): Tensor =>
+    return sn_graph_param(t)
+
+  # --- Forward eval (tests only) ---
+  #
+  # Execute the recorded forward graph ending at `loss` and return the
+  # scalar value. This runs ONE forward pass — no backward, no
+  # optimizer step. Used by the record-mode loss unit tests to
+  # validate a single op's math before plugging it into a real
+  # training graph.
+
+  fn computeLoss(loss: Tensor): double =>
+    return sn_graph_compute_loss(loss)

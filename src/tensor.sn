@@ -29,6 +29,10 @@
 import "./tensor/panic"
 import "./tensor/core"
 import "./tensor/graph"
+import "./tensor/pool"
+import "./tensor/record"
+import "./tensor/metrics"
+import "./tensor/params"
 
 # ---------------------------------------------------------------------------
 # `batchGraphs(list)` is kept as a thin alias for `GraphTensors.batch(list)`

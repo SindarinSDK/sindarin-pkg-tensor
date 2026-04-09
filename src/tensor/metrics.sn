@@ -1,0 +1,52 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/metrics.sn — MetricEmitter (global singleton)
+# ==============================================================================
+#
+# The training driver emits per-epoch and post-train metric tuples
+# via a single global callback slot managed by the C runtime. The
+# native surface is three entry points:
+#
+# sn_graph_set_train_metric_callback(cb)      — register (deep copies the closure)
+# sn_graph_clear_train_metric_callback()       — deregister + free the copy
+# sn_graph_emit_train_metric(name, val, lbls)  — fire the callback if set
+#
+# `MetricEmitter` exposes those as static methods on a dummy struct so
+# the call sites read as
+#
+# MetricEmitter.set(fn(name: str, val: double, lbls: StringField[]): void => ...)
+# MetricEmitter.emit("train_loss", loss, labels)
+# MetricEmitter.clear()
+#
+# instead of the underscored native names. There's only ever one
+# active callback (the native slot is a single pointer), so the
+# "singleton" framing is accurate — this is a module-scoped namespace,
+# not a struct you instantiate.
+#
+# Emitted metric contract — the set of names/labels the training
+# driver actually fires — is documented on the train() method in
+# src/gnn.sn. Consumers should use `name` to route and look up label
+# values by `key` inside each `StringField`.
+# ==============================================================================
+
+import "sindarin-pkg-sdk/src/core/fields"
+import "./core"
+
+struct MetricEmitter =>
+  _placeholder: bool
+
+  # Register a callback closure. Any previously registered callback is
+  # freed and replaced. Pass a no-op lambda to effectively disable
+  # (though `clear()` is the idiomatic form for that).
+  static fn set(cb: fn(str, double, StringField[]): void): void =>
+    sn_graph_set_train_metric_callback(cb)
+
+  # Free and null-out the currently registered callback. Safe to call
+  # even if nothing is registered.
+  static fn clear(): void =>
+    sn_graph_clear_train_metric_callback()
+
+  # Fire the registered callback with (name, value, labels). No-op
+  # if no callback is currently set. `labels` is a StringField array;
+  # pass `{}` for metrics with no label dimensions.
+  static fn emit(name: str, value: double, labels: StringField[]): void =>
+    sn_graph_emit_train_metric(name, value, labels)
