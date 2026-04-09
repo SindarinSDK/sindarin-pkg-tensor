@@ -167,7 +167,7 @@ fn main(): void =>
   # --- Train with multi-batch (totalSamples > batchSize) ------------------
   # totalSamples = 6, batchSize = 2 → 3 batches per epoch. Pre-fix this
   # would have crashed in the gnn.sn:343 multi-batch numEdges assertion.
-  var opt: Optimizer = Optimizer.adamw(0.05, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.05, 0.0).params()
   println("  training 300 epochs, batchSize=2 (3 batches per epoch)...")
   var result: TrainResult = model.train(
     trainGraphs, trainLabels, trainWeights,

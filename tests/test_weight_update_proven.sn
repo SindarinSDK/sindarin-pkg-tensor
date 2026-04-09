@@ -207,7 +207,7 @@ fn runArch(arch: str): void =>
     normBefore.push(paramsBefore[i].norm())
 
   # --- Train ---
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var result: TrainResult = model.train(
     graphs, labels, weights, opt, 50, 4, 0.0, 42l)
   println($"  train done: loss={result.loss} epochs={result.epochs}")

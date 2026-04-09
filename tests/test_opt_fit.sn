@@ -36,7 +36,7 @@ fn main(): void =>
   var labels: double[] = {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
   var weights: double[] = {1.0, 1.0, 1.0, 1.0}
 
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var result: TrainResult = model.train(
     trainGraphs, labels, weights, opt, 50, 1, 0.0, 42l)
   println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")

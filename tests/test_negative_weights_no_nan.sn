@@ -124,7 +124,7 @@ fn main(): void =>
   # 50 epochs is what skynet was using when the divergence kicked in.
   # Pre-fix this would have produced loss=NaN (the smoking-gun progression
   # was -0.6 → -1.1 → -1.5 → ... → -7.9 → -inf → NaN over ~18 epochs).
-  var opt: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  var opt: OptimizerParams = AdamW.create(0.001, 0.0001).params()
   println("  training 50 epochs, batchSize=9 (single batch), negative-weight mix...")
   var result: TrainResult = model.train(
     trainGraphs, labels, weights, opt, 50, 9, 0.0, 42l)
@@ -179,7 +179,7 @@ fn main(): void =>
     numLayers: 3, arch: "gat", dropoutRate: 0.0
   }
   var multiModel: Gnn = Gnn.createWithSeed(multiCfg, 7l)
-  var multiOpt: Optimizer = Optimizer.adamw(0.001, 0.0001)
+  var multiOpt: OptimizerParams = AdamW.create(0.001, 0.0001).params()
   var multiResult: TrainResult = multiModel.train(
     multiGraphs, multiLabels, multiWeights, multiOpt, 4, 8, 0.0, 42l)
   println($"  multi-batch final loss = {multiResult.loss}")

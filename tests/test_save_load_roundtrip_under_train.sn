@@ -105,7 +105,7 @@ fn trainModel(model: Gnn, epochs: int, trainSeed: long): TrainResult =>
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
   var weights: double[] = buildUnitWeights(len(graphs))
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   return model.train(graphs, labels, weights, opt, epochs, 3, 0.0, trainSeed)
 
 # Predict every training graph via predictBatch; return a per-sample

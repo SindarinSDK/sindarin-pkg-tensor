@@ -174,7 +174,7 @@ fn trainCrusher(seed: long): Gnn =>
   var graphs: GraphTensors[] = buildAllGraphs()
   var labels: double[] = buildAllLabels()
   var weights: double[] = buildUnitWeights(len(graphs))
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var result: TrainResult = model.train(
     graphs, labels, weights, opt, 200, 5, 0.0, 42l)
   println($"  seed={seed} final loss={result.loss} accuracy={result.accuracy}")

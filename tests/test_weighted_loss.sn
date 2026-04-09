@@ -69,7 +69,7 @@ fn trainOnce(model: Gnn, weights: double[]): TrainResult =>
     1.0, 0.0, 0.0, # Graph A â † ’ action 0
     0.0, 0.0, 1.0 # Graph B â † ’ action 2
   }
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   return model.train(trainGraphs, labels, weights, opt, 200, 2, 0.0, 42l)
 
 # ---------------------------------------------------------------------------

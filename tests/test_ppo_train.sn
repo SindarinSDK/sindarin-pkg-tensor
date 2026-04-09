@@ -131,7 +131,7 @@ fn main(): void =>
   println($"  pre-train  stateB probs=[{preB[0]}, {preB[1]}]")
 
   # --- Run PPO training on the mixed-sign-advantage batch.
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var graphs: GraphTensors[] = buildGraphs()
   var actions: double[] = buildActions()
   var advantages: double[] = buildAdvantages()

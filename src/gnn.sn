@@ -263,7 +263,7 @@ struct Gnn =>
   # docs/issues/compiler-problems.29.md for the refcount self-assignment
   # bug. The discard pattern below is the safe form.
   fn train(graphs: GraphTensors[], labels: double[], weights: double[],
-    optimizer: Optimizer, epochs: int, batchSize: int,
+    optimizer: OptimizerParams, epochs: int, batchSize: int,
     valSplit: double, seed: long): TrainResult =>
     # Thin wrapper over trainCore for the classic weighted-CE loss. The
     # oldLogProbsHost / epsilon slots are unused in this path and passed
@@ -304,7 +304,7 @@ struct Gnn =>
   # loss kinds differ only at (a) the loss op itself and (b) the choice
   # of per-epoch driver. See docs/issues/ppo-clipped-objective.md.
   fn trainPpo(graphs: GraphTensors[], actions: double[],
-    advantages: double[], optimizer: Optimizer, epochs: int,
+    advantages: double[], optimizer: OptimizerParams, epochs: int,
     batchSize: int, epsilon: double, entropyCoeff: double,
     seed: long): TrainResult =>
     var numClasses: int = self.config.numActions
@@ -344,7 +344,7 @@ struct Gnn =>
   # snapshot/delta tracking, metric emissions, TrainResult packaging —
   # is identical between the two loss kinds.
   fn trainCore(graphs: GraphTensors[], labels: double[], weights: double[],
-    optimizer: Optimizer, epochs: int, batchSize: int,
+    optimizer: OptimizerParams, epochs: int, batchSize: int,
     valSplit: double, seed: long, lossKind: str,
     oldLogProbsHost: double[], epsilon: double,
     entropyCoeff: double): TrainResult =>

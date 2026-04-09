@@ -1,45 +1,115 @@
 # ==============================================================================
-# sindarin-pkg-tensor/src/tensor/optim.sn — Optimizer configuration
+# sindarin-pkg-tensor/src/tensor/optim.sn — Optimizer interface + AdamW + Sgd
 # ==============================================================================
 #
-# `Optimizer` is a plain data struct — a tagged record carrying the
-# hyperparameters for either AdamW or SGD training. It is consumed by
-# `Gnn.train` / `Gnn.trainPpo` and forwarded to the native training
-# driver via the 6 scalar fields (`kind`, `learningRate`, `beta1`,
-# `beta2`, `eps`, `weightDecay`).
+# Training ops take their learning-rate / momentum / weight-decay
+# configuration through an `Optimizer` interface. Two implementations
+# ship with the package:
 #
-# Scheduled for split in step 8: an `Optimizer` interface + concrete
-# `AdamW` / `Sgd` structs will replace this record once `Trainer<S, O>`
-# is introduced and can consume them through a struct-level generic
-# type parameter. Today's `Gnn.train` is not struct-generic and can't
-# call interface methods on a plain parameter-typed argument, so the
-# interface form is deferred until the generic-aware Trainer lands.
+# AdamW   — adaptive moment estimation with decoupled weight decay.
+# The default for GNN training. Requires lr and wd; beta1,
+# beta2, eps default to the Kingma/Ba standard values.
 #
-# The `Optimizer.adamw(lr, wd)` and `Optimizer.sgd(lr)` static factories
-# remain the caller-facing construction path.
+# Sgd     — plain stochastic gradient descent with optional weight
+# decay. Simpler, fewer hyperparameters, rarely the right
+# choice for GNNs but useful for debugging.
+#
+# Both expose a single `params(): OptimizerParams` method that flattens
+# the concrete struct into a plain data record the training driver
+# actually consumes. `OptimizerParams` doubles as the native-boundary
+# format (6 scalars matching the C `sn_graph_train_epoch_*` arg list)
+# so any struct that can produce one of these satisfies `Optimizer`
+# structurally.
+#
+# The whole thing is consumed by `Trainer<S: TrainStrategy, O: Optimizer>`
+# in src/gnn/trainer.sn. Inside the Trainer's generic methods,
+# `self.optimizer.params()` dispatches to the concrete struct's
+# implementation. Interface-typed fields don't exist in Sindarin
+# today and interface-typed parameters can't have methods called on
+# them outside generic context — Trainer's struct-level `O: Optimizer`
+# constraint is the only viable dispatch mechanism. The shape of this
+# module is driven by that constraint; see docs/issues/compiler-problems.33
+# and 34 for the history.
 # ==============================================================================
 
-struct Optimizer =>
+# --- Plain-data optimizer configuration ----------------------------------
+
+struct OptimizerParams =>
   kind: str
   learningRate: double
   weightDecay: double
   beta1: double
   beta2: double
+  eps: double
 
-  static fn adamw(lr: double, wd: double): Optimizer =>
-    return Optimizer {
-      kind: "adamw",
+  # Identity-valued `params()` method so OptimizerParams itself
+  # satisfies the `Optimizer` interface. Useful when the caller has
+  # a pre-flattened config (e.g., loaded from JSON) and wants to
+  # skip the AdamW/Sgd struct wrapping.
+  fn params(): OptimizerParams =>
+    return self
+
+# --- Interface ------------------------------------------------------------
+
+interface Optimizer =>
+  fn params(): OptimizerParams
+
+# --- AdamW ----------------------------------------------------------------
+
+struct AdamW =>
+  learningRate: double
+  weightDecay: double
+  beta1: double
+  beta2: double
+  eps: double
+
+  # Standard AdamW defaults. `lr` and `wd` are the two knobs callers
+  # actually tune; beta1 / beta2 / eps are left at the Kingma/Ba
+  # canonical values and can be changed via direct struct-literal
+  # construction if needed.
+  static fn create(lr: double, wd: double): AdamW =>
+    return AdamW {
       learningRate: lr,
       weightDecay: wd,
       beta1: 0.9,
-      beta2: 0.999
+      beta2: 0.999,
+      eps: 0.00000001
     }
 
-  static fn sgd(lr: double): Optimizer =>
-    return Optimizer {
-      kind: "sgd",
+  fn params(): OptimizerParams =>
+    return OptimizerParams {
+      kind: "adamw",
+      learningRate: self.learningRate,
+      weightDecay: self.weightDecay,
+      beta1: self.beta1,
+      beta2: self.beta2,
+      eps: self.eps
+    }
+
+# --- Sgd ------------------------------------------------------------------
+
+struct Sgd =>
+  learningRate: double
+  weightDecay: double
+
+  static fn create(lr: double): Sgd =>
+    return Sgd {
       learningRate: lr,
-      weightDecay: 0.0,
+      weightDecay: 0.0
+    }
+
+  static fn createWithDecay(lr: double, wd: double): Sgd =>
+    return Sgd {
+      learningRate: lr,
+      weightDecay: wd
+    }
+
+  fn params(): OptimizerParams =>
+    return OptimizerParams {
+      kind: "sgd",
+      learningRate: self.learningRate,
+      weightDecay: self.weightDecay,
       beta1: 0.0,
-      beta2: 0.0
+      beta2: 0.0,
+      eps: 0.0
     }

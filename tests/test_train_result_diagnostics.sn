@@ -151,7 +151,7 @@ fn main(): void =>
 
   # ----- Train -----
 
-  var opt: Optimizer = Optimizer.adamw(0.01, 0.0)
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var epochs: int = 25
   var result: TrainResult = model.train(
     graphs, labels, weights, opt, epochs, 3, 0.0, 42l)
