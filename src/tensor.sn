@@ -33,6 +33,7 @@ import "./tensor/pool"
 import "./tensor/record"
 import "./tensor/metrics"
 import "./tensor/params"
+import "./tensor/optim"
 
 # ---------------------------------------------------------------------------
 # `batchGraphs(list)` is kept as a thin alias for `GraphTensors.batch(list)`

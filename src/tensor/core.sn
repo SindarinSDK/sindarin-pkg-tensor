@@ -280,34 +280,7 @@ native fn sn_graph_train_epoch_ppo(
   lr: double, beta1: double, beta2: double, eps: double, wd: double): double
 
 # ---------------------------------------------------------------------------
-# Optimizer configuration
-# ---------------------------------------------------------------------------
-
-struct Optimizer =>
-  kind: str
-  learningRate: double
-  weightDecay: double
-  beta1: double
-  beta2: double
-
-  static fn adamw(lr: double, wd: double): Optimizer =>
-    return Optimizer {
-      kind: "adamw",
-      learningRate: lr,
-      weightDecay: wd,
-      beta1: 0.9,
-      beta2: 0.999
-    }
-
-  static fn sgd(lr: double): Optimizer =>
-    return Optimizer {
-      kind: "sgd",
-      learningRate: lr,
-      weightDecay: 0.0,
-      beta1: 0.0,
-      beta2: 0.0
-    }
-
+# Optimizer is now defined in ./optim.sn. Imported by the src/tensor.sn facade.
 # ---------------------------------------------------------------------------
 # Training result
 #

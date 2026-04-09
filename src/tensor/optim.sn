@@ -1,0 +1,45 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/tensor/optim.sn — Optimizer configuration
+# ==============================================================================
+#
+# `Optimizer` is a plain data struct — a tagged record carrying the
+# hyperparameters for either AdamW or SGD training. It is consumed by
+# `Gnn.train` / `Gnn.trainPpo` and forwarded to the native training
+# driver via the 6 scalar fields (`kind`, `learningRate`, `beta1`,
+# `beta2`, `eps`, `weightDecay`).
+#
+# Scheduled for split in step 8: an `Optimizer` interface + concrete
+# `AdamW` / `Sgd` structs will replace this record once `Trainer<S, O>`
+# is introduced and can consume them through a struct-level generic
+# type parameter. Today's `Gnn.train` is not struct-generic and can't
+# call interface methods on a plain parameter-typed argument, so the
+# interface form is deferred until the generic-aware Trainer lands.
+#
+# The `Optimizer.adamw(lr, wd)` and `Optimizer.sgd(lr)` static factories
+# remain the caller-facing construction path.
+# ==============================================================================
+
+struct Optimizer =>
+  kind: str
+  learningRate: double
+  weightDecay: double
+  beta1: double
+  beta2: double
+
+  static fn adamw(lr: double, wd: double): Optimizer =>
+    return Optimizer {
+      kind: "adamw",
+      learningRate: lr,
+      weightDecay: wd,
+      beta1: 0.9,
+      beta2: 0.999
+    }
+
+  static fn sgd(lr: double): Optimizer =>
+    return Optimizer {
+      kind: "sgd",
+      learningRate: lr,
+      weightDecay: 0.0,
+      beta1: 0.0,
+      beta2: 0.0
+    }
