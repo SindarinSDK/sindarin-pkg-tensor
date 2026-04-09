@@ -1,0 +1,208 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/gnn/strategy.sn — TrainStrategy interface + impls
+# ==============================================================================
+#
+# Training has two "flavors" today — supervised weighted cross-entropy
+# and PPO-clipped surrogate — that share the same ~500 lines of
+# host-buffer assembly, record-mode plumbing, Phase C diagnostics, and
+# metric emissions. Only four things differ between them:
+#
+# 1. Pre-record data prep — PPO snapshots log π_old(a_i|s_i) from a
+# non-record forward pass; weighted-CE does nothing.
+#
+# 2. Extra static input tensors in the recorded graph — PPO adds an
+# oldLogProbs input; weighted-CE adds none.
+#
+# 3. Loss op — sn_tensor_weighted_cross_entropy vs
+# sn_tensor_ppo_clipped_loss.
+#
+# 4. Epoch driver — sn_graph_train_epoch vs sn_graph_train_epoch_ppo.
+#
+# The `TrainStrategy` interface exposes exactly those four extension
+# points. Concrete strategies (`WeightedCrossEntropy`, `PpoClipped`)
+# hold their own state (PPO holds the oldLogProbs host buffer and the
+# input tensor handle; weighted CE is stateless). A single
+# `Trainer<S: TrainStrategy, O: Optimizer>` generic consumes them and
+# runs one shared training body — the `lossKind: str` branching that
+# used to live inside `Gnn.trainCore` disappears.
+#
+# Notes on the interface shape imposed by the language:
+#
+# - `prepare` takes pre-computed forward probabilities as a flat
+# double[] rather than a `Gnn` reference, because strategy.sn
+# cannot import gnn.sn without creating a cycle (gnn.sn imports
+# this file back through its facade). Pre-computing is cheap —
+# one forward pass per training graph, same work PpoClipped used
+# to do inline in Gnn.trainPpo.
+#
+# - `buildLoss` takes a `RecordSession` parameter rather than letting
+# the strategy call `sn_graph_input_data` directly, so the caller
+# retains the "this recording" framing from record.sn. PpoClipped's
+# extra oldLogProbsInput allocation goes through session.inputData.
+#
+# - `runEpoch` takes an `EpochContext` — a bundle of the ~16 scalar
+# / tensor / array arguments the native driver takes. Otherwise
+# the method signature would be a wall of positional args.
+# ==============================================================================
+
+import "../tensor"
+import "../tensor/record"
+import "../tensor/optim"
+import "sindarin-pkg-sdk/src/core/math"
+
+# ---------------------------------------------------------------------------
+# EpochContext — bundled arguments for the per-epoch native driver.
+#
+# Every field here is either:
+# - a recorded-graph Tensor handle (loss, features, labels, weights)
+# - a host-side double[] buffer assembled by the trainer
+# (featuresHost, targetsHost, weightsHost, adjHost,
+# realNodeCountHost, perm)
+# - a shape/scale primitive (featureDim, labelsPerSample, batchSize,
+# maxNodes)
+# - the optimizer config (flattened via .params())
+#
+# PPO-specific additions (oldLogProbsHost buffer, oldLogProbsInput
+# tensor) live on the PpoClipped strategy itself, not here, so the
+# context struct is identical across strategies.
+# ---------------------------------------------------------------------------
+
+struct EpochContext =>
+  loss: Tensor
+  features: Tensor
+  labels: Tensor
+  weights: Tensor
+  featuresHost: double[]
+  targetsHost: double[]
+  weightsHost: double[]
+  adjHost: double[]
+  realNodeCountHost: double[]
+  perm: double[]
+  featureDim: int
+  labelsPerSample: int
+  batchSize: int
+  maxNodes: int
+  optimizer: OptimizerParams
+
+# ---------------------------------------------------------------------------
+# TrainStrategy interface
+# ---------------------------------------------------------------------------
+
+interface TrainStrategy =>
+  # Pre-record phase. Populate any strategy-owned host buffers from a
+  # non-record forward pass's output probabilities.
+  #
+  # allProbsFlat: (numSamples * numClasses) row-major probs for every
+  # training graph, computed by the caller via
+  # model.forward(g, false).probs.toDoubles()
+  # numSamples:   total training samples (one row per sample)
+  # numClasses:   numClasses = model.config.numActions
+  # targets:      the caller-supplied targets array passed to Trainer.run —
+  # one-hot labels for supervised, one-hot actions for RL.
+  #
+  # WeightedCrossEntropy ignores every argument. PpoClipped uses this to
+  # derive oldLogProbsHost.
+  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void
+
+  # Record-mode loss construction. Called once while a RecordSession is
+  # open, to allocate any extra per-batch input tensors the strategy
+  # needs (stored in the strategy's own fields) and build the loss op
+  # wired into the recorded training graph.
+  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor
+
+  # Per-epoch driver dispatch. Strategy picks the native entry point
+  # that matches its loss shape and forwards the EpochContext fields
+  # plus any strategy-owned state (PpoClipped's oldLogProbs input +
+  # host buffer) into it.
+  fn runEpoch(ctx: EpochContext): double
+
+# ---------------------------------------------------------------------------
+# WeightedCrossEntropy — supervised classification with per-sample weights.
+# Stateless; exists as a struct only to carry the interface methods.
+# ---------------------------------------------------------------------------
+
+struct WeightedCrossEntropy =>
+  _placeholder: bool
+
+  static fn create(): WeightedCrossEntropy =>
+    return WeightedCrossEntropy { _placeholder: true }
+
+  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void =>
+    return
+
+  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
+    return sn_tensor_weighted_cross_entropy(logits, targetsT, weightsT)
+
+  fn runEpoch(ctx: EpochContext): double =>
+    return sn_graph_train_epoch(
+      ctx.loss, ctx.features, ctx.labels, ctx.weights,
+      ctx.featuresHost, ctx.targetsHost, ctx.weightsHost,
+      ctx.adjHost, ctx.realNodeCountHost, ctx.perm,
+      ctx.featureDim, ctx.labelsPerSample, ctx.batchSize, ctx.maxNodes,
+      ctx.optimizer.kind, ctx.optimizer.learningRate,
+      ctx.optimizer.beta1, ctx.optimizer.beta2, ctx.optimizer.eps,
+      ctx.optimizer.weightDecay)
+
+# ---------------------------------------------------------------------------
+# PpoClipped — PPO clipped surrogate (Schulman et al. 2017) with optional
+# entropy bonus. Stateful: holds the extras host buffer and the extra
+# record-mode input tensor handle across the three lifecycle calls.
+# ---------------------------------------------------------------------------
+
+struct PpoClipped =>
+  epsilon: double
+  entropyCoeff: double
+  # Filled by prepare() from pre-record forward probabilities.
+  oldLogProbsHost: double[]
+  # Filled by buildLoss() with the record-mode input tensor allocated
+  # inside the RecordSession. runEpoch() reads it during dispatch.
+  oldLogProbsInput: Tensor
+
+  static fn create(epsilon: double, entropyCoeff: double): PpoClipped =>
+    return PpoClipped {
+      epsilon: epsilon,
+      entropyCoeff: entropyCoeff,
+      oldLogProbsHost: {},
+      oldLogProbsInput: Tensor.zeros(1, 1)
+    }
+
+  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void =>
+    # Snapshot log π_old(a_i|s_i) for every training sample. The chosen
+    # action index comes from argmax over the one-hot row in `targets`;
+    # picking the argmax (rather than break-on-first-match) is robust
+    # against float-noisy one-hots where the caller writes 0.999999
+    # instead of 1.0. The probability floor matches LOG_SM_EPS ≈ 2e-9
+    # from the loss op so oldLogProbs and the current log π_θ stay on
+    # the same effective scale.
+    var extras: double[] = {}
+    for var i: int = 0; i < numSamples; i++ =>
+      var chosen: int = 0
+      for var j: int = 1; j < numClasses; j++ =>
+        if targets[i * numClasses + j] > targets[i * numClasses + chosen] =>
+          chosen = j
+      var p: double = allProbsFlat[i * numClasses + chosen]
+      if p < 0.000000002 =>
+        p = 0.000000002
+      extras.push(log(p))
+    self.oldLogProbsHost = extras
+
+  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
+    var initOldLogProbs: double[] = {}
+    for var i: int = 0; i < batchSize; i++ =>
+      initOldLogProbs.push(0.0)
+    self.oldLogProbsInput = session.inputData(initOldLogProbs, batchSize, 1)
+    return sn_tensor_ppo_clipped_loss(
+      logits, self.oldLogProbsInput, targetsT, weightsT,
+      self.epsilon, self.entropyCoeff)
+
+  fn runEpoch(ctx: EpochContext): double =>
+    return sn_graph_train_epoch_ppo(
+      ctx.loss, ctx.features, ctx.labels, ctx.weights,
+      self.oldLogProbsInput,
+      ctx.featuresHost, ctx.targetsHost, ctx.weightsHost,
+      self.oldLogProbsHost,
+      ctx.adjHost, ctx.realNodeCountHost, ctx.perm,
+      ctx.featureDim, ctx.labelsPerSample, ctx.batchSize, ctx.maxNodes,
+      ctx.optimizer.kind, ctx.optimizer.learningRate,
+      ctx.optimizer.beta1, ctx.optimizer.beta2, ctx.optimizer.eps,
+      ctx.optimizer.weightDecay)
