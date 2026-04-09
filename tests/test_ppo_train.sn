@@ -137,9 +137,10 @@ fn main(): void =>
   var advantages: double[] = buildAdvantages()
   var epsilon: double = 0.2
   # epochs = 4, batchSize = 3
-  var result: TrainResult = model.trainPpo(
-    graphs, actions, advantages, opt,
-    4, 3, epsilon, 0.0, 42l)
+  var _cfg0: TrainConfig = TrainConfig.create(4, 3, 42l)
+  var _strat0: PpoClipped = PpoClipped.create(epsilon, 0.0)
+  var _trainer0: Trainer < Gnn, PpoClipped, OptimizerParams > = Trainer < Gnn, PpoClipped, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var result: TrainResult = _trainer0.run(graphs, actions, advantages)
 
   println($"  final loss = {result.loss}")
   println($"  accuracy   = {result.accuracy}")

@@ -175,8 +175,10 @@ fn trainCrusher(seed: long): Gnn =>
   var labels: double[] = buildAllLabels()
   var weights: double[] = buildUnitWeights(len(graphs))
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
-  var result: TrainResult = model.train(
-    graphs, labels, weights, opt, 200, 5, 0.0, 42l)
+  var _cfg0: TrainConfig = TrainConfig.create(200, 5, 42l)
+  var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var result: TrainResult = _trainer0.run(graphs, labels, weights)
   println($"  seed={seed} final loss={result.loss} accuracy={result.accuracy}")
   return model
 

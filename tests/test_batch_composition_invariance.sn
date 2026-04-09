@@ -17,7 +17,7 @@ import "../src/gnn"
 #
 # Formally, for any model M and any set of graphs G_1..G_K:
 #
-# M.forward(G_i)  ==  M.forward(batchGraphs([G_1..G_K]))[i]
+# M.forward(G_i)  ==  M.forward(GraphTensors.batch([G_1..G_K]))[i]
 #
 # up to float32 precision, for every i. This catches the entire
 # category of bugs that heterogeneous batching introduces:
@@ -37,7 +37,7 @@ import "../src/gnn"
 #
 # Part A â€” Batch composition invariance
 # Compute per-graph probs via three solo forward() calls.
-# Compute the same probs via a single forward(batchGraphs(...))
+# Compute the same probs via a single forward(GraphTensors.batch(...))
 # call. Assert row-by-row equivalence to 1e-5.
 #
 # Part B â€” Permutation invariance
@@ -227,7 +227,7 @@ fn partA(model: Gnn, label: str): void =>
 
   # Batched forward. Fresh graph builders so edge indices aren't
   # mutated by any internal copy.
-  var merged: GraphTensors = batchGraphs({buildG1(), buildG2(), buildG3()})
+  var merged: GraphTensors = GraphTensors.batch({buildG1(), buildG2(), buildG3()})
   var batchedFlat: double[] = model.forward(merged, false).probs.toDoubles()
 
   assertEqualInt(len(batchedFlat), 3 * numActions,
@@ -271,7 +271,7 @@ fn partB(model: Gnn): void =>
   var solo3: double[] = model.forward(buildG3(), false).probs.toDoubles()
 
   # Merged in swapped order: [G3, G1, G2].
-  var merged: GraphTensors = batchGraphs({buildG3(), buildG1(), buildG2()})
+  var merged: GraphTensors = GraphTensors.batch({buildG3(), buildG1(), buildG2()})
   var batchedFlat: double[] = model.forward(merged, false).probs.toDoubles()
 
   assertEqualInt(len(batchedFlat), 3 * numActions,
@@ -310,15 +310,16 @@ fn partC(): void =>
   # pad-to-max / per-batch-upload path; we don't care about
   # convergence, only that the model reaches a non-trivial state.
   var labels: double[] = {
-    1.0, 0.0, 0.0, # G1 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 0
-    0.0, 1.0, 0.0, # G2 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 1
-    0.0, 0.0, 1.0 # G3 ï ¿ ½ ï ¿ ½ ï ¿ ½ action 2
+    1.0, 0.0, 0.0, # G1 ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ action 0
+    0.0, 1.0, 0.0, # G2 ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ action 1
+    0.0, 0.0, 1.0 # G3 ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ ï ¿ ½ action 2
   }
   var weights: double[] = {1.0, 1.0, 1.0}
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
-  var result: TrainResult = model.train(
-    {buildG1(), buildG2(), buildG3()},
-    labels, weights, opt, 30, 3, 0.0, 42l)
+  var _cfg0: TrainConfig = TrainConfig.create(30, 3, 42l)
+  var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var result: TrainResult = _trainer0.run({buildG1(), buildG2(), buildG3()}, labels, weights)
   println($"  trained: loss={result.loss} accuracy={result.accuracy}")
 
   # The trained model must still show batch composition invariance.

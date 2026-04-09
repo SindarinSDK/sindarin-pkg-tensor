@@ -2,7 +2,7 @@ import "sindarin-pkg-test/src/assert"
 import "../src/tensor"
 
 # ===========================================================================
-# test_batch_graphs.sn — unit test for batchGraphs() in src/tensor.sn
+# test_batch_graphs.sn — unit test for GraphTensors.batch() in src/tensor.sn
 #
 # Verifies that the per-graph offset arithmetic, the row-major feature
 # concat, and the batchIndex construction all produce the expected output
@@ -64,7 +64,7 @@ fn case1(): void =>
   gb.edgeWeight = Tensor.fromDoubles({2.5}, 1, 1)
 
   var graphs: GraphTensors[] = {ga, gb}
-  var batched: GraphTensors = batchGraphs(graphs)
+  var batched: GraphTensors = GraphTensors.batch(graphs)
 
   assertEqualInt(batched.numNodes, 2, "case1 numNodes")
   assertEqualInt(batched.numEdges, 2, "case1 numEdges")
@@ -121,7 +121,7 @@ fn case2(): void =>
   )
 
   var graphs: GraphTensors[] = {ga, gb}
-  var batched: GraphTensors = batchGraphs(graphs)
+  var batched: GraphTensors = GraphTensors.batch(graphs)
 
   assertEqualInt(batched.numNodes, 5, "case2 numNodes")
   assertEqualInt(batched.numEdges, 3, "case2 numEdges")
@@ -192,7 +192,7 @@ fn case3(): void =>
   )
 
   var graphs: GraphTensors[] = {ga, gb, gc}
-  var batched: GraphTensors = batchGraphs(graphs)
+  var batched: GraphTensors = GraphTensors.batch(graphs)
 
   assertEqualInt(batched.numNodes, 6, "case3 numNodes")
   assertEqualInt(batched.numEdges, 6, "case3 numEdges")

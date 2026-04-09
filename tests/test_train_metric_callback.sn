@@ -154,8 +154,10 @@ fn main(): void =>
   var weights: double[] = buildWeights(len(graphs))
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var epochs: int = 5
-  var result: TrainResult = model.train(
-    graphs, labels, weights, opt, epochs, 3, 0.0, 42l)
+  var _cfg0: TrainConfig = TrainConfig.create(epochs, 3, 42l)
+  var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var result: TrainResult = _trainer0.run(graphs, labels, weights)
   var nParams: int = len(model.parameters())
 
   println($"  captured {len(nameBuf)} metric emissions across {epochs} epochs")
@@ -264,8 +266,10 @@ fn main(): void =>
   sn_graph_clear_train_metric_callback()
 
   var model2: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
-  var result2: TrainResult = model2.train(
-    graphs, labels, weights, opt, 3, 3, 0.0, 42l)
+  var _cfg1: TrainConfig = TrainConfig.create(3, 3, 42l)
+  var _strat1: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer1: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model2, config: _cfg1, optimizer: opt, strategy: _strat1}
+  var result2: TrainResult = _trainer1.run(graphs, labels, weights)
   # result2 is used just to avoid dead-code warnings if any — we care
   # that no buffer growth occurred.
   println($"  after clear: bufLen={len(nameBuf)} (was {bufLenBefore}), result2.loss={result2.loss}")
@@ -280,8 +284,10 @@ fn main(): void =>
   sn_graph_set_train_metric_callback(resumeCb)
 
   var model3: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
-  var r3: TrainResult = model3.train(
-    graphs, labels, weights, opt, 2, 3, 0.0, 42l)
+  var _cfg2: TrainConfig = TrainConfig.create(2, 3, 42l)
+  var _strat2: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer2: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model3, config: _cfg2, optimizer: opt, strategy: _strat2}
+  var r3: TrainResult = _trainer2.run(graphs, labels, weights)
   println($"  after re-register: resumeNames has {len(resumeNames)} entries, r3.loss={r3.loss}")
 
   assertEqualInt(countMatches(resumeNames, "train_loss"), 2,

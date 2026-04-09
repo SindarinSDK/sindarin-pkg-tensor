@@ -2,17 +2,23 @@
 # sindarin-pkg-tensor/src/tensor.sn — facade
 # ==============================================================================
 #
-# Re-exports the pieces that used to live in a single giant tensor.sn file.
-# The refactor split them along domain boundaries:
+# Re-exports the pieces split out of the original monolithic tensor.sn.
+# Consumers write `import "sindarin-pkg-tensor/src/tensor"` and receive
+# every public type/function transitively:
 #
 # ./tensor/panic     — panic(msg) helper
-# ./tensor/core      — Tensor struct + native declarations + @source pragmas
-# + Optimizer + TrainResult + distributionDivergence
-# ./tensor/graph     — GraphTensors (as ref) + Validator + batch()
-#
-# Consumers keep writing `import "sindarin-pkg-tensor/src/tensor"` and get
-# every public type/function as before. This facade file owns the package
-# entry point so future additions land in one well-known place.
+# ./tensor/core      — Tensor struct + native fn declarations +
+# @link/@source pragmas + distributionDivergence
+# ./tensor/graph     — GraphTensors + GraphTensors.create validating
+# factory + GraphTensors.batch(list)
+# ./tensor/pool      — TensorPool.scope / checkpoint / restore / reset
+# ./tensor/record    — RecordSession.open / input / inputData / param
+# / computeLoss / dispose (graph recording mode)
+# ./tensor/metrics   — MetricEmitter.set / clear / emit (training
+# metric callback singleton)
+# ./tensor/params    — ParameterSet.create / save / load / get
+# ./tensor/optim     — Optimizer interface, OptimizerParams plain
+# data, AdamW + Sgd concrete strategies
 #
 # Usage example:
 # import "sindarin-pkg-tensor/src/tensor"
@@ -23,7 +29,8 @@
 # var data: double[] = c.toDoubles()
 #
 # GPU acceleration via ggml backend (auto-selects best available device).
-# Training via ggml-opt (AdamW, SGD with backpropagation).
+# Training via Trainer<M, S, O> in src/gnn/trainer.sn (reached through
+# src/gnn.sn's facade).
 # ==============================================================================
 
 import "./tensor/panic"
@@ -34,12 +41,3 @@ import "./tensor/record"
 import "./tensor/metrics"
 import "./tensor/params"
 import "./tensor/optim"
-
-# ---------------------------------------------------------------------------
-# `batchGraphs(list)` is kept as a thin alias for `GraphTensors.batch(list)`
-# so the pre-refactor tests still link. Step 10 of the refactor rewrites
-# every test to use the static form directly and this alias will be
-# removed at that point.
-# ---------------------------------------------------------------------------
-fn batchGraphs(graphs: GraphTensors[]): GraphTensors =>
-  return GraphTensors.batch(graphs)

@@ -106,7 +106,10 @@ fn trainModel(model: Gnn, epochs: int, trainSeed: long): TrainResult =>
   var labels: double[] = buildLabels()
   var weights: double[] = buildUnitWeights(len(graphs))
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
-  return model.train(graphs, labels, weights, opt, epochs, 3, 0.0, trainSeed)
+  var _cfg0: TrainConfig = TrainConfig.create(epochs, 3, trainSeed)
+  var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  return _trainer0.run(graphs, labels, weights)
 
 # Predict every training graph via predictBatch; return a per-sample
 # flat double[][] of probs.

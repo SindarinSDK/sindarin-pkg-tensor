@@ -154,9 +154,10 @@ fn main(): void =>
 
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   println("  training 200 epochs, batch=2...")
-  var result: TrainResult = model.train(
-    trainingGraphs, labels, trainWeights,
-    opt, 200, 2, 0.0, 42l)
+  var _cfg0: TrainConfig = TrainConfig.create(200, 2, 42l)
+  var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var result: TrainResult = _trainer0.run(trainingGraphs, labels, trainWeights)
   println($"  train done loss={result.loss} accuracy={result.accuracy}")
   println("")
 
