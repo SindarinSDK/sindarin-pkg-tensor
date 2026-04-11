@@ -1,0 +1,183 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_ppo_value_head_train.sn — Phase 4.2+4.4 end-to-end VF loss training
+#
+# Drives Trainer.run with PpoClipped at valueCoeff=0.5 against a Gnn that
+# has the optional value head enabled (Gnn.enableValueHead(seed)). Three
+# properties must all hold for the integration to be useful:
+#
+# 1. BOUNDEDNESS under VF loss.
+# The policy loss stays finite across every epoch AND the VF loss
+# (computed post-hoc by Trainer and returned as TrainResult.
+# valueLossCurve) stays finite. Adding the VF term should not break
+# the boundedness guarantee of the policy surrogate.
+#
+# 2. VALUE HEAD LEARNS.
+# valueLossCurve[last] < valueLossCurve[0] * 0.9 — the critic must
+# make measurable progress toward fitting the (synthetic) returns
+# over a short training run. If the VF gradient isn't flowing the
+# curve stays flat.
+#
+# 3. POLICY STILL MOVES.
+# At least one non-value-head parameter has nontrivial max-abs-delta
+# after training. Guards against a regression where adding the VF
+# term suppresses the policy gradient (e.g. via gradient explosion
+# that grad-clip then wipes out, or a sign flip in the combined
+# loss that backs out the policy improvement).
+#
+# Setup is a deliberately simple 2-state, 2-action toy with reproducible
+# actions and hand-constructed advantages & returns via computeGae, so
+# the target for the value head is grounded in real PPO semantics
+# (returns = GAE advantage + V_old) rather than arbitrary targets.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Graph helpers
+# ---------------------------------------------------------------------------
+
+fn sn2(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 2),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 2
+  }
+
+fn makeModel(): Gnn =>
+  var config: GnnConfig = {
+    inputDim: 2, hiddenDim: 8, numActions: 2,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+  var m: Gnn = Gnn.createWithSeed(config, 42l)
+  # Enable the value head BEFORE constructing the Trainer. Primitive-
+  # field mutations on a Gnn passed through Trainer<M>'s generic do
+  # not propagate back to the caller (compiler-problems.36.md), so
+  # anything the trainer needs to observe — obs norm, value head —
+  # has to be installed on the concrete type up front.
+  m.enableValueHead(42l)
+  return m
+
+# 6 training graphs — same shape as test_ppo_train.sn but with explicit
+# advantages that computeGae can turn into a reasonable returns signal.
+fn buildGraphs(): GraphTensors[] =>
+  var graphs: GraphTensors[] = {}
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  graphs.push(sn2({1.0, 0.0}))
+  graphs.push(sn2({0.0, 1.0}))
+  return graphs
+
+fn buildActions(): double[] =>
+  var a: double[] = {}
+  a.push(1.0); a.push(0.0)
+  a.push(1.0); a.push(0.0)
+  a.push(0.0); a.push(1.0)
+  a.push(0.0); a.push(1.0)
+  a.push(0.0); a.push(1.0)
+  a.push(1.0); a.push(0.0)
+  return a
+
+fn main(): void =>
+  println("=== test_ppo_value_head_train ===")
+
+  var probeA: GraphTensors = sn2({1.0, 0.0})
+  var probeB: GraphTensors = sn2({0.0, 1.0})
+
+  var model: Gnn = makeModel()
+  assertTrue(model.valueHeadEnabled, "model starts with value head enabled")
+
+  var preA: double[] = model.forward(probeA, false).probs.toDoubles()
+  var preB: double[] = model.forward(probeB, false).probs.toDoubles()
+
+  # --- Synthetic rollout: 6 steps, reward +1 for "good" actions and
+  # -1 for "bad" ones, value estimates all zero initially, no dones
+  # mid-episode, natural terminal at the end. Feed through computeGae
+  # to get advantages + returns; the VF head will regress against
+  # `returns`.
+  var rewards: double[] = {1.0, 1.0, 1.0, 1.0, -1.0, -1.0}
+  var values0: double[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+  var dones0: double[] = {0.0, 0.0, 0.0, 0.0, 0.0, 1.0}
+  var gae: GaeResult = computeGae(rewards, values0, dones0, 0.0, 0.99, 0.95)
+
+  var advantages: double[] = gae.advantages
+
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var actions: double[] = buildActions()
+  var graphs: GraphTensors[] = buildGraphs()
+
+  var cfg: TrainConfig = TrainConfig.create(6, 3, 42l)
+  # valueCoeff=0.5 (standard PPO default), vfClipRange=0.0 (OFF —
+  # Andrychowicz 2021 / Engstrom 2020 — the package default).
+  var strat: PpoClipped = PpoClipped.create(0.2, 0.0, 0.5, 0.0)
+  var trainer: Trainer < Gnn, PpoClipped, OptimizerParams > = Trainer < Gnn, PpoClipped, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var result: TrainResult = trainer.run(graphs, actions, advantages)
+
+  println($"  final policy loss = {result.loss}")
+  println($"  accuracy          = {result.accuracy}")
+  println($"  epochs            = {result.epochs}")
+
+  # -------------------------------------------------------------------------
+  # Assertion 1: boundedness of both policy loss and VF loss
+  # -------------------------------------------------------------------------
+  assertTrue(isFinite(result.loss),
+    $"final loss = {result.loss} is finite under VF extension")
+  var lc: int = len(result.lossCurve)
+  assertEqualInt(lc, 6, "policy loss curve length == epochs")
+  for var i: int = 0; i < lc; i++ =>
+    var v: double = result.lossCurve[i]
+    assertTrue(isFinite(v), $"epoch {i}: policy loss {v} is finite")
+
+  var vlc: int = len(result.valueLossCurve)
+  assertEqualInt(vlc, 6, "valueLossCurve populated — one entry per epoch")
+  for var i: int = 0; i < vlc; i++ =>
+    var vv: double = result.valueLossCurve[i]
+    assertTrue(isFinite(vv), $"epoch {i}: value loss {vv} is finite")
+    println($"    epoch {i}: policy={result.lossCurve[i]}, VF={vv}")
+
+  # -------------------------------------------------------------------------
+  # Assertion 2: value head actually learned (VF loss decreased)
+  # -------------------------------------------------------------------------
+  var vfFirst: double = result.valueLossCurve[0]
+  var vfLast: double = result.valueLossCurve[vlc - 1]
+  println($"  VF loss: first={vfFirst}, last={vfLast}")
+  # Loose improvement threshold — the initial VF loss depends on the
+  # small-scale-init-std=1.0 on valueHeadW2 and the synthetic returns
+  # magnitude; we only want to confirm a monotonic downward trend.
+  assertTrue(vfLast < vfFirst * 0.9,
+    $"VF loss decreased by >10% over training ({vfFirst} -> {vfLast})")
+
+  # -------------------------------------------------------------------------
+  # Assertion 3: policy parameters still move under the combined loss
+  # -------------------------------------------------------------------------
+  var nParams: int = len(result.paramMaxAbsDelta)
+  var maxMove: double = 0.0
+  for var i: int = 0; i < nParams; i++ =>
+    if result.paramMaxAbsDelta[i] > maxMove =>
+      maxMove = result.paramMaxAbsDelta[i]
+  println($"  max param delta = {maxMove}")
+  assertTrue(maxMove > 0.00001,
+    $"at least one parameter moved by >1e-5 under combined policy+VF loss ({maxMove})")
+
+  # -------------------------------------------------------------------------
+  # Assertion 4: post-train probe probabilities still reflect learning
+  # -------------------------------------------------------------------------
+  var postA: double[] = model.forward(probeA, false).probs.toDoubles()
+  var postB: double[] = model.forward(probeB, false).probs.toDoubles()
+  var jsdA: double = distributionDivergence(preA, postA, "js")
+  var jsdB: double = distributionDivergence(preB, postB, "js")
+  println($"  JSD(preA, postA) = {jsdA}")
+  println($"  JSD(preB, postB) = {jsdB}")
+  assertTrue(jsdA + jsdB > 0.001,
+    $"policy distribution moved on at least one probe state (total JSD = {jsdA + jsdB})")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

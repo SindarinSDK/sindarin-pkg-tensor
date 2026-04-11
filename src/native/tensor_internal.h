@@ -68,7 +68,12 @@ void ensure_backend(void);
  * tracks its input tensors with track_input() so their host data is
  * uploaded by run_graph(), then calls run_graph() which returns an
  * allocator the caller must free after reading outputs. */
-#define GRAPH_CTX_SIZE (32 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
+/* The largest direct-mode loss graph is sn_tensor_ppo_clipped_loss with the
+ * Phase 4 VF extension: ~26 tensor nodes when VF clipping is active (policy
+ * surrogate, entropy bonus, VF unclipped branch, and the clipped-max branch
+ * with its two relu hinges). 48 tensors gives headroom for small op-count
+ * growth without bumping the constant again. */
+#define GRAPH_CTX_SIZE (48 * ggml_tensor_overhead() + ggml_graph_overhead() + 4096)
 #define MAX_INPUTS 8
 
 struct ggml_context *micro_ctx_init(void);
@@ -126,6 +131,14 @@ extern struct ggml_tensor   *g_opt_features_tensor;
 extern struct ggml_tensor   *g_opt_labels_tensor;
 extern struct ggml_tensor   *g_opt_weights_tensor;
 extern struct ggml_tensor   *g_opt_old_log_probs_tensor;
+/* Phase 4: per-batch input tensors for the VF loss path. Both are
+ * always non-NULL when sn_graph_train_epoch_ppo is the active entry
+ * point (the strategy allocates (1,1) placeholders when valueCoeff=0)
+ * and always NULL when sn_graph_train_epoch (weighted CE) is active.
+ * The per-batch upload loop gates on `g_opt_value_targets_tensor !=
+ * NULL` the same way the old-log-probs upload does. */
+extern struct ggml_tensor   *g_opt_value_targets_tensor;
+extern struct ggml_tensor   *g_opt_old_values_tensor;
 
 extern struct ggml_opt_optimizer_params g_opt_params;
 struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata);

@@ -30,6 +30,13 @@ import "../src/tensor"
 fn currentLogPiClass0(): double =>
   return - 0.12692801
 
+# Phase 4: placeholder (1,1) zero tensors for the VF-loss inputs. With
+# valueCoeff=0 and vfClipRange=0 the loss op's record-mode branch
+# never calls rec_tensor() on these and the VF subgraph is skipped
+# entirely, so any valid tensor handle with shape (1,1) works.
+fn vhPlaceholder(): Tensor =>
+  return sn_graph_input_data({0.0}, 1, 1)
+
 # ---------------------------------------------------------------------------
 # Case 1 — recorded mode: ratio = 1, A > 0
 # ---------------------------------------------------------------------------
@@ -43,7 +50,9 @@ fn case1(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -64,7 +73,9 @@ fn case2(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -85,7 +96,9 @@ fn case3(): void =>
   var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -106,7 +119,9 @@ fn case4(): void =>
   var advantages: Tensor = sn_graph_input_data({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()
@@ -130,7 +145,9 @@ fn case5(): void =>
   var advantages: Tensor = sn_graph_input_data({1.0, -1.0}, 2, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossValue: double = sn_graph_compute_loss(loss)
 
   sn_graph_end()

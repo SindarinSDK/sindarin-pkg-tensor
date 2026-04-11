@@ -236,23 +236,82 @@ RtTensor *sn_tensor_weighted_cross_entropy(RtTensor *logits_rt,
  * docs/issues/ppo-clipped-objective.md § "Why the current setup is wrong".
  * =========================================================================== */
 
+/* Phase 4 — Value-function loss extension.
+ *
+ * The Phase 4.2 extension folds the PPO value-function term into this
+ * same loss op rather than adding a second native entry point. The
+ * rationale: the critic shares the upstream trunk with the actor
+ * (same message-passing layers, same mean-pool embedding), so the
+ * backward over the recorded graph wants a single scalar loss that
+ * backprops through both heads. Splitting the policy and value loss
+ * into two ops and adding their scalars at the Sindarin level would
+ * force the trainer to stitch two backward passes over the same
+ * recorded graph — ggml_opt only understands one loss tensor.
+ *
+ * The VF contribution is gated on value_coeff > 0.0: when the caller
+ * passes valueCoeff=0 the VF sub-graph is not built and the policy-
+ * only behaviour is bit-identical to pre-Phase-4. Callers that don't
+ * want VF loss pass (1, 1) zero placeholder tensors for
+ * value_estimates / value_targets / old_values; the placeholders
+ * pass the unwrap() checks and the gate skips the rest.
+ *
+ * VF clipping follows the PPO2 form used by SB3 / CleanRL:
+ *     V_clip = old_values + clamp(V_theta - old_values, -eps_v, +eps_v)
+ *     L_VF_CLIP = max((V_theta - V_target)^2, (V_clip - V_target)^2)
+ * i.e. the value loss uses the element-wise maximum of the unclipped
+ * squared error and a squared error against a version of V_theta
+ * rewound to within ±eps_v of the pre-update value. This is the
+ * pessimistic form — if V has moved "in the direction the gradient
+ * wants", the clipped path keeps the loss as large as the unclipped
+ * one; if V has moved "past" the clip window, the clip freezes the
+ * effective prediction and the squared error plateaus.
+ *
+ * NOTE on the VF clipping default: Engstrom et al. 2020 ("Implementation
+ * Matters") found no benefit from VF clipping on their benchmarks, and
+ * Andrychowicz et al. 2021 ("What Matters in On-Policy RL") reports
+ * that it often *hurts* performance. SB3 defaults clip_range_vf to
+ * None (off) for this reason; this package ships the same default —
+ * PpoClipped.create passes vfClipRange=0.0 by default, which takes
+ * the unclipped branch below. The code path is here for parity with
+ * PPO2 / CleanRL and for consumers that want to reproduce those
+ * defaults explicitly.
+ */
 RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
                                      RtTensor *old_log_probs_rt,
                                      RtTensor *actions_one_hot_rt,
                                      RtTensor *advantages_rt,
+                                     RtTensor *value_estimates_rt,
+                                     RtTensor *value_targets_rt,
+                                     RtTensor *old_values_rt,
                                      double    epsilon,
-                                     double    entropy_coeff)
+                                     double    entropy_coeff,
+                                     double    value_coeff,
+                                     double    vf_clip_range)
 {
     TPool *pl   = unwrap(logits_rt);
     TPool *polp = unwrap(old_log_probs_rt);
     TPool *poh  = unwrap(actions_one_hot_rt);
     TPool *padv = unwrap(advantages_rt);
+    /* Value-head tensors are always non-NULL — the caller passes (1,1)
+     * placeholders when valueCoeff==0.0. The gate below avoids reading
+     * from them in the loss graph, so the placeholder data is never
+     * observed. */
+    TPool *pve  = unwrap(value_estimates_rt);
+    TPool *pvt  = unwrap(value_targets_rt);
+    TPool *pov  = unwrap(old_values_rt);
+    (void)pve; (void)pvt; (void)pov;
 
     int64_t numClasses = pl->ne[0];
     int64_t batchRows  = pl->ne[1];
     const float inv_neg_n = -1.0f / (float)(batchRows > 0 ? batchRows : 1);
+    const float inv_n     =  1.0f / (float)(batchRows > 0 ? batchRows : 1);
     const float eps_hi = 1.0f + (float)epsilon;
     const float eps_lo = 1.0f - (float)epsilon;
+    const int   vf_enabled      = (value_coeff > 0.0);
+    const int   vf_clip_enabled = (vf_clip_range > 0.0);
+    const float vf_scale        = (float)(value_coeff * (double)inv_n);
+    const float vf_clip_hi      = (float)  vf_clip_range;
+    const float vf_clip_lo      = -(float) vf_clip_range;
     /* Entropy bonus: loss_total = loss_clipped - entropy_coeff * mean(H(p))
      * where H(p) = -Σ_classes p log p (per sample). To minimize loss_total
      * via gradient descent and INCREASE entropy, we add
@@ -315,12 +374,69 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
         struct ggml_tensor *plp_sum      = ggml_sum(ctx, p_log_p);
         struct ggml_tensor *entropy_term = ggml_scale(ctx, plp_sum, entropy_scale);
 
-        struct ggml_tensor *loss         = ggml_add(ctx, clipped_loss, entropy_term);
+        struct ggml_tensor *loss = ggml_add(ctx, clipped_loss, entropy_term);
+
+        /* Phase 4 VF loss term (gated on value_coeff > 0).
+         *
+         *   diff       = value_estimates - value_targets
+         *   L_unclip   = diff * diff                (elementwise)
+         *   if vf_clip_range > 0:
+         *     v_delta      = value_estimates - old_values
+         *     v_delta_clip = clamp(v_delta, -eps_v, +eps_v) via two relu hinges
+         *     V_clip       = old_values + v_delta_clip
+         *     diff_clip    = V_clip - value_targets
+         *     L_clipped    = diff_clip * diff_clip
+         *     L_VF         = max(L_unclip, L_clipped) via abs-trick
+         *   else:
+         *     L_VF         = L_unclip
+         *   loss_total    += value_coeff * mean(L_VF)
+         *
+         * The max of two tensors elementwise uses the same identity as
+         * the policy min: max(a, b) = 0.5 * (a + b + |a - b|).
+         */
+        if (vf_enabled) {
+            struct ggml_tensor *gve = rec_tensor(value_estimates_rt);
+            struct ggml_tensor *gvt = rec_tensor(value_targets_rt);
+
+            struct ggml_tensor *diff      = ggml_sub(ctx, gve, gvt);
+            struct ggml_tensor *l_unclip  = ggml_mul(ctx, diff, diff);
+
+            struct ggml_tensor *l_vf = l_unclip;
+            if (vf_clip_enabled) {
+                struct ggml_tensor *gov = rec_tensor(old_values_rt);
+
+                struct ggml_tensor *v_delta       = ggml_sub(ctx, gve, gov);
+                /* clamp(v_delta, vf_clip_lo, vf_clip_hi) via two relu hinges */
+                struct ggml_tensor *vd_minus_hi   = ggml_scale_bias(ctx, v_delta,    1.0f, -vf_clip_hi);
+                struct ggml_tensor *over_hi       = ggml_relu(ctx, vd_minus_hi);
+                struct ggml_tensor *vd_hi         = ggml_sub(ctx, v_delta, over_hi);
+                struct ggml_tensor *lo_minus_vd   = ggml_scale_bias(ctx, vd_hi,     -1.0f, vf_clip_lo);
+                struct ggml_tensor *under_lo      = ggml_relu(ctx, lo_minus_vd);
+                struct ggml_tensor *vd_clipped    = ggml_add(ctx, vd_hi, under_lo);
+
+                struct ggml_tensor *v_clip        = ggml_add(ctx, gov, vd_clipped);
+                struct ggml_tensor *diff_clip     = ggml_sub(ctx, v_clip, gvt);
+                struct ggml_tensor *l_clipped     = ggml_mul(ctx, diff_clip, diff_clip);
+
+                /* max(l_unclip, l_clipped) = 0.5 * (a + b + |a - b|) */
+                struct ggml_tensor *sum_sq        = ggml_add(ctx, l_unclip, l_clipped);
+                struct ggml_tensor *diff_sq       = ggml_sub(ctx, l_unclip, l_clipped);
+                struct ggml_tensor *abs_diff_sq   = ggml_abs(ctx, diff_sq);
+                struct ggml_tensor *max_two_x     = ggml_add(ctx, sum_sq, abs_diff_sq);
+                l_vf                              = ggml_scale(ctx, max_two_x, 0.5f);
+            }
+
+            struct ggml_tensor *vf_sum   = ggml_sum(ctx, l_vf);
+            struct ggml_tensor *vf_term  = ggml_scale(ctx, vf_sum, vf_scale);
+            loss                         = ggml_add(ctx, loss, vf_term);
+        }
+
         ggml_set_name(loss, "ppo_clipped_loss");
         return rec_wrap(loss, 1, 1);
     }
 
-    /* Direct mode: one-shot eval for test_ppo_clipped_loss.sn */
+    /* Direct mode: one-shot eval for test_ppo_clipped_loss.sn and for
+     * Phase 4.2 test_ppo_vf_loss_direct.sn. */
     struct ggml_context *ctx = micro_ctx_init();
 
     struct ggml_tensor *tl   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, numClasses, batchRows);
@@ -335,6 +451,25 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
     track_input(tolp, polp->data);
     track_input(toh,  poh->data);
     track_input(tadv, padv->data);
+
+    /* Phase 4 VF inputs — only constructed when enabled so the direct-
+     * mode policy-only tests keep seeing the pre-Phase-4 graph shape. */
+    struct ggml_tensor *tve = NULL;
+    struct ggml_tensor *tvt = NULL;
+    struct ggml_tensor *tov = NULL;
+    if (vf_enabled) {
+        tve = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, batchRows);
+        tvt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, batchRows);
+        ggml_set_input(tve);
+        ggml_set_input(tvt);
+        track_input(tve, pve->data);
+        track_input(tvt, pvt->data);
+        if (vf_clip_enabled) {
+            tov = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, batchRows);
+            ggml_set_input(tov);
+            track_input(tov, pov->data);
+        }
+    }
 
     struct ggml_tensor *softmax      = ggml_soft_max(ctx, tl);
     struct ggml_tensor *softmax_safe = ggml_scale_bias(ctx, softmax, 1.0f, LOG_SM_EPS);
@@ -368,7 +503,40 @@ RtTensor *sn_tensor_ppo_clipped_loss(RtTensor *logits_rt,
     struct ggml_tensor *plp_sum      = ggml_sum(ctx, p_log_p);
     struct ggml_tensor *entropy_term = ggml_scale(ctx, plp_sum, entropy_scale);
 
-    struct ggml_tensor *loss         = ggml_add(ctx, clipped_loss, entropy_term);
+    struct ggml_tensor *loss = ggml_add(ctx, clipped_loss, entropy_term);
+
+    /* Phase 4 VF loss term (direct-mode mirror of the record-mode branch
+     * above). See comments on that branch for the math derivation. */
+    if (vf_enabled) {
+        struct ggml_tensor *diff      = ggml_sub(ctx, tve, tvt);
+        struct ggml_tensor *l_unclip  = ggml_mul(ctx, diff, diff);
+
+        struct ggml_tensor *l_vf = l_unclip;
+        if (vf_clip_enabled) {
+            struct ggml_tensor *v_delta       = ggml_sub(ctx, tve, tov);
+            struct ggml_tensor *vd_minus_hi   = ggml_scale_bias(ctx, v_delta,    1.0f, -vf_clip_hi);
+            struct ggml_tensor *over_hi       = ggml_relu(ctx, vd_minus_hi);
+            struct ggml_tensor *vd_hi         = ggml_sub(ctx, v_delta, over_hi);
+            struct ggml_tensor *lo_minus_vd   = ggml_scale_bias(ctx, vd_hi,     -1.0f, vf_clip_lo);
+            struct ggml_tensor *under_lo      = ggml_relu(ctx, lo_minus_vd);
+            struct ggml_tensor *vd_clipped    = ggml_add(ctx, vd_hi, under_lo);
+
+            struct ggml_tensor *v_clip        = ggml_add(ctx, tov, vd_clipped);
+            struct ggml_tensor *diff_clip     = ggml_sub(ctx, v_clip, tvt);
+            struct ggml_tensor *l_clipped     = ggml_mul(ctx, diff_clip, diff_clip);
+
+            struct ggml_tensor *sum_sq        = ggml_add(ctx, l_unclip, l_clipped);
+            struct ggml_tensor *diff_sq       = ggml_sub(ctx, l_unclip, l_clipped);
+            struct ggml_tensor *abs_diff_sq   = ggml_abs(ctx, diff_sq);
+            struct ggml_tensor *max_two_x     = ggml_add(ctx, sum_sq, abs_diff_sq);
+            l_vf                              = ggml_scale(ctx, max_two_x, 0.5f);
+        }
+
+        struct ggml_tensor *vf_sum  = ggml_sum(ctx, l_vf);
+        struct ggml_tensor *vf_term = ggml_scale(ctx, vf_sum, vf_scale);
+        loss                        = ggml_add(ctx, loss, vf_term);
+    }
+
     ggml_set_output(loss);
 
     struct ggml_cgraph *graph = ggml_new_graph(ctx);

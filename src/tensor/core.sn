@@ -182,17 +182,42 @@ native fn sn_tensor_weighted_cross_entropy(logits: Tensor, labels: Tensor, weigh
 # the weighted-CE unboundedness documented in docs/issues/ppo-clipped-objective.md.
 #
 # Shapes (same convention as weighted_cross_entropy):
-# logits        : (numClasses, batchRows) — current policy π_θ logits
-# oldLogProbs   : (1,          batchRows) — log π_old(a_i|s_i), DETACHED
+# logits          : (numClasses, batchRows) — current policy π_θ logits
+# oldLogProbs     : (1,          batchRows) — log π_old(a_i|s_i), DETACHED
 # (caller computes with a
 # pre-train forward pass)
-# actionsOneHot : (numClasses, batchRows) — one-hot mask of chosen actions
-# advantages    : (1,          batchRows) — A_i (already normalized)
-# epsilon       : clip range (typically 0.2)
+# actionsOneHot   : (numClasses, batchRows) — one-hot mask of chosen actions
+# advantages      : (1,          batchRows) — A_i (already normalized)
+# valueEstimates  : (1,          batchRows) — V_θ(s) from current forward pass,
+# produced by Gnn.forward()'s
+# value head. Pass a (1,1) zero
+# placeholder when valueCoeff=0.
+# valueTargets    : (1,          batchRows) — V_target = A + V_old (returns),
+# from computeGae's `returns`
+# output. Placeholder when
+# valueCoeff=0.
+# oldValues       : (1,          batchRows) — V_old, frozen snapshot from the
+# pre-train forward pass. Only
+# read when vfClipRange > 0;
+# placeholder otherwise.
+# epsilon         : policy ratio clip range (typically 0.2)
+# entropyCoeff    : entropy bonus coefficient (0.0 disables; typically 0.01
+# for a mild exploration pressure)
+# valueCoeff      : VF loss coefficient c1 (0.0 disables VF entirely; typical
+# SB3/CleanRL default is 0.5)
+# vfClipRange     : VF clipping range ε_v (0.0 disables VF clipping; SB3
+# defaults to None for this reason — Engstrom 2020 and
+# Andrychowicz 2021 both report that VF clipping provides
+# no benefit and can hurt, but it is preserved here for
+# PPO2/CleanRL-compatible reproduction).
 # Returns a scalar loss tensor. Works in both direct and record modes; the
-# record-mode path is driven by Gnn.trainPpo() for multi-epoch RL training
-# on the same batch without the weighted-CE divergence pathology.
-native fn sn_tensor_ppo_clipped_loss(logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor, epsilon: double, entropyCoeff: double): Tensor
+# record-mode path is driven by the PpoClipped TrainStrategy for multi-epoch
+# RL training on the same batch without the weighted-CE divergence pathology.
+native fn sn_tensor_ppo_clipped_loss(
+  logits: Tensor, oldLogProbs: Tensor, actionsOneHot: Tensor, advantages: Tensor,
+  valueEstimates: Tensor, valueTargets: Tensor, oldValues: Tensor,
+  epsilon: double, entropyCoeff: double,
+  valueCoeff: double, vfClipRange: double): Tensor
 native fn sn_tensor_init_kaiming(t: Tensor): void
 native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
 native fn sn_tensor_init_small_scale(t: Tensor, std: double): void
@@ -292,8 +317,10 @@ native fn sn_graph_set_grad_clip_norm(v: double): void
 native fn sn_graph_train_epoch_ppo(
   loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
   oldLogProbs: Tensor,
+  valueTargets: Tensor, oldValues: Tensor,
   featuresHost: double[], labelsHost: double[], weightsHost: double[],
   oldLogProbsHost: double[],
+  valueTargetsHost: double[], oldValuesHost: double[],
   adjHost: double[], realNodeCountHost: double[],
   batchPerm: double[],
   featureDim: int, labelsPerSample: int, nPerBatch: int,

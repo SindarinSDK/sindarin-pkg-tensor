@@ -61,6 +61,17 @@ struct ggml_tensor   *g_opt_weights_tensor   = NULL;
  * begin/end cycle. See sn_tensor_ppo_clipped_loss in tensor_loss.sn.c and
  * docs/issues/ppo-clipped-objective.md. */
 struct ggml_tensor   *g_opt_old_log_probs_tensor = NULL;
+/* Phase 4: PPO VF-loss inputs — per-batch scalar-per-sample tensors
+ * holding V_target (== advantages + V_old, from computeGae's returns)
+ * and V_old (the frozen critic estimate snapshotted before training).
+ * Both are non-NULL whenever sn_graph_train_epoch_ppo is the active
+ * entry point, regardless of whether VF loss is actually enabled:
+ * the strategy passes (1,1) placeholder tensors when valueCoeff=0
+ * and the loss op gates the VF subgraph away, but the per-batch
+ * upload registry still tracks them so re-entering the driver with
+ * the same strategy doesn't trip the tensor-identity sanity check. */
+struct ggml_tensor   *g_opt_value_targets_tensor = NULL;
+struct ggml_tensor   *g_opt_old_values_tensor    = NULL;
 
 struct ggml_opt_optimizer_params g_opt_params;
 
@@ -123,14 +134,16 @@ void sn_graph_begin(void) {
     g_record_mode = true;
 
     /* Reset epoch-loop training state — fresh per begin/end cycle */
-    g_opt_ctx                  = NULL;
-    g_opt_sched                = NULL;
-    g_opt_param_buf            = NULL;
-    g_opt_loss_tensor          = NULL;
-    g_opt_features_tensor      = NULL;
-    g_opt_labels_tensor        = NULL;
-    g_opt_weights_tensor       = NULL;
-    g_opt_old_log_probs_tensor = NULL;
+    g_opt_ctx                    = NULL;
+    g_opt_sched                  = NULL;
+    g_opt_param_buf              = NULL;
+    g_opt_loss_tensor            = NULL;
+    g_opt_features_tensor        = NULL;
+    g_opt_labels_tensor          = NULL;
+    g_opt_weights_tensor         = NULL;
+    g_opt_old_log_probs_tensor   = NULL;
+    g_opt_value_targets_tensor   = NULL;
+    g_opt_old_values_tensor      = NULL;
 
     /* Reset per-batch upload registry — tensors get re-registered as the
      * record-mode forward pass walks the layers. */
@@ -171,11 +184,13 @@ void sn_graph_end(void) {
     if (g_opt_ctx)       { ggml_opt_free(g_opt_ctx);                  g_opt_ctx       = NULL; }
     if (g_opt_sched)     { ggml_backend_sched_free(g_opt_sched);      g_opt_sched     = NULL; }
     if (g_opt_param_buf) { ggml_backend_buffer_free(g_opt_param_buf); g_opt_param_buf = NULL; }
-    g_opt_loss_tensor          = NULL;
-    g_opt_features_tensor      = NULL;
-    g_opt_labels_tensor        = NULL;
-    g_opt_weights_tensor       = NULL;
-    g_opt_old_log_probs_tensor = NULL;
+    g_opt_loss_tensor            = NULL;
+    g_opt_features_tensor        = NULL;
+    g_opt_labels_tensor          = NULL;
+    g_opt_weights_tensor         = NULL;
+    g_opt_old_log_probs_tensor   = NULL;
+    g_opt_value_targets_tensor   = NULL;
+    g_opt_old_values_tensor      = NULL;
 
     if (g_compute_ctx) { ggml_free(g_compute_ctx); g_compute_ctx = NULL; }
     if (g_param_ctx)   { ggml_free(g_param_ctx);   g_param_ctx = NULL; }

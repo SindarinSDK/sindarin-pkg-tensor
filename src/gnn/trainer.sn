@@ -204,6 +204,25 @@ struct TrainResult =>
   # have lengths matching the completed epoch count, and the model's
   # final parameters are the state after the last completed epoch.
   stoppedEarly: bool
+  # Phase 4: per-epoch mean value-function loss, computed post-hoc in
+  # Sindarin by running model.forward on every training sample at the
+  # end of each epoch and taking mean((V_θ(s) - V_target)^2). Only
+  # populated when the model has a value head (valueHeadEnabled on
+  # the concrete model before construction); for non-value-head runs
+  # this is an empty array.
+  #
+  # Why post-hoc rather than reading the native loss term: the native
+  # PPO loss graph produces a single scalar that combines the
+  # policy, entropy, and VF terms — splitting them out would require
+  # plumbing a second readback through ggml_opt_eval. Re-running
+  # forward() at epoch-end is the same cost as the Phase 2 target-KL
+  # drift check already pays (when targetKl > 0), and it's only
+  # incurred when the caller actually enabled a value head, so
+  # existing tests don't see any extra work.
+  #
+  # Length matches the number of COMPLETED epochs (same semantics as
+  # lossCurve / klCurve under target-KL early stop).
+  valueLossCurve: double[]
 
 # ---------------------------------------------------------------------------
 # Trainer<M, S, O>
@@ -258,6 +277,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       var emptyD5: double[] = {}
       var emptyD6: double[] = {}
       var emptyD7: double[] = {}
+      var emptyD8: double[] = {}
       return TrainResult {
         loss: 0.0,
         accuracy: 0.0,
@@ -273,7 +293,8 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         inputStd: 0.0,
         lrCurve: emptyD6,
         klCurve: emptyD7,
-        stoppedEarly: false
+        stoppedEarly: false,
+        valueLossCurve: emptyD8
       }
 
     var totalSamples: int = len(graphs)
@@ -308,12 +329,35 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # model state at the *start* of this run — so the drift is
     # measured against where we started, not where the previous
     # epoch left off. This matches SB3's target_kl semantics.
+    # Phase 4: collect the pre-record value estimates in the same loop
+    # as the probs. For models without a value head, forward() returns
+    # the (1,1) zero placeholder so initialValuesFlat is zero-padded
+    # to one entry per sample — the PpoClipped strategy still produces
+    # a valueTargetsHost (== advantages + zeros == advantages) which
+    # the loss op ignores whenever valueCoeff=0. The cost of the
+    # extra .toDoubles() call is one per sample and is dominated by
+    # the existing probs readback.
     var initialProbsFlat: double[] = {}
+    var initialValuesFlat: double[] = {}
     for var i: int = 0; i < totalSamples; i++ =>
-      var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+      var out: GnnOutput = self.model.forward(graphs[i], false)
+      var probs: double[] = out.probs.toDoubles()
       for var j: int = 0; j < len(probs); j++ =>
         initialProbsFlat.push(probs[j])
-    self.strategy.prepare(initialProbsFlat, totalSamples, numClasses, targets)
+      var v: double[] = out.valueEstimate.toDoubles()
+      var vScalar: double = 0.0
+      if len(v) > 0 =>
+        vScalar = v[0]
+      initialValuesFlat.push(vScalar)
+    # VF targets must be computed from the RAW advantages, not the
+    # advantage-normalized form — otherwise V_target = (normalized adv)
+    # + V_old drifts away from the real GAE returns and the value head
+    # learns a miscalibrated scalar. Normalized advantages are only
+    # the right signal for the POLICY gradient term; the value head
+    # regresses against un-normalized returns.
+    self.strategy.prepare(
+      initialProbsFlat, initialValuesFlat,
+      totalSamples, numClasses, targets, weights)
 
     # --- Aggregation normalization mode: gat -> sum, gcn -> sum_normalized,
     # sage -> mean. All layers in one model share an architecture.
@@ -522,9 +566,15 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     var output = self.model.forward(inputGraph, true)
 
     # Strategy builds the loss. PpoClipped allocates its extra
-    # oldLogProbsInput tensor via session.inputData here and stashes
-    # it on self for runEpoch.
-    var loss: Tensor = self.strategy.buildLoss(session, output.logits, labelsInput, weightsInput, batchSize)
+    # oldLogProbsInput / valueTargetsInput / oldValuesInput tensors
+    # via session.inputData here and stashes them on self for
+    # runEpoch. The valueEstimates tensor from the forward pass is
+    # threaded through so PpoClipped can wire it into the VF loss
+    # term; for models without a value head it's the (1,1) zero
+    # placeholder and the loss op gates the VF term away.
+    var loss: Tensor = self.strategy.buildLoss(
+      session, output.logits, output.valueEstimate,
+      labelsInput, weightsInput, batchSize)
 
     # --- Epoch loop with deterministic across-batch shuffling. -------------
     var nBatches: int = totalSamples / batchSize
@@ -550,6 +600,11 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     var klCurve: double[] = {}
     var stoppedEarly: bool = false
     var epochsCompleted: int = 0
+    # Phase 4: value-loss curve, populated only when the model has a
+    # value head enabled. Each entry is the mean squared error over
+    # the full training set between current V_θ(s) and the
+    # value targets (advantages + V_old captured pre-training).
+    var valueLossCurve: double[] = {}
 
     # Capture the base LR before the epoch loop so the schedule can
     # compute effectiveLr(baseLr, epoch, totalEpochs) from a fixed
@@ -622,6 +677,36 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         gradNormCurve.push(gradThisEpoch)
 
         MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
+
+        # Phase 4: post-hoc value-loss computation. Skipped entirely
+        # when the model has no value head so existing tests pay zero
+        # cost. When enabled, this runs one forward pass per training
+        # sample in inference mode (same pattern as the Phase 2
+        # target-KL drift check just below — pause/checkpoint the
+        # record session, read valueEstimate, restore). The value
+        # target for sample i is the raw (pre-advantage-norm) weight
+        # plus the V_old captured before training started, i.e.
+        # valueTargetsHost[i] in strategy state. We recompute it here
+        # from the trainer's own `weights` + `initialValuesFlat`
+        # arrays so the trainer doesn't have to poke into the
+        # strategy's private fields.
+        if self.model.valueHeadEnabled =>
+          var cpVh: long = sn_tensor_pool_checkpoint()
+          var prevRecVh: bool = sn_graph_pause_recording()
+          var vSqSum: double = 0.0
+          for var i: int = 0; i < totalSamples; i++ =>
+            var vEst: double[] = self.model.forward(graphs[i], false).valueEstimate.toDoubles()
+            var vPred: double = 0.0
+            if len(vEst) > 0 =>
+              vPred = vEst[0]
+            var vTarget: double = weights[i] + initialValuesFlat[i]
+            var dd: double = vPred - vTarget
+            vSqSum = vSqSum + dd * dd
+          sn_graph_resume_recording(prevRecVh)
+          sn_tensor_pool_restore(cpVh)
+          var vMse: double = vSqSum / totalSamples.toDouble()
+          valueLossCurve.push(vMse)
+          MetricEmitter.emit("value_loss", vMse, epochLabels)
 
         epochsCompleted = epochsCompleted + 1
 
@@ -779,5 +864,6 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       inputStd: inputStd,
       lrCurve: lrCurve,
       klCurve: klCurve,
-      stoppedEarly: stoppedEarly
+      stoppedEarly: stoppedEarly,
+      valueLossCurve: valueLossCurve
     }

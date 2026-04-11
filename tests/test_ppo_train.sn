@@ -138,7 +138,11 @@ fn main(): void =>
   var epsilon: double = 0.2
   # epochs = 4, batchSize = 3
   var _cfg0: TrainConfig = TrainConfig.create(4, 3, 42l)
-  var _strat0: PpoClipped = PpoClipped.create(epsilon, 0.0)
+  # Phase 4: PpoClipped.create now takes valueCoeff and vfClipRange
+  # after entropyCoeff. This test runs policy-only (no value head on
+  # the model), so both VF args are 0.0 and the loss op gates the
+  # entire VF term away.
+  var _strat0: PpoClipped = PpoClipped.create(epsilon, 0.0, 0.0, 0.0)
   var _trainer0: Trainer < Gnn, PpoClipped, OptimizerParams > = Trainer < Gnn, PpoClipped, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
   var result: TrainResult = _trainer0.run(graphs, actions, advantages)
 

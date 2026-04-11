@@ -90,25 +90,45 @@ struct EpochContext =>
 
 interface TrainStrategy =>
   # Pre-record phase. Populate any strategy-owned host buffers from a
-  # non-record forward pass's output probabilities.
+  # non-record forward pass's output probabilities and value estimates.
   #
-  # allProbsFlat: (numSamples * numClasses) row-major probs for every
+  # allProbsFlat:  (numSamples * numClasses) row-major probs for every
   # training graph, computed by the caller via
   # model.forward(g, false).probs.toDoubles()
-  # numSamples:   total training samples (one row per sample)
-  # numClasses:   numClasses = model.config.numActions
-  # targets:      the caller-supplied targets array passed to Trainer.run —
+  # allValuesFlat: numSamples value estimates, computed by the caller
+  # via model.forward(g, false).valueEstimate.toDoubles().
+  # For models without a value head this array contains
+  # one zero per sample (the placeholder path); PPO
+  # ignores it when the value coefficient is zero.
+  # numSamples:    total training samples (one row per sample)
+  # numClasses:    numClasses = model.config.numActions
+  # targets:       the caller-supplied targets array passed to Trainer.run —
   # one-hot labels for supervised, one-hot actions for RL.
+  # weights:       the caller-supplied weights / advantages array. PPO
+  # uses this to derive valueTargets (= advantages + V_old)
+  # for the VF loss term; WeightedCrossEntropy ignores it.
   #
   # WeightedCrossEntropy ignores every argument. PpoClipped uses this to
-  # derive oldLogProbsHost.
-  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void
+  # derive oldLogProbsHost (and, when the value head is enabled on the
+  # caller's model, oldValuesHost + valueTargetsHost for the VF loss).
+  fn prepare(
+    allProbsFlat: double[], allValuesFlat: double[],
+    numSamples: int, numClasses: int,
+    targets: double[], weights: double[]): void
 
   # Record-mode loss construction. Called once while a RecordSession is
   # open, to allocate any extra per-batch input tensors the strategy
   # needs (stored in the strategy's own fields) and build the loss op
   # wired into the recorded training graph.
-  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor
+  #
+  # `valueEstimates` is the recorded-graph tensor handle for the forward
+  # pass's value-head output. When the underlying model has no value
+  # head, it is the placeholder (1,1) zero tensor that Gnn.forward
+  # returns and the strategy simply passes it through to the loss op,
+  # which ignores it whenever valueCoeff=0.
+  fn buildLoss(
+    session: RecordSession, logits: Tensor, valueEstimates: Tensor,
+    targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor
 
   # Per-epoch driver dispatch. Strategy picks the native entry point
   # that matches its loss shape and forwards the EpochContext fields
@@ -127,10 +147,15 @@ struct WeightedCrossEntropy =>
   static fn create(): WeightedCrossEntropy =>
     return WeightedCrossEntropy { _placeholder: true }
 
-  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void =>
+  fn prepare(
+    allProbsFlat: double[], allValuesFlat: double[],
+    numSamples: int, numClasses: int,
+    targets: double[], weights: double[]): void =>
     return
 
-  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
+  fn buildLoss(
+    session: RecordSession, logits: Tensor, valueEstimates: Tensor,
+    targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
     return sn_tensor_weighted_cross_entropy(logits, targetsT, weightsT)
 
   fn runEpoch(ctx: EpochContext): double =>
@@ -152,21 +177,69 @@ struct WeightedCrossEntropy =>
 struct PpoClipped =>
   epsilon: double
   entropyCoeff: double
+  # Phase 4: VF loss extension. `valueCoeff` is c1 — the scalar that
+  # the loss op multiplies the mean squared value error by before
+  # adding it to the policy term. `vfClipRange` is ε_v — the PPO2
+  # value clipping bound. Both default to the SB3 / CleanRL
+  # recommended values in create(): valueCoeff=0.5 for the VF loss
+  # weight (matching standard PPO), vfClipRange=0.0 (OFF) because
+  # Engstrom 2020 and Andrychowicz 2021 both report that VF
+  # clipping provides no benefit and can hurt. The bounded fallback
+  # path in sn_tensor_ppo_clipped_loss stays available for callers
+  # that want PPO2-faithful reproduction.
+  #
+  # When the caller's model has no value head enabled, the trainer
+  # still passes through all the VF machinery — placeholder input
+  # tensors for valueTargets/oldValues, zero-filled host buffers,
+  # and a (1,1) zero placeholder valueEstimates tensor from
+  # forward()'s non-critic path. The loss op's `value_coeff > 0`
+  # gate then collapses the entire VF subgraph to a no-op. This
+  # keeps the PpoClipped code path uniform (no branching on
+  # valueHeadEnabled) and means turning the value head on/off at
+  # the model level is the single control surface.
+  valueCoeff: double
+  vfClipRange: double
   # Filled by prepare() from pre-record forward probabilities.
   oldLogProbsHost: double[]
+  # Phase 4: filled by prepare() from pre-record forward value
+  # estimates. Length == numSamples. When the model has no value
+  # head, every entry is 0.0 (the placeholder forward path).
+  oldValuesHost: double[]
+  # Phase 4: filled by prepare() as valueTargets[i] = advantages[i]
+  # + oldValuesHost[i]. This is the `returns` that the VF loss
+  # regresses V_θ against. Also length == numSamples.
+  valueTargetsHost: double[]
   # Filled by buildLoss() with the record-mode input tensor allocated
   # inside the RecordSession. runEpoch() reads it during dispatch.
   oldLogProbsInput: Tensor
+  # Phase 4: per-batch input tensors for the VF loss path. Allocated
+  # in buildLoss() and read in runEpoch(). When the strategy is
+  # running in policy-only mode (valueCoeff=0 AND the model has no
+  # value head), these stay as (1,1) placeholders that the loss op
+  # gates away via `vf_enabled = value_coeff > 0`.
+  valueTargetsInput: Tensor
+  oldValuesInput: Tensor
 
-  static fn create(epsilon: double, entropyCoeff: double): PpoClipped =>
+  static fn create(
+    epsilon: double, entropyCoeff: double,
+    valueCoeff: double, vfClipRange: double): PpoClipped =>
     return PpoClipped {
       epsilon: epsilon,
       entropyCoeff: entropyCoeff,
+      valueCoeff: valueCoeff,
+      vfClipRange: vfClipRange,
       oldLogProbsHost: {},
-      oldLogProbsInput: Tensor.zeros(1, 1)
+      oldValuesHost: {},
+      valueTargetsHost: {},
+      oldLogProbsInput: Tensor.zeros(1, 1),
+      valueTargetsInput: Tensor.zeros(1, 1),
+      oldValuesInput: Tensor.zeros(1, 1)
     }
 
-  fn prepare(allProbsFlat: double[], numSamples: int, numClasses: int, targets: double[]): void =>
+  fn prepare(
+    allProbsFlat: double[], allValuesFlat: double[],
+    numSamples: int, numClasses: int,
+    targets: double[], weights: double[]): void =>
     # Snapshot log π_old(a_i|s_i) for every training sample. The chosen
     # action index comes from argmax over the one-hot row in `targets`;
     # picking the argmax (rather than break-on-first-match) is robust
@@ -186,21 +259,69 @@ struct PpoClipped =>
       extras.push(log(p))
     self.oldLogProbsHost = extras
 
-  fn buildLoss(session: RecordSession, logits: Tensor, targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
+    # Phase 4: snapshot V_old (frozen critic estimate) and derive
+    # valueTargets (= advantages + V_old = GAE returns). When the
+    # caller's model has no value head, allValuesFlat has one zero
+    # per sample and valueTargets degenerates to the advantage
+    # vector — harmless because the loss op gates the whole VF term
+    # on valueCoeff > 0.
+    #
+    # Length of `weights` is expected to match numSamples (the
+    # trainer's per-sample advantage array). If the caller passed
+    # uniform supervised weights the math is still well-defined but
+    # the VF term is a regression against a constant target, which
+    # PPO has no use for — that's why the gate is on valueCoeff.
+    var vOld: double[] = {}
+    var vTarget: double[] = {}
+    var haveWeights: bool = len(weights) == numSamples
+    for var i: int = 0; i < numSamples; i++ =>
+      var v: double = 0.0
+      if i < len(allValuesFlat) =>
+        v = allValuesFlat[i]
+      vOld.push(v)
+      var a: double = 0.0
+      if haveWeights =>
+        a = weights[i]
+      vTarget.push(a + v)
+    self.oldValuesHost = vOld
+    self.valueTargetsHost = vTarget
+
+  fn buildLoss(
+    session: RecordSession, logits: Tensor, valueEstimates: Tensor,
+    targetsT: Tensor, weightsT: Tensor, batchSize: int): Tensor =>
     var initOldLogProbs: double[] = {}
     for var i: int = 0; i < batchSize; i++ =>
       initOldLogProbs.push(0.0)
     self.oldLogProbsInput = session.inputData(initOldLogProbs, batchSize, 1)
+
+    # Phase 4: allocate two more per-batch input tensors for the VF
+    # loss path. Always allocated (even when valueCoeff==0) so that
+    # the recorded graph and the native driver's sanity-check slots
+    # have stable identities — switching VF on/off between epochs
+    # without rebuilding the graph would break g_opt_value_* tensor
+    # identity checks on the second sn_graph_train_epoch_ppo call.
+    var initVt: double[] = {}
+    var initOv: double[] = {}
+    for var i: int = 0; i < batchSize; i++ =>
+      initVt.push(0.0)
+      initOv.push(0.0)
+    self.valueTargetsInput = session.inputData(initVt, batchSize, 1)
+    self.oldValuesInput = session.inputData(initOv, batchSize, 1)
+
     return sn_tensor_ppo_clipped_loss(
       logits, self.oldLogProbsInput, targetsT, weightsT,
-      self.epsilon, self.entropyCoeff)
+      valueEstimates, self.valueTargetsInput, self.oldValuesInput,
+      self.epsilon, self.entropyCoeff,
+      self.valueCoeff, self.vfClipRange)
 
   fn runEpoch(ctx: EpochContext): double =>
     return sn_graph_train_epoch_ppo(
       ctx.loss, ctx.features, ctx.labels, ctx.weights,
       self.oldLogProbsInput,
+      self.valueTargetsInput, self.oldValuesInput,
       ctx.featuresHost, ctx.targetsHost, ctx.weightsHost,
       self.oldLogProbsHost,
+      self.valueTargetsHost, self.oldValuesHost,
       ctx.adjHost, ctx.realNodeCountHost, ctx.perm,
       ctx.featureDim, ctx.labelsPerSample, ctx.batchSize, ctx.maxNodes,
       ctx.optimizer.kind, ctx.optimizer.learningRate,

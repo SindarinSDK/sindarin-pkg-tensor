@@ -1,0 +1,151 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "../src/tensor"
+
+# ===========================================================================
+# test_ppo_vf_loss_direct.sn — Phase 4.2 direct-mode VF loss unit test
+#
+# The existing test_ppo_clipped_loss.sn pins the five policy-only branches
+# of sn_tensor_ppo_clipped_loss. This test covers the Phase 4 extension:
+# the folded value-function loss term, gated on valueCoeff > 0 with
+# optional VF clipping.
+#
+# All cases use the same base policy input from test_ppo_clipped_loss.sn
+# case 1 (ratio=1, A=+1, policy loss = -1.0), so the delta between cases
+# is strictly the VF contribution.
+#
+# Cases:
+#
+# A — valueCoeff = 0 (VF disabled)
+# Even with garbage VF inputs the loss equals the pre-Phase-4 policy
+# term. Guards the gate: callers that pass placeholder tensors get
+# bit-identical behaviour to the old policy-only path.
+#
+# B — valueCoeff = 0.5, vfClipRange = 0 (VF enabled, no clipping)
+# valueEstimates=[0.5], valueTargets=[1.5], oldValues ignored.
+# L_VF = (0.5 - 1.5)^2 = 1.0.
+# total = -1.0 + 0.5 * 1.0 = -0.5.
+#
+# C — valueCoeff = 0.5, vfClipRange = 0.2, clipped branch wins
+# valueEstimates=[1.2], valueTargets=[1.0], oldValues=[0.5].
+# V - V_old = 0.7 → clipped to +0.2 → V_clip = 0.7.
+# L_unclip  = (1.2 - 1.0)^2 = 0.04.
+# L_clipped = (0.7 - 1.0)^2 = 0.09.
+# L_VF = max(0.04, 0.09) = 0.09 ← clipped is the pessimistic path
+# (V moved toward V_target further than ε_v allows).
+# total = -1.0 + 0.5 * 0.09 = -0.955.
+#
+# D — valueCoeff = 0.5, vfClipRange = 0 (same numerics as C, no clipping)
+# L_VF = L_unclip = 0.04, total = -1.0 + 0.5 * 0.04 = -0.98.
+# Verifies that vfClipRange=0 takes the unclipped path even when V
+# has drifted past where clipping WOULD have fired.
+#
+# E — valueCoeff = 0.5, vfClipRange = 0.2, unclipped branch wins
+# valueEstimates=[3.0], valueTargets=[1.0], oldValues=[0.5].
+# V - V_old = 2.5 → clipped to +0.2 → V_clip = 0.7.
+# L_unclip  = (3.0 - 1.0)^2 = 4.0.
+# L_clipped = (0.7 - 1.0)^2 = 0.09.
+# L_VF = max(4.0, 0.09) = 4.0 ← unclipped wins. VF clipping cannot
+# rescue V from a catastrophic overshoot in a single pass.
+# total = -1.0 + 0.5 * 4.0 = +1.0.
+# ===========================================================================
+
+# Matches the `currentLogPiClass0` in test_ppo_clipped_loss.sn.
+fn currentLogPiClass0(): double =>
+  return - 0.12692801
+
+# Base policy inputs — all cases share these.
+fn baseLogits(): Tensor =>
+  return Tensor.fromDoubles({2.0, 0.0}, 1, 2)
+
+fn baseOldLogProbs(): Tensor =>
+  return Tensor.fromDoubles({currentLogPiClass0()}, 1, 1)
+
+fn baseActions(): Tensor =>
+  return Tensor.fromDoubles({1.0, 0.0}, 1, 2)
+
+fn baseAdvantages(): Tensor =>
+  return Tensor.fromDoubles({1.0}, 1, 1)
+
+fn main(): void =>
+  println("=== test_ppo_vf_loss_direct ===")
+
+  # -------------------------------------------------------------------------
+  # Case A: VF disabled, garbage VF inputs → pure policy loss
+  # -------------------------------------------------------------------------
+  println("--- Case A: valueCoeff=0 ignores all VF inputs ---")
+  var lossA: Tensor = sn_tensor_ppo_clipped_loss(
+    baseLogits(), baseOldLogProbs(), baseActions(), baseAdvantages(),
+    Tensor.fromDoubles({99.0}, 1, 1),
+    Tensor.fromDoubles({-7.0}, 1, 1),
+    Tensor.fromDoubles({42.0}, 1, 1),
+    0.2, 0.0, 0.0, 0.0)
+  var dataA: double[] = lossA.toDoubles()
+  assertApproxDouble(dataA[0], -1.0, 0.001,
+    "A: valueCoeff=0 leaves loss at pure policy term (-1.0) regardless of VF inputs")
+
+  # -------------------------------------------------------------------------
+  # Case B: VF enabled, no clipping, simple squared error
+  # -------------------------------------------------------------------------
+  println("--- Case B: valueCoeff=0.5, no clipping, L_VF=1.0 ---")
+  var lossB: Tensor = sn_tensor_ppo_clipped_loss(
+    baseLogits(), baseOldLogProbs(), baseActions(), baseAdvantages(),
+    Tensor.fromDoubles({0.5}, 1, 1), # valueEstimates
+    Tensor.fromDoubles({1.5}, 1, 1), # valueTargets
+    Tensor.fromDoubles({0.0}, 1, 1), # oldValues(ignored with vfClipRange = 0)
+    0.2, 0.0, 0.5, 0.0)
+  var dataB: double[] = lossB.toDoubles()
+  assertApproxDouble(dataB[0], -0.5, 0.001,
+    "B: policy(-1) + 0.5 * (0.5-1.5)^2 = -0.5")
+
+  # -------------------------------------------------------------------------
+  # Case C: VF clipping ACTIVE, clipped branch wins (pessimistic max)
+  # -------------------------------------------------------------------------
+  println("--- Case C: vfClipRange=0.2, clipped branch wins (max) ---")
+  var lossC: Tensor = sn_tensor_ppo_clipped_loss(
+    baseLogits(), baseOldLogProbs(), baseActions(), baseAdvantages(),
+    Tensor.fromDoubles({1.2}, 1, 1), # valueEstimates
+    Tensor.fromDoubles({1.0}, 1, 1), # valueTargets
+    Tensor.fromDoubles({0.5}, 1, 1), # oldValues
+    0.2, 0.0, 0.5, 0.2)
+  var dataC: double[] = lossC.toDoubles()
+  # L_unclip = 0.04, L_clip = 0.09, max = 0.09
+  # policy(-1) + 0.5 * 0.09 = -0.955
+  assertApproxDouble(dataC[0], -0.955, 0.001,
+    "C: VF clipping pessimistically picks the clipped branch (loss = -0.955)")
+
+  # -------------------------------------------------------------------------
+  # Case D: Same numerics as C but vfClipRange=0 → unclipped L_VF
+  # -------------------------------------------------------------------------
+  println("--- Case D: same as C with vfClipRange=0 ---")
+  var lossD: Tensor = sn_tensor_ppo_clipped_loss(
+    baseLogits(), baseOldLogProbs(), baseActions(), baseAdvantages(),
+    Tensor.fromDoubles({1.2}, 1, 1),
+    Tensor.fromDoubles({1.0}, 1, 1),
+    Tensor.fromDoubles({0.5}, 1, 1),
+    0.2, 0.0, 0.5, 0.0)
+  var dataD: double[] = lossD.toDoubles()
+  # L_unclip = 0.04
+  # policy(-1) + 0.5 * 0.04 = -0.98
+  assertApproxDouble(dataD[0], -0.98, 0.001,
+    "D: vfClipRange=0 uses unclipped L_VF even past where clipping would fire")
+
+  # -------------------------------------------------------------------------
+  # Case E: VF clipping cannot rescue a catastrophic overshoot
+  # -------------------------------------------------------------------------
+  println("--- Case E: vfClipRange=0.2, unclipped wins (huge overshoot) ---")
+  var lossE: Tensor = sn_tensor_ppo_clipped_loss(
+    baseLogits(), baseOldLogProbs(), baseActions(), baseAdvantages(),
+    Tensor.fromDoubles({3.0}, 1, 1), # V way above V_old
+    Tensor.fromDoubles({1.0}, 1, 1),
+    Tensor.fromDoubles({0.5}, 1, 1),
+    0.2, 0.0, 0.5, 0.2)
+  var dataE: double[] = lossE.toDoubles()
+  # L_unclip = 4.0, L_clip = 0.09, max = 4.0
+  # policy(-1) + 0.5 * 4.0 = +1.0
+  assertApproxDouble(dataE[0], 1.0, 0.001,
+    "E: huge overshoot → unclipped branch dominates the max (loss = +1.0)")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

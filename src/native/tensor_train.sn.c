@@ -154,10 +154,14 @@ static double sn_graph_train_epoch_impl(
     RtTensor *labels_rt,
     RtTensor *weights_rt,
     RtTensor *old_log_probs_rt,     /* PPO only; NULL for weighted CE */
+    RtTensor *value_targets_rt,     /* PPO only; NULL for weighted CE */
+    RtTensor *old_values_rt,        /* PPO only; NULL for weighted CE */
     SnArray  *features_host,         /* total_samples * max_nodes * feature_dim doubles, zero-padded */
     SnArray  *labels_host,           /* total_samples * labels_per_sample doubles */
     SnArray  *weights_host,          /* total_samples doubles, one weight per sample */
     SnArray  *old_log_probs_host,    /* total_samples doubles, one per sample; PPO only; NULL for weighted CE */
+    SnArray  *value_targets_host,    /* total_samples doubles; PPO only; NULL for weighted CE */
+    SnArray  *old_values_host,       /* total_samples doubles; PPO only; NULL for weighted CE */
     SnArray  *adj_host,              /* total_samples * max_nodes * max_nodes doubles, zero-padded */
     SnArray  *real_node_count_host,  /* total_samples doubles (per-sample real node count) */
     SnArray  *batch_perm,            /* total_samples doubles (integer-valued permutation) */
@@ -185,6 +189,21 @@ static double sn_graph_train_epoch_impl(
     if (old_log_probs_rt) {
         old_log_probs = rec_tensor(old_log_probs_rt);
         if (!old_log_probs) return -1.0;
+    }
+
+    /* Phase 4 PPO VF: resolve the two extra per-batch inputs. Both are
+     * expected to be non-NULL whenever this is the PPO path (the
+     * strategy passes (1,1) zero placeholders when VF is disabled) and
+     * NULL whenever this is the weighted-CE path. */
+    struct ggml_tensor *value_targets = NULL;
+    struct ggml_tensor *old_values    = NULL;
+    if (value_targets_rt) {
+        value_targets = rec_tensor(value_targets_rt);
+        if (!value_targets) return -1.0;
+    }
+    if (old_values_rt) {
+        old_values = rec_tensor(old_values_rt);
+        if (!old_values) return -1.0;
     }
 
     /* Batched padded sizes — every batch lives in a tensor of these dims. */
@@ -243,20 +262,24 @@ static double sn_graph_train_epoch_impl(
         /* Use ggml_opt_loss() — the loss tensor that ggml_opt_build creates
          * in ctx_static (with a real buffer). The original `loss` we built
          * lives in g_compute_ctx (no_alloc) and has no buffer to read from. */
-        g_opt_loss_tensor          = ggml_opt_loss(g_opt_ctx);
-        g_opt_features_tensor      = features;
-        g_opt_labels_tensor        = labels;
-        g_opt_weights_tensor       = weights;
-        g_opt_old_log_probs_tensor = old_log_probs; /* NULL in weighted-CE mode */
+        g_opt_loss_tensor            = ggml_opt_loss(g_opt_ctx);
+        g_opt_features_tensor        = features;
+        g_opt_labels_tensor          = labels;
+        g_opt_weights_tensor         = weights;
+        g_opt_old_log_probs_tensor   = old_log_probs; /* NULL in weighted-CE mode */
+        g_opt_value_targets_tensor   = value_targets;  /* NULL in weighted-CE mode */
+        g_opt_old_values_tensor      = old_values;     /* NULL in weighted-CE mode */
     }
 
     /* Sanity check: caller must use the same tensors as the init call.
-     * Includes the optional PPO slot — switching loss kinds mid-cycle
+     * Includes the optional PPO slots — switching loss kinds mid-cycle
      * (weighted CE → PPO or vice versa) is not supported and trips here. */
     if (features != g_opt_features_tensor ||
         labels   != g_opt_labels_tensor   ||
         weights  != g_opt_weights_tensor  ||
-        old_log_probs != g_opt_old_log_probs_tensor) {
+        old_log_probs != g_opt_old_log_probs_tensor ||
+        value_targets != g_opt_value_targets_tensor ||
+        old_values    != g_opt_old_values_tensor) {
         return -1.0;
     }
 
@@ -279,6 +302,9 @@ static double sn_graph_train_epoch_impl(
     size_t weights_bytes       = ggml_nbytes(weights);
     /* PPO: old_log_probs is (1, n_per_batch); one scalar per sample. */
     size_t old_log_probs_bytes = old_log_probs ? ggml_nbytes(old_log_probs) : 0;
+    /* Phase 4 PPO VF: value_targets and old_values are also (1, n_per_batch). */
+    size_t value_targets_bytes = value_targets ? ggml_nbytes(value_targets) : 0;
+    size_t old_values_bytes    = old_values    ? ggml_nbytes(old_values)    : 0;
 
     float *features_buf      = (float *)calloc((size_t)features_per_batch, sizeof(float));
     float *adj_buf           = (float *)calloc((size_t)nodes_per_batch * (size_t)nodes_per_batch, sizeof(float));
@@ -287,6 +313,8 @@ static double sn_graph_train_epoch_impl(
     float *labels_buf        = (float *)malloc(labels_bytes);
     float *weights_buf       = (float *)malloc(weights_bytes);
     float *old_log_probs_buf = old_log_probs ? (float *)malloc(old_log_probs_bytes) : NULL;
+    float *value_targets_buf = value_targets ? (float *)malloc(value_targets_bytes) : NULL;
+    float *old_values_buf    = old_values    ? (float *)malloc(old_values_bytes)    : NULL;
 
     /* Sanity-check the recorded tensors actually have the expected padded shape.
      * If they don't, the caller built the template with the wrong dimensions
@@ -301,6 +329,8 @@ static double sn_graph_train_epoch_impl(
         free(labels_buf); free(weights_buf);
         free(att_mask_buf);
         if (old_log_probs_buf) free(old_log_probs_buf);
+        if (value_targets_buf) free(value_targets_buf);
+        if (old_values_buf)    free(old_values_buf);
         return -1.0;
     }
 
@@ -406,6 +436,21 @@ static double sn_graph_train_epoch_impl(
                 double *olp = (double *)sn_array_get(old_log_probs_host, sample_idx);
                 old_log_probs_buf[i] = (float)(*olp);
             }
+
+            /* --- Phase 4 PPO VF: one valueTarget and one oldValue per sample.
+             * Both buffers are non-NULL iff the caller is on the PPO path
+             * (the weighted-CE wrapper passes NULL). Even when VF loss is
+             * disabled (strategy passed (1,1) placeholder tensors), the
+             * buffers are still uploaded so the static graph's sanity
+             * check sees stable tensor identities across epochs. */
+            if (value_targets_buf) {
+                double *vt = (double *)sn_array_get(value_targets_host, sample_idx);
+                value_targets_buf[i] = (float)(*vt);
+            }
+            if (old_values_buf) {
+                double *ov = (double *)sn_array_get(old_values_host, sample_idx);
+                old_values_buf[i] = (float)(*ov);
+            }
         }
 
         /* Derive the Phase L attention additive mask from adj_buf:
@@ -438,6 +483,21 @@ static double sn_graph_train_epoch_impl(
         if (g_opt_old_log_probs_tensor && old_log_probs_buf) {
             ggml_backend_tensor_set(g_opt_old_log_probs_tensor,
                                     old_log_probs_buf, 0, old_log_probs_bytes);
+        }
+
+        /* Phase 4 PPO VF: upload the valueTargets and oldValues slices
+         * for this batch. When VF loss is disabled, the strategy has
+         * allocated (1,1) placeholder tensors on the recorded graph and
+         * their host buffers carry zeros — the backend still gets the
+         * upload (a single float per tensor) so the sanity check
+         * doesn't fire on the second batch. */
+        if (g_opt_value_targets_tensor && value_targets_buf) {
+            ggml_backend_tensor_set(g_opt_value_targets_tensor,
+                                    value_targets_buf, 0, value_targets_bytes);
+        }
+        if (g_opt_old_values_tensor && old_values_buf) {
+            ggml_backend_tensor_set(g_opt_old_values_tensor,
+                                    old_values_buf, 0, old_values_bytes);
         }
 
         /* Upload the batched adjacency / pool matrix / attention mask
@@ -557,6 +617,8 @@ static double sn_graph_train_epoch_impl(
     free(labels_buf);
     free(weights_buf);
     if (old_log_probs_buf) free(old_log_probs_buf);
+    if (value_targets_buf) free(value_targets_buf);
+    if (old_values_buf)    free(old_values_buf);
 
     /* Read back updated PARAM data into the pool slots so subsequent
      * inference (forward() outside record mode) sees the trained values. */
@@ -601,8 +663,12 @@ double sn_graph_train_epoch(
     return sn_graph_train_epoch_impl(
         loss_rt, features_rt, labels_rt, weights_rt,
         /*old_log_probs_rt=*/ NULL,
+        /*value_targets_rt=*/ NULL,
+        /*old_values_rt=*/    NULL,
         features_host, labels_host, weights_host,
         /*old_log_probs_host=*/ NULL,
+        /*value_targets_host=*/ NULL,
+        /*old_values_host=*/    NULL,
         adj_host, real_node_count_host, batch_perm,
         feature_dim, labels_per_sample, n_per_batch, max_nodes_per_graph,
         optimizer_str, lr, beta1, beta2, eps, wd);
@@ -624,10 +690,14 @@ double sn_graph_train_epoch_ppo(
     RtTensor *labels_rt,
     RtTensor *weights_rt,
     RtTensor *old_log_probs_rt,
+    RtTensor *value_targets_rt,
+    RtTensor *old_values_rt,
     SnArray  *features_host,
     SnArray  *labels_host,
     SnArray  *weights_host,
     SnArray  *old_log_probs_host,
+    SnArray  *value_targets_host,
+    SnArray  *old_values_host,
     SnArray  *adj_host,
     SnArray  *real_node_count_host,
     SnArray  *batch_perm,
@@ -644,7 +714,9 @@ double sn_graph_train_epoch_ppo(
 {
     return sn_graph_train_epoch_impl(
         loss_rt, features_rt, labels_rt, weights_rt, old_log_probs_rt,
+        value_targets_rt, old_values_rt,
         features_host, labels_host, weights_host, old_log_probs_host,
+        value_targets_host, old_values_host,
         adj_host, real_node_count_host, batch_perm,
         feature_dim, labels_per_sample, n_per_batch, max_nodes_per_graph,
         optimizer_str, lr, beta1, beta2, eps, wd);

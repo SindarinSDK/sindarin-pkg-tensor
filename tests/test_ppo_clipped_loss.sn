@@ -91,6 +91,14 @@ import "../src/tensor"
 fn currentLogPiClass0(): double =>
   return - 0.12692801
 
+# Phase 4: placeholder (1,1) zero tensors for the VF-loss inputs.
+# With valueCoeff=0 and vfClipRange=0 the loss op gates the entire
+# VF subgraph away, so the actual contents never matter — but the
+# native ABI requires non-null handles. Allocating fresh scalars on
+# each call keeps the test cases independent.
+fn vhPlaceholder(): Tensor =>
+  return Tensor.fromDoubles({0.0}, 1, 1)
+
 # ---------------------------------------------------------------------------
 # Case 1 — ratio = 1, A > 0, no clip
 # ---------------------------------------------------------------------------
@@ -103,7 +111,9 @@ fn case1(): void =>
   var advantages: Tensor = Tensor.fromDoubles({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossData: double[] = loss.toDoubles()
 
   assertEqualInt(len(lossData), 1, "case1 loss is scalar (1 element)")
@@ -122,7 +132,9 @@ fn case2(): void =>
   var advantages: Tensor = Tensor.fromDoubles({1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossData: double[] = loss.toDoubles()
 
   assertApproxDouble(lossData[0], -1.2, 0.001,
@@ -140,7 +152,9 @@ fn case3(): void =>
   var advantages: Tensor = Tensor.fromDoubles({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossData: double[] = loss.toDoubles()
 
   assertApproxDouble(lossData[0], 0.8, 0.001,
@@ -158,7 +172,9 @@ fn case4(): void =>
   var advantages: Tensor = Tensor.fromDoubles({-1.0}, 1, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossData: double[] = loss.toDoubles()
 
   # e^1.873072 = 6.50843...; loss = -(-6.50843) = +6.50843
@@ -186,7 +202,9 @@ fn case5(): void =>
   var advantages: Tensor = Tensor.fromDoubles({1.0, -1.0}, 2, 1)
 
   var loss: Tensor = sn_tensor_ppo_clipped_loss(
-    logits, oldLogProbs, actionsOneHot, advantages, 0.2, 0.0)
+    logits, oldLogProbs, actionsOneHot, advantages,
+    vhPlaceholder(), vhPlaceholder(), vhPlaceholder(),
+    0.2, 0.0, 0.0, 0.0)
   var lossData: double[] = loss.toDoubles()
 
   assertApproxDouble(lossData[0], -0.1, 0.001,
