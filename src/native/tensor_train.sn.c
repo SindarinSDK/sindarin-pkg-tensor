@@ -76,6 +76,43 @@ void sn_graph_emit_train_metric(char *name, double value, SnArray *labels)
     fn(g_train_metric_cb, name, value, labels);
 }
 
+/* ============================================================================
+ * Phase 1.4: gradient clipping by global norm (post-hoc delta clipping)
+ *
+ * ggml's `ggml_opt_eval` runs forward + backward + optimizer step as a
+ * single atomic call — there is no hook between backward and the
+ * optimizer step where we could clip the gradients directly. Instead
+ * we apply "delta clipping" around the call: snapshot every PARAM
+ * tensor before eval, let ggml run its unmodified step, then compare
+ * the post-eval values against the snapshot. If the global L2 of the
+ * parameter delta exceeds `g_grad_clip_norm`, rewind the deltas to
+ * length `g_grad_clip_norm` via `new = old + scale * (new - old)` and
+ * upload the scaled values back to the backend.
+ *
+ * Mathematically this is equivalent to pre-step gradient clipping for
+ * SGD (`delta = -lr * g` so bounding ||delta|| bounds ||g||). For
+ * AdamW it's not strictly identical because the moments still see the
+ * unscaled gradient, but it delivers the same stability property —
+ * bounded step size per batch, preventing a single bad batch from
+ * destroying the policy. This is the property that matters for the
+ * "don't destroy a training run" Tier 0 goal.
+ *
+ * `g_grad_clip_norm` is a global because passing it through every
+ * sn_graph_train_epoch_* variant's parameter list would add noise to
+ * the ABI without enabling any feature. Trainer.run sets it before
+ * the epoch loop via sn_graph_set_grad_clip_norm and resets it to
+ * 0.0 afterwards.
+ *
+ * Value 0.0 means "disabled" (no snapshot, no overhead).
+ * ============================================================================ */
+
+double g_grad_clip_norm = 0.0;
+
+void sn_graph_set_grad_clip_norm(double v)
+{
+    g_grad_clip_norm = v;
+}
+
 /* ======================================================================
  * Per-epoch training driver — shared implementation.
  *
@@ -269,6 +306,37 @@ static double sn_graph_train_epoch_impl(
 
     double total_loss = 0.0;
 
+    /* Phase 1.4: allocate per-param snapshot buffers up front if grad
+     * clipping is enabled. These hold the "before ggml_opt_eval"
+     * parameter state so we can diff against the post-step values
+     * and clip the delta in place when it exceeds g_grad_clip_norm. */
+    int clip_n_params = 0;
+    float **clip_snapshots = NULL;
+    float **clip_new_bufs  = NULL;
+    int   *clip_param_pool_idx = NULL;
+    if (g_grad_clip_norm > 0.0) {
+        for (int i = 0; i < g_pool_count; i++) {
+            struct ggml_tensor *gt = g_record_map[i];
+            if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) clip_n_params++;
+        }
+        if (clip_n_params > 0) {
+            clip_snapshots = (float **)malloc((size_t)clip_n_params * sizeof(float *));
+            clip_new_bufs  = (float **)malloc((size_t)clip_n_params * sizeof(float *));
+            clip_param_pool_idx = (int *)malloc((size_t)clip_n_params * sizeof(int));
+            int j = 0;
+            for (int i = 0; i < g_pool_count; i++) {
+                struct ggml_tensor *gt = g_record_map[i];
+                if (gt && (gt->flags & GGML_TENSOR_FLAG_PARAM)) {
+                    size_t n_elem = (size_t)g_pool[i].n_elem;
+                    clip_snapshots[j] = (float *)malloc(n_elem * sizeof(float));
+                    clip_new_bufs[j]  = (float *)malloc(n_elem * sizeof(float));
+                    clip_param_pool_idx[j] = i;
+                    j++;
+                }
+            }
+        }
+    }
+
     for (long long batch_idx = 0; batch_idx < n_batches; batch_idx++) {
         /* Zero the assembled buffers for this batch (block-diagonal layout
          * means most cells are padding zeros). */
@@ -400,6 +468,22 @@ static double sn_graph_train_epoch_impl(
             }
         }
 
+        /* Phase 1.4: snapshot all PARAM tensors right before the step
+         * so the delta-clip post-processor has a baseline to diff
+         * against. Skipped when g_grad_clip_norm == 0.0. */
+        if (clip_n_params > 0) {
+            for (int k = 0; k < clip_n_params; k++) {
+                int pi = clip_param_pool_idx[k];
+                struct ggml_tensor *gt = g_record_map[pi];
+                size_t bytes = (size_t)g_pool[pi].n_elem * sizeof(float);
+                if (gt && gt->buffer) {
+                    ggml_backend_tensor_get(gt, clip_snapshots[k], 0, bytes);
+                } else if (gt && gt->data) {
+                    memcpy(clip_snapshots[k], gt->data, bytes);
+                }
+            }
+        }
+
         /* Run forward + backward + AdamW step (NULL result — we read loss directly) */
         ggml_opt_eval(g_opt_ctx, NULL);
 
@@ -407,6 +491,63 @@ static double sn_graph_train_epoch_impl(
         float batch_loss = 0.0f;
         ggml_backend_tensor_get(g_opt_loss_tensor, &batch_loss, 0, sizeof(float));
         total_loss += (double)batch_loss;
+
+        /* Phase 1.4: post-hoc delta clipping. Read each PARAM's new
+         * values, accumulate the global L2 of (new - snapshot), and if
+         * it exceeds g_grad_clip_norm, scale the delta to length
+         * g_grad_clip_norm and upload the clipped values back. The
+         * new_bufs slab is reused across batches (allocated once
+         * before the loop) to avoid per-batch malloc churn. */
+        if (clip_n_params > 0) {
+            double delta_sq = 0.0;
+            for (int k = 0; k < clip_n_params; k++) {
+                int pi = clip_param_pool_idx[k];
+                struct ggml_tensor *gt = g_record_map[pi];
+                size_t bytes = (size_t)g_pool[pi].n_elem * sizeof(float);
+                if (gt && gt->buffer) {
+                    ggml_backend_tensor_get(gt, clip_new_bufs[k], 0, bytes);
+                } else if (gt && gt->data) {
+                    memcpy(clip_new_bufs[k], gt->data, bytes);
+                }
+                float *old = clip_snapshots[k];
+                float *nw  = clip_new_bufs[k];
+                for (long long j = 0; j < g_pool[pi].n_elem; j++) {
+                    double d = (double)nw[j] - (double)old[j];
+                    delta_sq += d * d;
+                }
+            }
+            double delta_norm = sqrt(delta_sq);
+            if (delta_norm > g_grad_clip_norm) {
+                double scale = g_grad_clip_norm / delta_norm;
+                for (int k = 0; k < clip_n_params; k++) {
+                    int pi = clip_param_pool_idx[k];
+                    struct ggml_tensor *gt = g_record_map[pi];
+                    float *old = clip_snapshots[k];
+                    float *nw  = clip_new_bufs[k];
+                    for (long long j = 0; j < g_pool[pi].n_elem; j++) {
+                        double d = (double)nw[j] - (double)old[j];
+                        nw[j] = (float)((double)old[j] + scale * d);
+                    }
+                    size_t bytes = (size_t)g_pool[pi].n_elem * sizeof(float);
+                    if (gt && gt->buffer) {
+                        ggml_backend_tensor_set(gt, nw, 0, bytes);
+                    } else if (gt && gt->data) {
+                        memcpy(gt->data, nw, bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Phase 1.4: free per-epoch grad-clip scratch buffers. */
+    if (clip_n_params > 0) {
+        for (int k = 0; k < clip_n_params; k++) {
+            free(clip_snapshots[k]);
+            free(clip_new_bufs[k]);
+        }
+        free(clip_snapshots);
+        free(clip_new_bufs);
+        free(clip_param_pool_idx);
     }
 
     free(features_buf);

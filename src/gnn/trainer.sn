@@ -98,6 +98,15 @@ struct TrainConfig =>
   # src/tensor/optim.sn::LrSchedule for the schedule kinds and
   # `effectiveLr` semantics.
   lrSchedule: LrSchedule
+  # Phase 1.4: global-norm gradient clip threshold. If > 0.0, the
+  # training loop bounds the L2 norm of each batch's parameter delta
+  # to this value, scaling down the update post-hoc when it exceeds
+  # the bound. Prevents a single bad batch from destroying the
+  # policy — the critical "don't kill a training run" safeguard on
+  # cold-start / noisy-advantage regimes. 0.0 disables (default).
+  # See src/native/tensor_train.sn.c for the implementation rationale
+  # (delta clipping vs true gradient clipping under AdamW moments).
+  gradClipNorm: double
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
@@ -107,7 +116,8 @@ struct TrainConfig =>
       valSplit: 0.0,
       normalizeAdvantages: false,
       normalizeObservations: false,
-      lrSchedule: LrSchedule.constant()
+      lrSchedule: LrSchedule.constant(),
+      gradClipNorm: 0.0
     }
 
 # ---------------------------------------------------------------------------
@@ -423,6 +433,12 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             var pos: int = base + r * featureDim + c
             featuresHost[pos] = (featuresHost[pos] - modelMean[c]) / modelStd[c]
 
+    # Phase 1.4: install the grad-clip threshold into the native
+    # training driver. The global is reset to 0.0 after the loop so
+    # a subsequent Trainer.run with a different gradClipNorm (or
+    # none) starts from a clean slate.
+    sn_graph_set_grad_clip_norm(self.config.gradClipNorm)
+
     # --- Open a record session and build the static training graph. -------
     var session: RecordSession = RecordSession.open()
 
@@ -557,6 +573,11 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
 
     session.dispose()
+
+    # Phase 1.4: release the native clip threshold so subsequent
+    # trainer runs start from the disabled state unless they opt in
+    # again via TrainConfig.gradClipNorm.
+    sn_graph_set_grad_clip_norm(0.0)
 
     # --- Phase C: post-train per-parameter snapshots. ----------------------
     var paramNormAfter: double[] = {}

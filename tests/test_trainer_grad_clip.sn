@@ -1,0 +1,185 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_trainer_grad_clip.sn — Phase 1.4 regression guard
+#
+# Verifies TrainConfig.gradClipNorm end-to-end. Gradient clipping in
+# this package is implemented as post-hoc "delta clipping" around the
+# ggml optimizer step: the native driver snapshots PARAM tensors before
+# ggml_opt_eval and, if the L2 norm of the post-step delta exceeds the
+# threshold, scales the delta back to exactly the threshold. For SGD
+# this is mathematically identical to pre-step gradient clipping; for
+# AdamW it's slightly different (the moments still see unscaled
+# gradients) but delivers the same stability property — bounded step
+# size per batch.
+#
+# Part A — Clipping actually bounds the update:
+# Run with gradClipNorm=0.0 (disabled) on a batch designed to produce
+# a large update (huge advantages, fresh random init). Capture the
+# per-param max-abs-delta across the run. Then run the same model /
+# same seed / same data with gradClipNorm=0.01 (a tiny bound). The
+# second run's max update magnitude must be strictly less than the
+# first's. This is the headline property of the feature — it does
+# something measurable on a batch that needs clipping.
+#
+# Part B — Disabled is a no-op:
+# Run with gradClipNorm=0.0 twice on the same seed/data; assert bit-
+# equivalence. Defense against a "forgot to gate on the threshold"
+# regression that would introduce nondeterminism.
+#
+# Part C — Very large threshold is a no-op:
+# Run with gradClipNorm=100.0 (far above the natural delta norm),
+# assert bit-equivalence to gradClipNorm=0.0. Proves the code path
+# is traversed but the scale branch is not entered when the delta
+# is within bounds.
+#
+# Part D — Off-by-default:
+# TrainConfig.create returns gradClipNorm=0.0.
+# ===========================================================================
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  return {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2),
+    singleNode({0.9, 0.1}, 2),
+    singleNode({0.1, 0.9}, 2)
+  }
+
+fn buildLabels(): double[] =>
+  return {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+
+# Deliberately huge advantage vector so the unclipped update is
+# large enough that the clip threshold of 0.01 kicks in.
+fn buildHugeAdvantages(): double[] =>
+  return {500.0, -500.0, 400.0, -400.0, 600.0, -600.0}
+
+# Run the trainer with the given clip threshold and return the
+# maximum absolute per-parameter delta across the whole training run,
+# plus the final flat parameter vector (for equivalence tests).
+fn trainWithClip(clip: double): double =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildHugeAdvantages()
+
+  var cfg: TrainConfig = TrainConfig.create(5, 2, 42l)
+  cfg.gradClipNorm = clip
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var result: TrainResult = trainer.run(graphs, labels, weights)
+
+  var maxDelta: double = 0.0
+  for var i: int = 0; i < len(result.paramMaxAbsDelta); i++ =>
+    if result.paramMaxAbsDelta[i] > maxDelta =>
+      maxDelta = result.paramMaxAbsDelta[i]
+  return maxDelta
+
+# Same setup as trainWithClip but returns the flat post-train
+# parameter vector for bit-equivalence testing.
+fn trainWithClipFlat(clip: double): double[] =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildHugeAdvantages()
+
+  var cfg: TrainConfig = TrainConfig.create(5, 2, 42l)
+  cfg.gradClipNorm = clip
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var _result: TrainResult = trainer.run(graphs, labels, weights)
+
+  var params: Tensor[] = model.parameters()
+  var flat: double[] = {}
+  for var i: int = 0; i < len(params); i++ =>
+    var d: double[] = params[i].toDoubles()
+    for var j: int = 0; j < len(d); j++ =>
+      flat.push(d[j])
+  return flat
+
+fn main(): void =>
+  println("=== test_trainer_grad_clip ===")
+
+  # -------------------------------------------------------------------
+  # Part A — Clipping bounds the update
+  # -------------------------------------------------------------------
+  println("--- Part A: clipping bounds the per-param update ---")
+  var unclippedMaxDelta: double = trainWithClip(0.0)
+  var clippedMaxDelta: double = trainWithClip(0.01)
+  println($"  unclipped maxDelta = {unclippedMaxDelta}")
+  println($"  clipped   maxDelta = {clippedMaxDelta}")
+
+  # The unclipped delta should be larger than the clipped one. Given
+  # the huge advantages (±500) the unclipped update should be well
+  # above the 0.01 clip threshold.
+  assertTrue(unclippedMaxDelta > clippedMaxDelta, "Part A: clipped max-abs-delta is strictly smaller than unclipped")
+  # The clipped maxDelta can be up to the clip norm spread across
+  # params; on a 2-feature 4-hidden 2-action GCN with 10 total params
+  # a clip norm of 0.01 on the L2 delta implies each individual param's
+  # delta is at most 0.01 (if all mass concentrates in one element),
+  # so we expect maxDelta <= 0.01 + small numerical slack across the
+  # 5-epoch run (each epoch's delta is bounded to 0.01 but they
+  # accumulate, so cap at 5 * 0.01 = 0.05 as a sane upper bound).
+  assertTrue(clippedMaxDelta <= 0.06, "Part A: clipped max-abs-delta stays within the bound across the run")
+
+  # -------------------------------------------------------------------
+  # Part B — Disabled is a no-op
+  # -------------------------------------------------------------------
+  println("--- Part B: gradClipNorm=0.0 is bit-deterministic across runs ---")
+  var runB1: double[] = trainWithClipFlat(0.0)
+  var runB2: double[] = trainWithClipFlat(0.0)
+  assertEqualInt(len(runB1), len(runB2), "Part B: flattened param counts match")
+  var maxDeltaB: double = 0.0
+  for var i: int = 0; i < len(runB1); i++ =>
+    var d: double = runB1[i] - runB2[i]
+    if d < 0.0 =>
+      d = -d
+    if d > maxDeltaB =>
+      maxDeltaB = d
+  assertApproxDouble(maxDeltaB, 0.0, 0.0000001, "Part B: two gradClipNorm=0.0 runs bit-equivalent")
+
+  # -------------------------------------------------------------------
+  # Part C — Very large threshold is a no-op
+  # -------------------------------------------------------------------
+  println("--- Part C: oversized threshold behaves like disabled ---")
+  var runC1: double[] = trainWithClipFlat(0.0)
+  var runC2: double[] = trainWithClipFlat(100.0)
+  assertEqualInt(len(runC1), len(runC2), "Part C: flattened param counts match")
+  var maxDeltaC: double = 0.0
+  for var i: int = 0; i < len(runC1); i++ =>
+    var d: double = runC1[i] - runC2[i]
+    if d < 0.0 =>
+      d = -d
+    if d > maxDeltaC =>
+      maxDeltaC = d
+  println($"  max delta between 0.0 and 100.0 clip = {maxDeltaC}")
+  assertApproxDouble(maxDeltaC, 0.0, 0.0000001, "Part C: gradClipNorm=100.0 matches gradClipNorm=0.0 bit-for-bit")
+
+  # -------------------------------------------------------------------
+  # Part D — Off-by-default
+  # -------------------------------------------------------------------
+  println("--- Part D: off-by-default ---")
+  var defaultCfg: TrainConfig = TrainConfig.create(10, 2, 42l)
+  assertApproxDouble(defaultCfg.gradClipNorm, 0.0, 0.0000001, "Part D: TrainConfig.create returns gradClipNorm=0.0")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0
