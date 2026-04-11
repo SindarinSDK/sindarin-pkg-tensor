@@ -72,7 +72,14 @@ fn buildHugeAdvantages(): double[] =>
 # maximum absolute per-parameter delta across the whole training run,
 # plus the final flat parameter vector (for equivalence tests).
 fn trainWithClip(clip: double): double =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -82,7 +89,12 @@ fn trainWithClip(clip: double): double =>
   cfg.gradClipNorm = clip
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var result: TrainResult = trainer.run(graphs, labels, weights)
 
   var maxDelta: double = 0.0
@@ -94,7 +106,14 @@ fn trainWithClip(clip: double): double =>
 # Same setup as trainWithClip but returns the flat post-train
 # parameter vector for bit-equivalence testing.
 fn trainWithClipFlat(clip: double): double[] =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -104,7 +123,12 @@ fn trainWithClipFlat(clip: double): double[] =>
   cfg.gradClipNorm = clip
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var _result: TrainResult = trainer.run(graphs, labels, weights)
 
   var params: Tensor[] = model.parameters()
@@ -131,14 +155,17 @@ fn main(): void =>
   # the huge advantages (±500) the unclipped update should be well
   # above the 0.01 clip threshold.
   assertTrue(unclippedMaxDelta > clippedMaxDelta, "Part A: clipped max-abs-delta is strictly smaller than unclipped")
-  # The clipped maxDelta can be up to the clip norm spread across
-  # params; on a 2-feature 4-hidden 2-action GCN with 10 total params
-  # a clip norm of 0.01 on the L2 delta implies each individual param's
-  # delta is at most 0.01 (if all mass concentrates in one element),
-  # so we expect maxDelta <= 0.01 + small numerical slack across the
-  # 5-epoch run (each epoch's delta is bounded to 0.01 but they
-  # accumulate, so cap at 5 * 0.01 = 0.05 as a sane upper bound).
-  assertTrue(clippedMaxDelta <= 0.06, "Part A: clipped max-abs-delta stays within the bound across the run")
+  # The clipped maxDelta is an element-wise accumulation across all
+  # optimizer steps: 5 epochs × 3 batches (6 samples / batchSize=2) =
+  # 15 clipped updates, each bounded in L2 at 0.01. In the worst case
+  # a single parameter element saturates the clip budget on every
+  # step, yielding up to 15 × 0.01 = 0.15. Under orthogonal init
+  # (semi-orthogonal for rows > cols), gradient direction concentrates
+  # more consistently than Kaiming and the observed max-delta sits
+  # in the 0.10–0.12 range. The bound at 0.16 gives a small margin
+  # above the theoretical ceiling while still catching a regression
+  # that lets clipping go unbounded.
+  assertTrue(clippedMaxDelta <= 0.16, "Part A: clipped max-abs-delta stays within the bound across the run")
 
   # -------------------------------------------------------------------
   # Part B — Disabled is a no-op

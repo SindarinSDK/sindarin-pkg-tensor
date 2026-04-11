@@ -43,7 +43,7 @@ struct GnnLayer =>
   dropoutRate: double
 
   static fn create(arch: str, inputDim: int, outputDim: int, dropoutRate: double): GnnLayer =>
-    var layer: GnnLayer = GnnLayer {
+    var layer: GnnLayer = {
       weight: Tensor.zeros(outputDim, inputDim),
       bias: Tensor.zeros(1, outputDim),
       attSrc: Tensor.zeros(1, outputDim),
@@ -58,14 +58,24 @@ struct GnnLayer =>
     layer.attDst.initKaiming()
     return layer
 
-  # Deterministic variant of create(): seeds the weight tensor's Kaiming
-  # init from the given value so two runs with the same seed produce
-  # bit-identical layers. bias remains at zero; attSrc/attDst are
-  # Kaiming-seeded with distinct per-role seed offsets so the attention
-  # head starts in a non-degenerate regime from epoch 0.
+  # Deterministic variant of create(): seeds the weight tensor's
+  # orthogonal init (Saxe et al. 2014) from the given value so two
+  # runs with the same seed produce bit-identical layers. This is
+  # the SB3 / CleanRL / Andrychowicz 2021 standard PPO init for
+  # ReLU hidden layers — orthogonal rows with gain √2 preserve
+  # gradient magnitude through the forward pass and empirically
+  # outperform Kaiming on on-policy actor-critic tasks. Expansion
+  # layers where outputDim > inputDim use the semi-orthogonal case
+  # (columns orthonormal) introduced in tensor commit dece90a,
+  # matching torch.nn.init.orthogonal_'s behavior.
+  #
+  # bias remains at zero. attSrc/attDst stay on Kaiming because the
+  # attention aggregation path has no direct SB3 analogue (SB3 has
+  # no GAT), and the (1, outputDim) shape is too small for
+  # orthogonal to matter much anyway.
   static fn createWithSeed(arch: str, inputDim: int, outputDim: int,
     dropoutRate: double, seed: long): GnnLayer =>
-    var layer: GnnLayer = GnnLayer {
+    var layer: GnnLayer = {
       weight: Tensor.zeros(outputDim, inputDim),
       bias: Tensor.zeros(1, outputDim),
       attSrc: Tensor.zeros(1, outputDim),
@@ -75,7 +85,7 @@ struct GnnLayer =>
       arch: arch,
       dropoutRate: dropoutRate
     }
-    layer.weight.initKaimingSeeded(seed)
+    layer.weight.initOrthogonalSeeded(1.4142135623730951, seed)
     layer.attSrc.initKaimingSeeded(seed + 100000l)
     layer.attDst.initKaimingSeeded(seed + 200000l)
     return layer
