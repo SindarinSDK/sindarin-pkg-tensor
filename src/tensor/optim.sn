@@ -126,17 +126,30 @@ struct LrSchedule =>
     if progress > 1.0 =>
       progress = 1.0
 
+    var result: double = baseLr
     if self.kind == "linear" =>
-      return baseLr + (self.minLr - baseLr) * progress
+      result = baseLr + (self.minLr - baseLr) * progress
 
     if self.kind == "cosine" =>
       # cos(π * progress) ∈ [1, -1] as progress ∈ [0, 1]; so the
       # factor (1 + cos) / 2 ∈ [1, 0], giving a smooth decay from
       # baseLr at progress=0 to minLr at progress=1.
       var cosv: double = cos(3.141592653589793 * progress)
-      return self.minLr + 0.5 * (baseLr - self.minLr) * (1.0 + cosv)
+      result = self.minLr + 0.5 * (baseLr - self.minLr) * (1.0 + cosv)
 
-    return baseLr
+    # Floor at a tiny positive value. ggml's AdamW asserts
+    # `opt_pars.adamw.alpha > 0.0f` on every step, so a schedule
+    # that decays to exactly zero on the final epoch aborts the
+    # training round. Callers that want a literal zero LR (i.e.
+    # no update) should set `kind` to "constant" with `baseLr=0`
+    # and accept the ggml abort — there is no sane "zero-LR
+    # training" regime. The floor here prevents the much more
+    # common mistake of `linear` / `cosine` schedules with
+    # `minLr=0.0` silently crashing on their last epoch.
+    var floor: double = 0.00000001
+    if result < floor =>
+      result = floor
+    return result
 
 # --- Plain-data optimizer configuration ----------------------------------
 
