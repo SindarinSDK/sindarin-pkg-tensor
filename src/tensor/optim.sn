@@ -32,6 +32,112 @@
 # and 34 for the history.
 # ==============================================================================
 
+import "sindarin-pkg-sdk/src/core/math"
+
+# --- LR schedule configuration ------------------------------------------
+#
+# Phase 1.3: learning-rate schedule. Applied per-epoch by Trainer.run
+# to the base optimizer learning rate before each call into the native
+# training driver.
+#
+# `kind`:
+# "constant" — no change; returns base lr every epoch
+# "linear"   — warmup then linear decay from base lr to minLr
+# "cosine"   — warmup then cosine decay from base lr to minLr
+#
+# `warmupEpochs`:
+# Number of initial epochs during which lr ramps linearly from 0 to
+# base lr. Reduces the "first-update blast" that destroys randomly
+# initialized policies on early batches — exactly the failure mode
+# the Tier 0 stability items target.
+#
+# `minLr`:
+# Lower bound for the post-warmup decay. At the last epoch the
+# effective lr equals minLr. For schedules that should flatten at the
+# base lr after warmup (no decay), set minLr == base lr; "constant"
+# also achieves this and is slightly cheaper.
+#
+# Use `LrSchedule.constant()` for the no-schedule default. Non-default
+# schedules are constructed via struct literal:
+#
+# var schedule: LrSchedule = LrSchedule {
+# kind: "cosine", warmupEpochs: 5, minLr: 0.00001
+# }
+#
+# The effective learning rate for epoch `e` out of `totalEpochs` is
+# computed by `LrSchedule.effectiveLr(baseLr, e, totalEpochs)`.
+# ---------------------------------------------------------------------------
+
+struct LrSchedule =>
+  kind: str
+  warmupEpochs: int
+  minLr: double
+
+  static fn constant(): LrSchedule =>
+    return LrSchedule {
+      kind: "constant",
+      warmupEpochs: 0,
+      minLr: 0.0
+    }
+
+  # Compute the effective learning rate for this epoch.
+  #
+  # Semantics:
+  # - Before the first `warmupEpochs` are complete, lr ramps linearly
+  # from 0 to `baseLr` as `baseLr * (epoch + 1) / warmupEpochs`.
+  # This gives the first batch a non-zero but small update so the
+  # policy doesn't destabilize on noisy initial advantages.
+  # - After warmup, the schedule decays from `baseLr` toward `minLr`:
+  # linear: progress from 0 to 1 across (totalEpochs - warmupEpochs)
+  # then lr = baseLr + (minLr - baseLr) * progress
+  # cosine: lr = minLr + 0.5 * (baseLr - minLr) * (1 + cos(π * progress))
+  # - "constant" ignores warmup and decay, returns baseLr verbatim.
+  #
+  # Guards:
+  # - If `totalEpochs <= warmupEpochs`, the post-warmup decay denominator
+  # would be zero or negative; we clamp progress to 0 so the schedule
+  # stays at `baseLr` for the whole run. A warmup longer than the
+  # run is effectively "ramp-up with no decay".
+  fn effectiveLr(baseLr: double, epoch: int, totalEpochs: int): double =>
+    if self.kind == "constant" =>
+      return baseLr
+
+    if self.warmupEpochs > 0 && epoch < self.warmupEpochs =>
+      return baseLr * (epoch + 1).toDouble() / self.warmupEpochs.toDouble()
+
+    var decaySpan: int = totalEpochs - self.warmupEpochs
+    if decaySpan <= 0 =>
+      return baseLr
+
+    var decayPos: int = epoch - self.warmupEpochs
+    # Normalize so that the FIRST post-warmup epoch has progress=0
+    # (value == baseLr) and the LAST training epoch has progress=1
+    # (value == minLr). The denominator is (decaySpan - 1) because
+    # there are `decaySpan` post-warmup epochs numbered 0..decaySpan-1.
+    # When decaySpan == 1 (only one post-warmup epoch), the schedule
+    # should land immediately at minLr on that lone epoch.
+    var progress: double = 0.0
+    if decaySpan > 1 =>
+      progress = decayPos.toDouble() / (decaySpan - 1).toDouble()
+    else =>
+      progress = 1.0
+    if progress < 0.0 =>
+      progress = 0.0
+    if progress > 1.0 =>
+      progress = 1.0
+
+    if self.kind == "linear" =>
+      return baseLr + (self.minLr - baseLr) * progress
+
+    if self.kind == "cosine" =>
+      # cos(π * progress) ∈ [1, -1] as progress ∈ [0, 1]; so the
+      # factor (1 + cos) / 2 ∈ [1, 0], giving a smooth decay from
+      # baseLr at progress=0 to minLr at progress=1.
+      var cosv: double = cos(3.141592653589793 * progress)
+      return self.minLr + 0.5 * (baseLr - self.minLr) * (1.0 + cosv)
+
+    return baseLr
+
 # --- Plain-data optimizer configuration ----------------------------------
 
 struct OptimizerParams =>

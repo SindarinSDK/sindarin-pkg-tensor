@@ -90,6 +90,14 @@ struct TrainConfig =>
   # training set with a very different feature distribution. The
   # caller controls the session boundary.
   normalizeObservations: bool
+  # Phase 1.3: learning-rate schedule. Applied per-epoch by Trainer.run
+  # to the base optimizer lr before calling the native driver.
+  # Default is `LrSchedule.constant()` — no warmup, no decay, behaves
+  # identically to pre-Phase-1.3 runs so existing tests and skynet
+  # call sites keep working with zero config changes. See
+  # src/tensor/optim.sn::LrSchedule for the schedule kinds and
+  # `effectiveLr` semantics.
+  lrSchedule: LrSchedule
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
@@ -98,7 +106,8 @@ struct TrainConfig =>
       seed: seed,
       valSplit: 0.0,
       normalizeAdvantages: false,
-      normalizeObservations: false
+      normalizeObservations: false,
+      lrSchedule: LrSchedule.constant()
     }
 
 # ---------------------------------------------------------------------------
@@ -142,6 +151,14 @@ struct TrainResult =>
   weightVarianceIn: double
   inputMean: double
   inputStd: double
+  # Phase 1.3: per-epoch effective learning rate actually used by the
+  # optimizer. Length == epochs. For the default
+  # `LrSchedule.constant()` this is a flat vector of the caller's
+  # base lr; for warmup + decay schedules it's the curve produced by
+  # `LrSchedule.effectiveLr(baseLr, epoch, totalEpochs)`. Consumers
+  # can use this to debug "did my schedule actually take effect" and
+  # to plot the learning-rate trajectory alongside lossCurve.
+  lrCurve: double[]
 
 # ---------------------------------------------------------------------------
 # Trainer<M, S, O>
@@ -194,6 +211,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       var emptyD3: double[] = {}
       var emptyD4: double[] = {}
       var emptyD5: double[] = {}
+      var emptyD6: double[] = {}
       return TrainResult {
         loss: 0.0,
         accuracy: 0.0,
@@ -206,7 +224,8 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         weightSumIn: 0.0,
         weightVarianceIn: 0.0,
         inputMean: 0.0,
-        inputStd: 0.0
+        inputStd: 0.0,
+        lrCurve: emptyD6
       }
 
     var totalSamples: int = len(graphs)
@@ -463,6 +482,14 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
 
     var lossCurve: double[] = {}
     var gradNormCurve: double[] = {}
+    var lrCurve: double[] = {}
+
+    # Capture the base LR before the epoch loop so the schedule can
+    # compute effectiveLr(baseLr, epoch, totalEpochs) from a fixed
+    # anchor. Mutating optParams.learningRate per epoch below does
+    # NOT re-baseline because we compute from `baseLr`, not from
+    # `optParams.learningRate`.
+    var baseLr: double = optParams.learningRate
 
     using rng = Random.createWithSeed(self.config.seed) =>
       for var epoch: int = 0; epoch < epochs; epoch++ =>
@@ -474,6 +501,16 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             if srcIdx >= totalSamples =>
               srcIdx = srcIdx % totalSamples
             perm[b * batchSize + k] = srcIdx.toDouble()
+
+        # Phase 1.3: compute the scheduled effective LR for this epoch
+        # and mutate the OptimizerParams value struct in place before
+        # building the ctx. The struct is copied into ctx by value, so
+        # each strategy.runEpoch call sees the right LR. For the
+        # default `LrSchedule.constant()` this is a no-op passthrough
+        # of baseLr — existing tests see identical behaviour.
+        var effLr: double = self.config.lrSchedule.effectiveLr(baseLr, epoch, epochs)
+        optParams.learningRate = effLr
+        lrCurve.push(effLr)
 
         # Bundle up the per-epoch context and hand it to the strategy's
         # dispatcher. WeightedCrossEntropy calls sn_graph_train_epoch;
@@ -619,5 +656,6 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       weightSumIn: weightSumIn,
       weightVarianceIn: weightVarianceIn,
       inputMean: inputMean,
-      inputStd: inputStd
+      inputStd: inputStd,
+      lrCurve: lrCurve
     }

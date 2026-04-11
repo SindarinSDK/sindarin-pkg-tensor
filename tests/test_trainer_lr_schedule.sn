@@ -1,0 +1,188 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_trainer_lr_schedule.sn — Phase 1.3 regression guard
+#
+# Verifies TrainConfig.lrSchedule end-to-end:
+#
+# Part A — LrSchedule.effectiveLr math (direct unit test):
+# For each kind (constant, linear, cosine) the effective LR at
+# epochs 0, warmup-1, warmup, halfway, and final matches the
+# hand-computed reference values to 1e-9.
+#
+# Part B — lrCurve reflects the schedule during Trainer.run:
+# Train with a linear warmup+decay schedule, then assert that
+# result.lrCurve is (1) length == epochs, (2) starts at a small
+# warmup value, (3) peaks at baseLr exactly once, (4) decays
+# monotonically after warmup, and (5) the final value == minLr.
+#
+# Part C — Constant schedule (the default) returns baseLr every epoch:
+# Train with the factory-default constant schedule, assert the
+# lrCurve is a flat vector of baseLr values.
+#
+# Part D — Off-by-default: TrainConfig.create returns a constant
+# schedule; no caller-side configuration is needed to get today's
+# behaviour.
+# ===========================================================================
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  return {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2)
+  }
+
+fn buildLabels(): double[] =>
+  return {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+
+fn main(): void =>
+  println("=== test_trainer_lr_schedule ===")
+
+  # -------------------------------------------------------------------
+  # Part A — Direct math unit test of LrSchedule.effectiveLr
+  # -------------------------------------------------------------------
+  println("--- Part A: LrSchedule.effectiveLr math ---")
+
+  var baseLr: double = 0.01
+  var totalEpochs: int = 10
+  var warmup: int = 3
+  var minLr: double = 0.001
+
+  # Constant: returns baseLr regardless of epoch.
+  var constantSched: LrSchedule = LrSchedule.constant()
+  assertApproxDouble(constantSched.effectiveLr(baseLr, 0, totalEpochs), baseLr, 0.000000001, "Part A constant: epoch 0 == baseLr")
+  assertApproxDouble(constantSched.effectiveLr(baseLr, 5, totalEpochs), baseLr, 0.000000001, "Part A constant: epoch 5 == baseLr")
+  assertApproxDouble(constantSched.effectiveLr(baseLr, 9, totalEpochs), baseLr, 0.000000001, "Part A constant: epoch 9 == baseLr")
+
+  # Linear: warmup ramps 0 -> baseLr across `warmup` epochs, then
+  # decays baseLr -> minLr across (totalEpochs - warmup) epochs.
+  var linearSched: LrSchedule = LrSchedule {
+    kind: "linear",
+    warmupEpochs: warmup,
+    minLr: minLr
+  }
+
+  # Warmup ramp: at epoch e (0 <= e < warmup), lr = baseLr * (e+1) / warmup
+  assertApproxDouble(linearSched.effectiveLr(baseLr, 0, totalEpochs), baseLr / 3.0, 0.000000001, "Part A linear: warmup epoch 0 == baseLr/3")
+  assertApproxDouble(linearSched.effectiveLr(baseLr, 1, totalEpochs), baseLr * 2.0 / 3.0, 0.000000001, "Part A linear: warmup epoch 1 == 2*baseLr/3")
+  assertApproxDouble(linearSched.effectiveLr(baseLr, 2, totalEpochs), baseLr, 0.000000001, "Part A linear: warmup epoch 2 == baseLr (peak)")
+
+  # Post-warmup: decaySpan = 7, denominator = decaySpan - 1 = 6.
+  # Epoch 3 (decayPos=0) -> progress=0 -> lr == baseLr
+  # Epoch 9 (decayPos=6) -> progress=1 -> lr == minLr (last epoch lands exact)
+  assertApproxDouble(linearSched.effectiveLr(baseLr, 3, totalEpochs), baseLr, 0.000000001, "Part A linear: post-warmup epoch 3 == baseLr (progress=0)")
+  assertApproxDouble(linearSched.effectiveLr(baseLr, 9, totalEpochs), minLr, 0.000000001, "Part A linear: post-warmup epoch 9 == minLr (progress=1)")
+
+  # Cosine: warmup same, then 0.5*(baseLr-minLr)*(1+cos(pi*progress)) + minLr
+  var cosSched: LrSchedule = LrSchedule {
+    kind: "cosine",
+    warmupEpochs: warmup,
+    minLr: minLr
+  }
+  assertApproxDouble(cosSched.effectiveLr(baseLr, 0, totalEpochs), baseLr / 3.0, 0.000000001, "Part A cosine: warmup epoch 0 == baseLr/3")
+  assertApproxDouble(cosSched.effectiveLr(baseLr, 2, totalEpochs), baseLr, 0.000000001, "Part A cosine: warmup epoch 2 == baseLr (peak)")
+
+  # At epoch 3 (decayPos=0, progress=0), cos(0)=1, factor=1.0, lr=baseLr
+  assertApproxDouble(cosSched.effectiveLr(baseLr, 3, totalEpochs), baseLr, 0.000000001, "Part A cosine: post-warmup epoch 3 == baseLr (progress=0)")
+
+  # At epoch 9 (decayPos=6, denominator=6, progress=1):
+  # cos(pi * 1) = -1, factor = 0.5 * (1 + -1) = 0
+  # lr = minLr + (baseLr - minLr) * 0 = minLr
+  assertApproxDouble(cosSched.effectiveLr(baseLr, 9, totalEpochs), minLr, 0.000000001, "Part A cosine: post-warmup epoch 9 == minLr (progress=1)")
+
+  # Midpoint sanity: epoch 6 (decayPos=3, progress=0.5), cos(pi/2)=0, factor=0.5
+  # lr = minLr + (baseLr - minLr) * 0.5
+  var cosMid: double = minLr + (baseLr - minLr) * 0.5
+  assertApproxDouble(cosSched.effectiveLr(baseLr, 6, totalEpochs), cosMid, 0.000000001, "Part A cosine: midpoint epoch 6 at 50% of decay range")
+
+  # Warmup > totalEpochs guard: decaySpan <= 0, clamp to baseLr after warmup ramp.
+  var bigWarmup: LrSchedule = LrSchedule {
+    kind: "linear",
+    warmupEpochs: 20,
+    minLr: 0.0001
+  }
+  assertApproxDouble(bigWarmup.effectiveLr(baseLr, 5, totalEpochs), baseLr * 6.0 / 20.0, 0.000000001, "Part A: oversized warmup returns ramp value at epoch 5")
+
+  # -------------------------------------------------------------------
+  # Part B — lrCurve during Trainer.run
+  # -------------------------------------------------------------------
+  println("--- Part B: lrCurve reflects schedule during training ---")
+
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = {1.0, 1.0, 1.0, 1.0}
+
+  var cfg: TrainConfig = TrainConfig.create(10, 2, 42l)
+  cfg.lrSchedule = LrSchedule {
+    kind: "linear",
+    warmupEpochs: 3,
+    minLr: 0.001
+  }
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var result: TrainResult = trainer.run(graphs, labels, weights)
+
+  assertEqualInt(len(result.lrCurve), 10, "Part B: lrCurve length == epochs")
+
+  # Hand-compute the expected curve and compare element-wise.
+  var expected: double[] = {}
+  for var e: int = 0; e < 10; e++ =>
+    expected.push(cfg.lrSchedule.effectiveLr(0.01, e, 10))
+  for var i: int = 0; i < 10; i++ =>
+    assertApproxDouble(result.lrCurve[i], expected[i], 0.000000001, $"Part B: lrCurve[{i}] matches expected schedule")
+
+  # The first epoch must be SMALLER than baseLr (warmup ramp).
+  assertTrue(result.lrCurve[0] < 0.01, "Part B: warmup epoch 0 LR is smaller than baseLr")
+  # The post-warmup peak is at epoch 2 (warmup-1 index where ramp completes).
+  assertApproxDouble(result.lrCurve[2], 0.01, 0.000000001, "Part B: lrCurve[2] (end of warmup) == baseLr")
+  # The final epoch must be minLr (linear decay lands exactly there).
+  assertApproxDouble(result.lrCurve[9], 0.001, 0.000000001, "Part B: lrCurve[9] (final epoch) == minLr")
+  # Post-warmup monotone non-increasing.
+  for var i: int = 3; i < 9; i++ =>
+    assertTrue(result.lrCurve[i] >= result.lrCurve[i + 1], $"Part B: lrCurve[{i}] >= lrCurve[{i+1}] (monotone decay)")
+
+  # -------------------------------------------------------------------
+  # Part C — Default constant schedule is a flat vector of baseLr
+  # -------------------------------------------------------------------
+  println("--- Part C: constant schedule returns baseLr every epoch ---")
+  var config2: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model2: Gnn = Gnn.createWithSeed(config2, 42l)
+  var cfg2: TrainConfig = TrainConfig.create(5, 2, 42l)
+  # No lrSchedule override — get the factory default (constant).
+  var opt2: OptimizerParams = AdamW.create(0.005, 0.0).params()
+  var strat2: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer2: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model2, config: cfg2, optimizer: opt2, strategy: strat2}
+  var result2: TrainResult = trainer2.run(graphs, labels, weights)
+
+  assertEqualInt(len(result2.lrCurve), 5, "Part C: lrCurve length == epochs")
+  for var i: int = 0; i < 5; i++ =>
+    assertApproxDouble(result2.lrCurve[i], 0.005, 0.000000001, $"Part C: lrCurve[{i}] == baseLr (constant schedule)")
+
+  # -------------------------------------------------------------------
+  # Part D — Off-by-default
+  # -------------------------------------------------------------------
+  println("--- Part D: off-by-default ---")
+  var defaultCfg: TrainConfig = TrainConfig.create(10, 2, 42l)
+  assertTrue(defaultCfg.lrSchedule.kind == "constant", "Part D: TrainConfig.create returns constant schedule")
+  assertEqualInt(defaultCfg.lrSchedule.warmupEpochs, 0, "Part D: default warmupEpochs == 0")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0
