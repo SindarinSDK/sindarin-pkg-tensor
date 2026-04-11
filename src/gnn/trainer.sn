@@ -53,13 +53,34 @@ struct TrainConfig =>
   batchSize: int
   seed: long
   valSplit: double
+  # Phase 1.1: if true, Trainer.run normalizes the caller-supplied
+  # `weights` array (interpreted as per-sample advantages in the RL
+  # case) to zero mean and unit std before handing it to the strategy.
+  # Matches the standard PPO "advantage normalization" implementation
+  # detail (SB3, CleanRL, Huang et al. 2022 "37 details"). Default
+  # false for backwards compatibility — existing supervised callers
+  # that pass constant-1.0 weights do not want their weights zeroed.
+  #
+  # Semantics: the normalization is over the FULL input weights array
+  # (not per-minibatch), applied once before training starts. This
+  # matches how SB3 and CleanRL do it — GAE is computed on the full
+  # rollout, then normalized across the whole dataset before shuffling
+  # into minibatches. If the population std is below `ADV_NORM_EPS`
+  # (e.g. all weights identical), normalization is skipped to avoid
+  # divide-by-near-zero producing NaNs. The diagnostic fields
+  # `weightSumIn` / `weightVarianceIn` on TrainResult still report the
+  # statistics of the ORIGINAL input weights, not the normalized form
+  # — they're the caller-facing "here's what you passed in" sanity
+  # check. The strategy consumes the normalized form internally.
+  normalizeAdvantages: bool
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
       epochs: epochs,
       batchSize: batchSize,
       seed: seed,
-      valSplit: 0.0
+      valSplit: 0.0,
+      normalizeAdvantages: false
     }
 
 # ---------------------------------------------------------------------------
@@ -319,6 +340,25 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         wSqDiff = wSqDiff + d * d
       weightVarianceIn = wSqDiff / nW.toDouble()
 
+    # Phase 1.1: advantage normalization. If enabled, replace `weights`
+    # with (weights - mean) / (std + eps) over the full input array.
+    # The diagnostic fields above are computed against the ORIGINAL
+    # input so callers can sanity-check what they passed in.
+    var effectiveWeights: double[] = weights
+    if self.config.normalizeAdvantages && nW > 0 =>
+      var wMean2: double = weightSumIn / nW.toDouble()
+      var wStd: double = sqrt(weightVarianceIn)
+      var advNormEps: double = 0.00000001
+      # Guard against degenerate zero-variance inputs (e.g. all
+      # weights identical). Skipping is the right call — dividing by
+      # ~0 would amplify floating-point noise into huge spurious
+      # advantages. The caller's data is just uninformative here.
+      if wStd > advNormEps =>
+        var normed: double[] = {}
+        for var i: int = 0; i < nW; i++ =>
+          normed.push((weights[i] - wMean2) / (wStd + advNormEps))
+        effectiveWeights = normed
+
     # --- Open a record session and build the static training graph. -------
     var session: RecordSession = RecordSession.open()
 
@@ -400,7 +440,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
           weights: weightsInput,
           featuresHost: featuresHost,
           targetsHost: targets,
-          weightsHost: weights,
+          weightsHost: effectiveWeights,
           adjHost: adjHost,
           realNodeCountHost: realNodeCountHost,
           perm: perm,

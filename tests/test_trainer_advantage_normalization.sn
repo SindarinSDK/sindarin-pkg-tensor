@@ -1,0 +1,217 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_trainer_advantage_normalization.sn — Phase 1.1 regression guard
+#
+# Verifies that `TrainConfig.normalizeAdvantages` does exactly what the
+# docstring on it claims:
+#
+# Part A — Math equivalence:
+# Run A: raw weights w, normalizeAdvantages=true.
+# Run B: externally pre-normalized weights w', normalizeAdvantages=false.
+# Assertion: the two runs produce bit-identical post-train parameters to
+# 1e-6. Strict proof that the in-trainer normalization path is exactly
+# (w - mean(w)) / (std(w) + eps).
+#
+# Part B — Diagnostic invariance:
+# Assertion: with normalizeAdvantages=true on raw weights w,
+# result.weightSumIn and result.weightVarianceIn match the statistics
+# of the ORIGINAL raw weights, not the normalized form. The diagnostic
+# is the caller-facing "here's what you passed in" sanity check;
+# normalization must not corrupt it.
+#
+# Part C — Degenerate zero-variance input:
+# Assertion: with normalizeAdvantages=true on all-identical weights
+# (std == 0), training completes without NaN and the final parameters
+# match the normalizeAdvantages=false run on the same data. The skip
+# guard in trainer.sn (`wStd > advNormEps`) kicks in here.
+#
+# Part D — Off-by-default backwards compatibility:
+# Assertion: `TrainConfig.create(...)` returns normalizeAdvantages=false.
+# Defense against accidentally flipping the default — every existing
+# test in the suite assumes this default.
+#
+# Tiny 2-state 2-action toy, single-node graphs. Same shape as
+# test_trainer_weighted_ce.sn so the Trainer-API plumbing is shared.
+# ===========================================================================
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  return {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2),
+    singleNode({0.9, 0.1}, 2),
+    singleNode({0.1, 0.9}, 2)
+  }
+
+fn buildLabels(): double[] =>
+  return {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+
+# Raw per-sample "advantages" with a deliberately off-centre mean and
+# non-unit std so normalization has something to do.
+fn buildRawWeights(): double[] =>
+  return {5.0, -3.0, 4.0, -2.0, 6.0, -4.0}
+
+# External re-implementation of the trainer's normalization, used to
+# produce the pre-normalized weights for the math-equivalence run.
+# Must match trainer.sn exactly: population mean, population std, same
+# eps, same skip-on-zero-variance guard.
+fn normalizeExternally(w: double[]): double[] =>
+  var n: int = len(w)
+  if n == 0 =>
+    return w
+  var sum: double = 0.0
+  for var i: int = 0; i < n; i++ =>
+    sum = sum + w[i]
+  var mean: double = sum / n.toDouble()
+  var sq: double = 0.0
+  for var i: int = 0; i < n; i++ =>
+    var d: double = w[i] - mean
+    sq = sq + d * d
+  var variance: double = sq / n.toDouble()
+  var std: double = sqrt(variance)
+  var eps: double = 0.00000001
+  if std <= eps =>
+    return w
+  var out: double[] = {}
+  for var i: int = 0; i < n; i++ =>
+    out.push((w[i] - mean) / (std + eps))
+  return out
+
+# Run a full Trainer pass and return the final flat parameter vector.
+fn trainAndFlatten(weights: double[], normalize: bool): double[] =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+
+  var cfg: TrainConfig = TrainConfig.create(30, 2, 42l)
+  cfg.normalizeAdvantages = normalize
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var _result: TrainResult = trainer.run(graphs, labels, weights)
+
+  var params: Tensor[] = model.parameters()
+  var flat: double[] = {}
+  for var i: int = 0; i < len(params); i++ =>
+    var d: double[] = params[i].toDoubles()
+    for var j: int = 0; j < len(d); j++ =>
+      flat.push(d[j])
+  return flat
+
+fn trainAndGetResult(weights: double[], normalize: bool): TrainResult =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+
+  var cfg: TrainConfig = TrainConfig.create(5, 2, 42l)
+  cfg.normalizeAdvantages = normalize
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  return trainer.run(graphs, labels, weights)
+
+fn main(): void =>
+  println("=== test_trainer_advantage_normalization ===")
+
+  # -------------------------------------------------------------------
+  # Part A — Math equivalence
+  # -------------------------------------------------------------------
+  println("--- Part A: math equivalence (internal vs external normalization) ---")
+  var rawWeights: double[] = buildRawWeights()
+  var preNormed: double[] = normalizeExternally(rawWeights)
+
+  var runA: double[] = trainAndFlatten(rawWeights, true)
+  var runB: double[] = trainAndFlatten(preNormed, false)
+
+  assertEqualInt(len(runA), len(runB), "Part A: flattened parameter counts match across runs")
+
+  var maxDeltaA: double = 0.0
+  for var i: int = 0; i < len(runA); i++ =>
+    var d: double = runA[i] - runB[i]
+    if d < 0.0 =>
+      d = -d
+    if d > maxDeltaA =>
+      maxDeltaA = d
+  assertApproxDouble(maxDeltaA, 0.0, 0.000001, "Part A: internal-normalize vs external-normalize runs are bit-equivalent")
+
+  # -------------------------------------------------------------------
+  # Part B — Diagnostic invariance
+  # -------------------------------------------------------------------
+  println("--- Part B: diagnostic invariance (weightSumIn/VarianceIn unchanged) ---")
+  var resultNorm: TrainResult = trainAndGetResult(rawWeights, true)
+
+  var expSum: double = 0.0
+  var nW: int = len(rawWeights)
+  for var i: int = 0; i < nW; i++ =>
+    expSum = expSum + rawWeights[i]
+  var expMean: double = expSum / nW.toDouble()
+  var expSq: double = 0.0
+  for var i: int = 0; i < nW; i++ =>
+    var d: double = rawWeights[i] - expMean
+    expSq = expSq + d * d
+  var expVar: double = expSq / nW.toDouble()
+
+  assertApproxDouble(resultNorm.weightSumIn, expSum, 0.000001, "Part B: weightSumIn reports raw-input sum even under normalization")
+  assertApproxDouble(resultNorm.weightVarianceIn, expVar, 0.000001, "Part B: weightVarianceIn reports raw-input variance even under normalization")
+
+  # Defense against a "use the normalized stats" regression: the
+  # normalized form has sum ≈ 0 (and var ≈ 1); explicitly assert the
+  # diagnostic is NOT reporting those values.
+  assertTrue(fabs(resultNorm.weightSumIn) > 0.1, "Part B: weightSumIn is not ~0 (would indicate normalized-form leaked)")
+
+  # -------------------------------------------------------------------
+  # Part C — Degenerate zero-variance input
+  # -------------------------------------------------------------------
+  println("--- Part C: degenerate zero-variance input (all-identical weights) ---")
+  var flatWeights: double[] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
+
+  var runC1: double[] = trainAndFlatten(flatWeights, true)
+  var runC2: double[] = trainAndFlatten(flatWeights, false)
+
+  var maxDeltaC: double = 0.0
+  for var i: int = 0; i < len(runC1); i++ =>
+    var d: double = runC1[i] - runC2[i]
+    if d < 0.0 =>
+      d = -d
+    if d > maxDeltaC =>
+      maxDeltaC = d
+  assertApproxDouble(maxDeltaC, 0.0, 0.000001, "Part C: zero-variance input skips normalization (bit-equivalent runs)")
+
+  # Also verify no NaN snuck into the final parameters. If the skip
+  # guard failed and we divided by ~0, parameters would blow up to
+  # NaN/Inf after the first AdamW step; NaN detection via `v != v`
+  # catches both (Inf arithmetic quickly produces NaN).
+  var hasNaN: bool = false
+  for var i: int = 0; i < len(runC1); i++ =>
+    var v: double = runC1[i]
+    if v != v =>
+      hasNaN = true
+  assertTrue(!hasNaN, "Part C: degenerate input produces no NaN in final parameters")
+
+  # -------------------------------------------------------------------
+  # Part D — Off-by-default
+  # -------------------------------------------------------------------
+  println("--- Part D: off-by-default backwards compatibility ---")
+  var defaultCfg: TrainConfig = TrainConfig.create(10, 2, 42l)
+  assertTrue(!defaultCfg.normalizeAdvantages, "Part D: TrainConfig.create returns normalizeAdvantages=false")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0
