@@ -1,0 +1,174 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_trainer_target_kl.sn — Phase 2 regression guard
+#
+# Verifies TrainConfig.targetKl end-to-end. The trainer measures mean
+# KL divergence between the current policy and the initial snapshot
+# after each epoch; if the mean exceeds the threshold, training
+# aborts early, leaving the model at the most recent completed
+# epoch and TrainResult.stoppedEarly set.
+#
+# Part A — Tight threshold triggers early stop:
+# Train with a huge advantage vector (large per-batch updates) and
+# a very small targetKl. Assert result.stoppedEarly == true, that
+# result.epochs < the configured epoch count, and that the
+# recorded klCurve's last entry strictly exceeds targetKl.
+#
+# Part B — Generous threshold never triggers:
+# Same training setup but with a huge targetKl (e.g. 100.0). Assert
+# result.stoppedEarly == false and result.epochs == config.epochs.
+#
+# Part C — Disabled (targetKl == 0.0) is a no-op:
+# Two runs on the same seed/data/model with targetKl=0.0 produce
+# bit-identical parameters. klCurve is empty. Defense against a
+# "forgot to gate" regression that would introduce nondeterminism
+# or spurious forward passes.
+#
+# Part D — Curve length tracks completed epochs:
+# When stoppedEarly is true, klCurve length equals result.epochs
+# (NOT config.epochs). Same for lossCurve and gradNormCurve and
+# lrCurve — they should all have matching lengths that reflect
+# actual work done, not the configured ceiling.
+#
+# Part E — Off-by-default: TrainConfig.create returns targetKl=0.0.
+# ===========================================================================
+
+fn singleNode(features: double[], featureDim: int): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, featureDim),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: featureDim
+  }
+
+fn buildGraphs(): GraphTensors[] =>
+  return {
+    singleNode({1.0, 0.0}, 2),
+    singleNode({0.0, 1.0}, 2),
+    singleNode({0.8, 0.2}, 2),
+    singleNode({0.2, 0.8}, 2),
+    singleNode({0.9, 0.1}, 2),
+    singleNode({0.1, 0.9}, 2)
+  }
+
+fn buildLabels(): double[] =>
+  return {1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0}
+
+# Deliberately large advantages so the post-epoch KL drift is huge.
+fn buildBigAdvantages(): double[] =>
+  return {50.0, -50.0, 40.0, -40.0, 60.0, -60.0}
+
+fn trainWith(targetKl: double, epochs: int): TrainResult =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = buildBigAdvantages()
+
+  var cfg: TrainConfig = TrainConfig.create(epochs, 2, 42l)
+  cfg.targetKl = targetKl
+  var opt: OptimizerParams = AdamW.create(0.05, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  return trainer.run(graphs, labels, weights)
+
+fn trainAndFlatten(targetKl: double, epochs: int): double[] =>
+  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var model: Gnn = Gnn.createWithSeed(config, 42l)
+  var graphs: GraphTensors[] = buildGraphs()
+  var labels: double[] = buildLabels()
+  var weights: double[] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0}
+
+  var cfg: TrainConfig = TrainConfig.create(epochs, 2, 42l)
+  cfg.targetKl = targetKl
+  var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
+  var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
+  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var _r: TrainResult = trainer.run(graphs, labels, weights)
+
+  var params: Tensor[] = model.parameters()
+  var flat: double[] = {}
+  for var i: int = 0; i < len(params); i++ =>
+    var d: double[] = params[i].toDoubles()
+    for var j: int = 0; j < len(d); j++ =>
+      flat.push(d[j])
+  return flat
+
+fn main(): void =>
+  println("=== test_trainer_target_kl ===")
+
+  # -------------------------------------------------------------------
+  # Part A — Tight threshold triggers early stop
+  # -------------------------------------------------------------------
+  println("--- Part A: tight threshold triggers early stop ---")
+  var resultA: TrainResult = trainWith(0.001, 50)
+  println($"  epochs={resultA.epochs} stoppedEarly={resultA.stoppedEarly} klCurve len={len(resultA.klCurve)}")
+  if len(resultA.klCurve) > 0 =>
+    println($"  final KL = {resultA.klCurve[len(resultA.klCurve) - 1]}")
+
+  assertTrue(resultA.stoppedEarly, "Part A: training aborted early under tight threshold")
+  assertTrue(resultA.epochs < 50, "Part A: epochs count < configured ceiling")
+  assertTrue(resultA.epochs >= 1, "Part A: at least one epoch completed before triggering")
+  assertTrue(len(resultA.klCurve) >= 1, "Part A: klCurve has at least one entry")
+  # Final KL entry must be the one that triggered the stop — must exceed the threshold.
+  var lastKl: double = resultA.klCurve[len(resultA.klCurve) - 1]
+  assertTrue(lastKl > 0.001, "Part A: final klCurve entry strictly exceeds targetKl")
+
+  # -------------------------------------------------------------------
+  # Part B — Generous threshold never triggers
+  # -------------------------------------------------------------------
+  println("--- Part B: generous threshold never triggers ---")
+  var resultB: TrainResult = trainWith(100.0, 10)
+  println($"  epochs={resultB.epochs} stoppedEarly={resultB.stoppedEarly} klCurve len={len(resultB.klCurve)}")
+  assertTrue(!resultB.stoppedEarly, "Part B: training NOT aborted under generous threshold")
+  assertEqualInt(resultB.epochs, 10, "Part B: all configured epochs completed")
+  assertEqualInt(len(resultB.klCurve), 10, "Part B: klCurve length == configured epochs")
+
+  # -------------------------------------------------------------------
+  # Part C — Disabled is a no-op (deterministic + no curve)
+  # -------------------------------------------------------------------
+  println("--- Part C: targetKl=0.0 is a no-op ---")
+  var runC1: double[] = trainAndFlatten(0.0, 10)
+  var runC2: double[] = trainAndFlatten(0.0, 10)
+  assertEqualInt(len(runC1), len(runC2), "Part C: flattened param counts match")
+  var maxDeltaC: double = 0.0
+  for var i: int = 0; i < len(runC1); i++ =>
+    var d: double = runC1[i] - runC2[i]
+    if d < 0.0 =>
+      d = -d
+    if d > maxDeltaC =>
+      maxDeltaC = d
+  assertApproxDouble(maxDeltaC, 0.0, 0.0000001, "Part C: two targetKl=0.0 runs bit-equivalent")
+
+  # When disabled, klCurve should be empty because no check ran.
+  var resultC: TrainResult = trainWith(0.0, 5)
+  assertEqualInt(len(resultC.klCurve), 0, "Part C: klCurve is empty when targetKl=0.0")
+  assertTrue(!resultC.stoppedEarly, "Part C: stoppedEarly=false when targetKl=0.0")
+
+  # -------------------------------------------------------------------
+  # Part D — Curve lengths reflect actual work
+  # -------------------------------------------------------------------
+  println("--- Part D: curve lengths track completed epochs ---")
+  var resultD: TrainResult = trainWith(0.001, 50)
+  assertTrue(resultD.stoppedEarly, "Part D: Part D run also triggers early stop")
+  assertEqualInt(len(resultD.lossCurve), resultD.epochs, "Part D: lossCurve length == epochs")
+  assertEqualInt(len(resultD.gradNormCurve), resultD.epochs, "Part D: gradNormCurve length == epochs")
+  assertEqualInt(len(resultD.lrCurve), resultD.epochs, "Part D: lrCurve length == epochs")
+  assertEqualInt(len(resultD.klCurve), resultD.epochs, "Part D: klCurve length == epochs")
+
+  # -------------------------------------------------------------------
+  # Part E — Off-by-default
+  # -------------------------------------------------------------------
+  println("--- Part E: off-by-default ---")
+  var defaultCfg: TrainConfig = TrainConfig.create(10, 2, 42l)
+  assertApproxDouble(defaultCfg.targetKl, 0.0, 0.0000001, "Part E: TrainConfig.create returns targetKl=0.0")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

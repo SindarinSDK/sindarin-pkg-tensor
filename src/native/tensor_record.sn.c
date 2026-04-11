@@ -137,6 +137,35 @@ void sn_graph_begin(void) {
     g_pb_count = 0;
 }
 
+/* Phase 2: pause/resume the record-mode dispatch flag around
+ * direct-mode forward passes (e.g. the trainer's per-epoch drift
+ * check). Toggles g_record_mode only — the compute / param contexts,
+ * the per-batch upload registry, and the optimizer state all stay
+ * allocated, so recording picks up exactly where it left off when
+ * you call resume. Paired with sn_tensor_pool_checkpoint /
+ * sn_tensor_pool_restore to reclaim any pool slots allocated while
+ * paused.
+ *
+ * Intended use:
+ *   long cp   = sn_tensor_pool_checkpoint();
+ *   bool prev = sn_graph_pause_recording();
+ *   // ... run inference forward passes on caller-owned graphs ...
+ *   sn_graph_resume_recording(prev);
+ *   sn_tensor_pool_restore(cp);
+ *
+ * Do NOT use this to jump in and out of an unrelated record session
+ * — the pause only works for suspending ops within a single active
+ * record session. */
+bool sn_graph_pause_recording(void) {
+    bool prev = g_record_mode;
+    g_record_mode = false;
+    return prev;
+}
+
+void sn_graph_resume_recording(bool prev) {
+    g_record_mode = prev;
+}
+
 void sn_graph_end(void) {
     /* Tear down epoch-loop training state if it was lazy-initialized */
     if (g_opt_ctx)       { ggml_opt_free(g_opt_ctx);                  g_opt_ctx       = NULL; }

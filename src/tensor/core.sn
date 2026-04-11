@@ -196,6 +196,8 @@ native fn sn_tensor_pool_restore(checkpoint: long): void
 
 native fn sn_graph_begin(): void
 native fn sn_graph_end(): void
+native fn sn_graph_pause_recording(): bool
+native fn sn_graph_resume_recording(prev: bool): void
 native fn sn_graph_input(rows: int, cols: int): Tensor
 native fn sn_graph_input_data(data: double[], rows: int, cols: int): Tensor
 native fn sn_graph_param(t: Tensor): Tensor

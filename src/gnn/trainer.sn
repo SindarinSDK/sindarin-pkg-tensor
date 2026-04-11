@@ -107,6 +107,26 @@ struct TrainConfig =>
   # See src/native/tensor_train.sn.c for the implementation rationale
   # (delta clipping vs true gradient clipping under AdamW moments).
   gradClipNorm: double
+  # Phase 2: per-epoch trust-region early stop. If > 0.0, after each
+  # epoch the trainer computes the mean KL divergence between the
+  # current policy's predictions and the initial-snapshot
+  # predictions (both over the full training set) and breaks the
+  # epoch loop the first time the mean exceeds this threshold. The
+  # model at exit reflects the state at the last completed epoch
+  # (the "safe" state), and TrainResult.stoppedEarly is true.
+  #
+  # Follows the SB3 `target_kl` convention — a bounded "how far has
+  # the policy moved from where it started" check that prevents a
+  # single training run from destroying a good initial policy when
+  # the advantages or gradients are unexpectedly large. Works for
+  # any strategy (PPO or weighted CE) because the initial-probs
+  # snapshot is computed by the trainer regardless of what the
+  # strategy's prepare() does with it.
+  #
+  # Default 0.0 disables the check entirely (no extra forward passes,
+  # zero overhead). A typical enabled value is 0.01 to 0.02 for PPO
+  # — matches SB3's recommendation.
+  targetKl: double
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
@@ -117,7 +137,8 @@ struct TrainConfig =>
       normalizeAdvantages: false,
       normalizeObservations: false,
       lrSchedule: LrSchedule.constant(),
-      gradClipNorm: 0.0
+      gradClipNorm: 0.0,
+      targetKl: 0.0
     }
 
 # ---------------------------------------------------------------------------
@@ -169,6 +190,20 @@ struct TrainResult =>
   # can use this to debug "did my schedule actually take effect" and
   # to plot the learning-rate trajectory alongside lossCurve.
   lrCurve: double[]
+  # Phase 2: per-epoch mean KL divergence between the current policy
+  # and the initial-snapshot policy (both over the full training
+  # set). Computed only when TrainConfig.targetKl > 0.0; for
+  # disabled runs this is an empty array. Length equals the number
+  # of epochs actually run (which may be less than config.epochs
+  # if stoppedEarly is true).
+  klCurve: double[]
+  # Phase 2: true if training was aborted mid-loop by the Phase 2
+  # target-KL drift check. When this is set, `epochs` reflects the
+  # number of COMPLETED epochs (which will be less than
+  # config.epochs), lossCurve / gradNormCurve / lrCurve / klCurve
+  # have lengths matching the completed epoch count, and the model's
+  # final parameters are the state after the last completed epoch.
+  stoppedEarly: bool
 
 # ---------------------------------------------------------------------------
 # Trainer<M, S, O>
@@ -222,6 +257,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       var emptyD4: double[] = {}
       var emptyD5: double[] = {}
       var emptyD6: double[] = {}
+      var emptyD7: double[] = {}
       return TrainResult {
         loss: 0.0,
         accuracy: 0.0,
@@ -235,7 +271,9 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         weightVarianceIn: 0.0,
         inputMean: 0.0,
         inputStd: 0.0,
-        lrCurve: emptyD6
+        lrCurve: emptyD6,
+        klCurve: emptyD7,
+        stoppedEarly: false
       }
 
     var totalSamples: int = len(graphs)
@@ -261,12 +299,21 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # WeightedCrossEntropy ignores the call. The forward pass runs
     # BEFORE sn_graph_begin() so the pool slots it allocates aren't
     # record-mode tensors.
-    var allProbsFlat: double[] = {}
+    #
+    # Phase 2: the same flattened-probs buffer doubles as the initial
+    # policy snapshot for the target-KL drift check. If
+    # `config.targetKl > 0.0`, we keep this array around and re-
+    # compute its equivalent after each epoch, then compare via
+    # per-sample KL divergence. The initial snapshot reflects the
+    # model state at the *start* of this run — so the drift is
+    # measured against where we started, not where the previous
+    # epoch left off. This matches SB3's target_kl semantics.
+    var initialProbsFlat: double[] = {}
     for var i: int = 0; i < totalSamples; i++ =>
       var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
       for var j: int = 0; j < len(probs); j++ =>
-        allProbsFlat.push(probs[j])
-    self.strategy.prepare(allProbsFlat, totalSamples, numClasses, targets)
+        initialProbsFlat.push(probs[j])
+    self.strategy.prepare(initialProbsFlat, totalSamples, numClasses, targets)
 
     # --- Aggregation normalization mode: gat -> sum, gcn -> sum_normalized,
     # sage -> mean. All layers in one model share an architecture.
@@ -499,6 +546,10 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     var lossCurve: double[] = {}
     var gradNormCurve: double[] = {}
     var lrCurve: double[] = {}
+    # Phase 2: per-epoch drift-check outputs + early-stop bookkeeping.
+    var klCurve: double[] = {}
+    var stoppedEarly: bool = false
+    var epochsCompleted: int = 0
 
     # Capture the base LR before the epoch loop so the schedule can
     # compute effectiveLr(baseLr, epoch, totalEpochs) from a fixed
@@ -571,6 +622,54 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         gradNormCurve.push(gradThisEpoch)
 
         MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
+
+        epochsCompleted = epochsCompleted + 1
+
+        # Phase 2: target-KL drift check. Pause the record session
+        # (so inference forward passes don't add nodes to the
+        # recorded training graph), checkpoint the tensor pool
+        # (so intermediate allocations get reclaimed), run the
+        # current model's forward over every training sample,
+        # compute the mean KL divergence between the current
+        # distributions and the initial snapshot, restore the pool,
+        # and resume recording. If KL > targetKl, set stoppedEarly
+        # and break out of the epoch loop — the model stays at
+        # this epoch's post-update state, which is the "moved
+        # but not ridiculously far" snapshot.
+        if self.config.targetKl > 0.0 =>
+          var cp: long = sn_tensor_pool_checkpoint()
+          var prevRec: bool = sn_graph_pause_recording()
+
+          var currentProbsFlat: double[] = {}
+          for var i: int = 0; i < totalSamples; i++ =>
+            var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+            for var j: int = 0; j < len(probs); j++ =>
+              currentProbsFlat.push(probs[j])
+
+          sn_graph_resume_recording(prevRec)
+          sn_tensor_pool_restore(cp)
+
+          # Mean per-sample KL(current || initial). distributionDivergence
+          # with kind="kl" computes KL(a || b) = Σ a_i * log(a_i / b_i),
+          # so passing (current, initial) measures "how far new has
+          # drifted away from where it started" — the SB3 target_kl
+          # semantic.
+          var klSum: double = 0.0
+          for var i: int = 0; i < totalSamples; i++ =>
+            var a: double[] = {}
+            var b: double[] = {}
+            for var j: int = 0; j < numClasses; j++ =>
+              a.push(currentProbsFlat[i * numClasses + j])
+              b.push(initialProbsFlat[i * numClasses + j])
+            klSum = klSum + distributionDivergence(a, b, "kl")
+          var klMean: double = klSum / totalSamples.toDouble()
+          klCurve.push(klMean)
+
+          MetricEmitter.emit("kl_divergence", klMean, epochLabels)
+
+          if klMean > self.config.targetKl =>
+            stoppedEarly = true
+            break
 
     session.dispose()
 
@@ -668,7 +767,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     return TrainResult {
       loss: finalLoss,
       accuracy: accuracy,
-      epochs: epochs,
+      epochs: epochsCompleted,
       lossCurve: lossCurve,
       gradNormCurve: gradNormCurve,
       paramNormBefore: paramNormBefore,
@@ -678,5 +777,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       weightVarianceIn: weightVarianceIn,
       inputMean: inputMean,
       inputStd: inputStd,
-      lrCurve: lrCurve
+      lrCurve: lrCurve,
+      klCurve: klCurve,
+      stoppedEarly: stoppedEarly
     }
