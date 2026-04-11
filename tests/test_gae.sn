@@ -1,0 +1,123 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/gnn"
+
+# ===========================================================================
+# test_gae.sn — Phase 4 regression guard for computeGae
+#
+# Direct unit test of the pure-Sindarin GAE helper in src/gnn/gae.sn.
+# Every case uses hand-computed expected advantages/returns so a bad
+# refactor of the recurrence will surface as a numerical diff rather
+# than a silently-converging training run.
+#
+# Cases:
+#
+# Part A — Terminal-at-end rollout (T=4).
+# rewards = [1, 0, 1, 0], values = [0.5]*4, dones = [0,0,0,1],
+# bootstrap = 0, gamma = 0.9, lambda = 0.95. The terminal flag at
+# t=3 zeros the next-value contribution AND wipes the recurrence
+# tail, so advantages[3] = r_3 - V(s_3) = -0.5 exactly.
+#
+# Part B — Truncated rollout with non-zero bootstrap, gamma=1, lambda=1.
+# Collapses to pure Monte-Carlo returns; the hand-check exercises
+# the bootstrap branch and the lambda=1 limit of the recurrence.
+#
+# Part C — Mid-episode terminal (T=3, done at t=1).
+# The terminal at t=1 must prevent advantages[2] from leaking into
+# advantages[1] via the recurrence tail, while still letting
+# advantages[1] contribute to advantages[0] normally.
+#
+# Part D — Empty trajectory.
+# T=0: both arrays returned should be empty.
+# ===========================================================================
+
+fn main(): void =>
+  println("=== test_gae ===")
+
+  var tol: double = 0.0000000001
+
+  # -------------------------------------------------------------------------
+  # Part A: terminal-at-end rollout
+  # -------------------------------------------------------------------------
+  println("--- Part A: terminal-at-end rollout ---")
+  var rewardsA: double[] = {1.0, 0.0, 1.0, 0.0}
+  var valuesA: double[] = {0.5, 0.5, 0.5, 0.5}
+  var donesA: double[] = {0.0, 0.0, 0.0, 1.0}
+  var resA: GaeResult = computeGae(rewardsA, valuesA, donesA, 0.0, 0.9, 0.95)
+
+  # Hand-computed expected values (see file header):
+  # t=3: delta=-0.5,              gae=-0.5,           return=0.0
+  # t=2: delta= 0.95,             gae= 0.5225,        return=1.0225
+  # t=1: delta=-0.05,             gae= 0.3967375,     return=0.8967375
+  # t=0: delta= 0.95,             gae= 1.2892105625,  return=1.7892105625
+  assertTrue(len(resA.advantages) == 4, "A: advantages length = 4")
+  assertTrue(len(resA.returns) == 4, "A: returns length = 4")
+  assertApproxDouble(resA.advantages[3], -0.5, tol, "A: advantages[3]")
+  assertApproxDouble(resA.advantages[2], 0.5225, tol, "A: advantages[2]")
+  assertApproxDouble(resA.advantages[1], 0.3967375, tol, "A: advantages[1]")
+  assertApproxDouble(resA.advantages[0], 1.2892105625, tol, "A: advantages[0]")
+  assertApproxDouble(resA.returns[3], 0.0, tol, "A: returns[3]")
+  assertApproxDouble(resA.returns[2], 1.0225, tol, "A: returns[2]")
+  assertApproxDouble(resA.returns[1], 0.8967375, tol, "A: returns[1]")
+  assertApproxDouble(resA.returns[0], 1.7892105625, tol, "A: returns[0]")
+
+  # -------------------------------------------------------------------------
+  # Part B: truncated rollout, gamma=1, lambda=1 -> Monte-Carlo returns
+  # -------------------------------------------------------------------------
+  println("--- Part B: gamma=1, lambda=1 Monte-Carlo equivalence ---")
+  var rewardsB: double[] = {1.0, 1.0}
+  var valuesB: double[] = {2.0, 3.0}
+  var donesB: double[] = {0.0, 0.0}
+  var resB: GaeResult = computeGae(rewardsB, valuesB, donesB, 4.0, 1.0, 1.0)
+
+  # Hand-computed:
+  # t=1: delta = r_1 + V(bootstrap) - V(s_1) = 1 + 4 - 3 = 2
+  # gae   = 2 (no tail)
+  # t=0: delta = r_0 + V(s_1) - V(s_0)       = 1 + 3 - 2 = 2
+  # gae   = 2 + 1*1*1*2                 = 4
+  # returns = [6, 5] (pure Monte-Carlo discounted sums)
+  assertApproxDouble(resB.advantages[1], 2.0, tol, "B: advantages[1]")
+  assertApproxDouble(resB.advantages[0], 4.0, tol, "B: advantages[0]")
+  assertApproxDouble(resB.returns[1], 5.0, tol, "B: returns[1]")
+  assertApproxDouble(resB.returns[0], 6.0, tol, "B: returns[0]")
+
+  # -------------------------------------------------------------------------
+  # Part C: mid-episode terminal (done at t=1) must block leak
+  # -------------------------------------------------------------------------
+  println("--- Part C: mid-episode terminal at t=1 ---")
+  var rewardsC: double[] = {1.0, 1.0, 1.0}
+  var valuesC: double[] = {0.0, 0.0, 0.0}
+  var donesC: double[] = {0.0, 1.0, 0.0}
+  var resC: GaeResult = computeGae(rewardsC, valuesC, donesC, 0.0, 0.9, 0.95)
+
+  # Hand-computed:
+  # t=2: delta = 1 + 0.9*0*(1) - 0 = 1, gae = 1, return = 1
+  # t=1: dones[1]=1 -> nonTerminal=0;
+  # delta = 1 + 0.9*V(s_2)*0 - 0 = 1
+  # gae   = 1 + 0.9*0.95*0*prev = 1 (tail wiped)
+  # return = 1
+  # t=0: delta = 1 + 0.9*V(s_1)*1 - 0 = 1
+  # gae   = 1 + 0.9*0.95*1*1 = 1 + 0.855 = 1.855
+  # return = 1.855
+  assertApproxDouble(resC.advantages[2], 1.0, tol, "C: advantages[2]")
+  assertApproxDouble(resC.advantages[1], 1.0, tol, "C: advantages[1] (terminal wipes recurrence tail)")
+  assertApproxDouble(resC.advantages[0], 1.855, tol, "C: advantages[0] (recurrence survives across terminal at t=1)")
+  assertApproxDouble(resC.returns[2], 1.0, tol, "C: returns[2]")
+  assertApproxDouble(resC.returns[1], 1.0, tol, "C: returns[1]")
+  assertApproxDouble(resC.returns[0], 1.855, tol, "C: returns[0]")
+
+  # -------------------------------------------------------------------------
+  # Part D: empty trajectory
+  # -------------------------------------------------------------------------
+  println("--- Part D: empty trajectory ---")
+  var rewardsD: double[] = {}
+  var valuesD: double[] = {}
+  var donesD: double[] = {}
+  var resD: GaeResult = computeGae(rewardsD, valuesD, donesD, 0.0, 0.99, 0.95)
+  assertTrue(len(resD.advantages) == 0, "D: empty advantages")
+  assertTrue(len(resD.returns) == 0, "D: empty returns")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

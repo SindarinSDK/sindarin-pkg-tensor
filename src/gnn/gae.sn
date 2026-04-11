@@ -1,0 +1,120 @@
+# ==============================================================================
+# sindarin-pkg-tensor/src/gnn/gae.sn — Generalized Advantage Estimation
+# ==============================================================================
+#
+# Pure-Sindarin helper that turns a rollout (rewards, value estimates,
+# done flags, plus the bootstrap value of the state reached after the
+# last step) into per-step advantages and returns, using the standard
+# Schulman et al. 2016 recurrence
+# (High-Dimensional Continuous Control Using Generalized Advantage
+# Estimation — https://arxiv.org/abs/1506.02438).
+#
+# Definitions:
+#
+# δ_t      = r_t + γ · V(s_{t+1}) · (1 − done_t) − V(s_t)
+# A_t^GAE  = δ_t + γ · λ · (1 − done_t) · A_{t+1}^GAE
+# return_t = A_t^GAE + V(s_t)         (used as V_target for the VF loss)
+#
+# The (1 − done_t) factor is what prevents advantages from leaking
+# across episode boundaries: when step t is terminal the next-state
+# value contribution is zeroed AND the recurrence is reset, so the
+# advantage for the next episode starts fresh. The bootstrap value
+# for the final (T+1)-th state is passed explicitly; callers pass 0
+# for fully-terminated rollouts, or a value estimate for truncated
+# (time-limit-cut) rollouts.
+#
+# This lives in pure Sindarin rather than as a native op because it's
+# pointer-free scalar math over small double[] arrays and there is no
+# ggml tensor machinery to buy — the rollout lengths the package sees
+# are short enough that array indexing dominates.
+#
+# Typical usage (in skynet's trainer shim):
+#
+# var gae: GaeResult = computeGae(rewards, values, dones, 0.0, 0.99, 0.95)
+# trainer.run(graphs, actionsOneHot, gae.advantages)
+# # gae.returns feeds the VF loss path via PpoClipped's valueTargets
+#
+# The advantages can then be advantage-normalized via TrainConfig.
+# normalizeAdvantages, and gae.returns is handed to the PPO strategy
+# (alongside the model's stored value estimates) to compute the
+# value-function loss term in sn_tensor_ppo_clipped_loss.
+# ==============================================================================
+
+# ---------------------------------------------------------------------------
+# GaeResult — bundle holding the two per-step vectors.
+#
+# Both arrays are length T (same as the input `rewards`). `advantages`
+# is the GAE estimate A_t^GAE at each step; `returns` is the
+# bootstrapped return A_t^GAE + V(s_t), which is what the PPO value
+# loss regresses against.
+# ---------------------------------------------------------------------------
+
+struct GaeResult =>
+  advantages: double[]
+  returns: double[]
+
+# ---------------------------------------------------------------------------
+# Compute GAE advantages and returns from a rollout.
+#
+# rewards        : length T — r_t at each step
+# values         : length T — V(s_t) at each step (from the frozen critic)
+# dones          : length T — 1.0 at terminal steps, 0.0 otherwise.
+# Non-0.0 is treated as a terminal marker; the exact
+# value is multiplied out by (1 − done_t), so using
+# a float 1.0 is required for the canonical behaviour.
+# bootstrapValue : V(s_T) — the value estimate of the state reached
+# AFTER the last rewarded step. Pass 0.0 for a
+# naturally-terminated rollout; pass a critic estimate
+# when the rollout was cut by a time limit (truncation).
+# Only used for the t = T−1 recurrence step.
+# gamma          : discount factor (typically 0.99)
+# lambda_        : GAE decay (typically 0.95; λ=1 recovers Monte-Carlo,
+# λ=0 recovers one-step TD)
+#
+# On an empty rollout (T = 0), returns two empty arrays. On T = 1, the
+# recurrence collapses to a single delta term with no lookahead. No
+# length or parameter validation is performed beyond T = 0 — callers
+# pass sane inputs.
+# ---------------------------------------------------------------------------
+
+fn computeGae(
+  rewards: double[],
+  values: double[],
+  dones: double[],
+  bootstrapValue: double,
+  gamma: double,
+  lambda_: double
+): GaeResult =>
+  var T: int = len(rewards)
+  var advantages: double[] = {}
+  var returns: double[] = {}
+  for var i: int = 0; i < T; i++ =>
+    advantages.push(0.0)
+    returns.push(0.0)
+
+  if T == 0 =>
+    return GaeResult {
+      advantages: advantages,
+      returns: returns
+    }
+
+  # Reverse recurrence: A_T^GAE accumulates from the tail forward.
+  # At t = T-1 the "next value" is the bootstrap estimate; at t < T-1
+  # it is the critic's estimate for the following step. In both
+  # cases the (1 - done_t) factor zeros out the contribution when
+  # step t was terminal.
+  var gae: double = 0.0
+  for var t: int = T - 1; t >= 0; t-- =>
+    var nextValue: double = bootstrapValue
+    if t < T - 1 =>
+      nextValue = values[t + 1]
+    var nonTerminal: double = 1.0 - dones[t]
+    var delta: double = rewards[t] + gamma * nextValue * nonTerminal - values[t]
+    gae = delta + gamma * lambda_ * nonTerminal * gae
+    advantages[t] = gae
+    returns[t] = gae + values[t]
+
+  return GaeResult {
+    advantages: advantages,
+    returns: returns
+  }
