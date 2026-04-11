@@ -27,6 +27,18 @@ void sn_model_save(SnArray *params, char *path)
     fclose(f);
 }
 
+/* Probe whether a file exists and is readable. Used by Gnn.load to
+ * detect the optional sidecar .buf file that carries non-trainable
+ * buffers (observation normalization stats) without stderr-spamming
+ * on old-format models that don't have one. */
+bool sn_file_exists(char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
 SnArray *sn_model_load(char *path)
 {
     FILE *f = fopen(path, "rb");

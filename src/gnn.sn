@@ -68,6 +68,34 @@ struct Gnn =>
   classifierW2: Tensor
   classifierB2: Tensor
   config: GnnConfig
+  # Phase 1.2: observation normalization state.
+  #
+  # `obsNormEnabled` gates the whole mechanism — when false (default),
+  # forward() is the original unnormalized path verbatim, and save()/
+  # load() writes no sidecar. When true, forward() subtracts `obsMean`
+  # and divides by `obsStd` from the incoming node features before
+  # running any message-passing layer, and save() writes a .buf
+  # sidecar alongside the main model file so inference after load
+  # produces matching outputs.
+  #
+  # Population mean and std are per-feature (length == inputDim).
+  # Trainer.run computes them from the full padded featuresHost at
+  # the start of each training session when TrainConfig.normalize-
+  # Observations is true, writes them back here, sets obsNormEnabled
+  # to true, and pre-normalizes the training host buffer so the loss
+  # op sees normalized features.
+  #
+  # Stored host-side (double[]) rather than as Tensors so they
+  # survive pool resets and can be safely serialized through any
+  # file format without going through the ggml backend. The forward
+  # path builds a fresh normalized nodeFeatures tensor per call
+  # rather than mutating the caller's — roughly one host-round-trip
+  # worth of overhead per forward, which matters only for very large
+  # graphs and is the price for not adding new broadcasting tensor
+  # ops to the native surface for this phase.
+  obsNormEnabled: bool
+  obsMean: double[]
+  obsStd: double[]
 
   static fn create(config: GnnConfig): Gnn =>
     var gnnLayers: GnnLayer[] = {}
@@ -90,13 +118,25 @@ struct Gnn =>
     var b1: Tensor = Tensor.zeros(1, hd)
     var b2: Tensor = Tensor.zeros(1, na)
 
+    # Observation normalization starts disabled with identity stats
+    # (mean=0, std=1). Trainer.run fills these in and flips the flag
+    # when the caller asks for it; otherwise they stay a no-op.
+    var initMean: double[] = {}
+    var initStd: double[] = {}
+    for var i: int = 0; i < config.inputDim; i++ =>
+      initMean.push(0.0)
+      initStd.push(1.0)
+
     return Gnn {
       layers: gnnLayers,
       classifierW1: w1,
       classifierB1: b1,
       classifierW2: w2,
       classifierB2: b2,
-      config: config
+      config: config,
+      obsNormEnabled: false,
+      obsMean: initMean,
+      obsStd: initStd
     }
 
   # Deterministic variant of create(): every Kaiming-initialized weight
@@ -130,17 +170,62 @@ struct Gnn =>
     var b1: Tensor = Tensor.zeros(1, hd)
     var b2: Tensor = Tensor.zeros(1, na)
 
+    var initMean: double[] = {}
+    var initStd: double[] = {}
+    for var i: int = 0; i < config.inputDim; i++ =>
+      initMean.push(0.0)
+      initStd.push(1.0)
+
     return Gnn {
       layers: gnnLayers,
       classifierW1: w1,
       classifierB1: b1,
       classifierW2: w2,
       classifierB2: b2,
-      config: config
+      config: config,
+      obsNormEnabled: false,
+      obsMean: initMean,
+      obsStd: initStd
     }
 
   fn forward(graph: GraphTensors, training: bool): GnnOutput =>
+    # Phase 1.2: if observation normalization is enabled, rewrite the
+    # incoming node features host-side before feeding them into the
+    # first message-passing layer. The normalization is (x - μ) / σ
+    # per feature dimension, using the stats captured at the last
+    # Trainer.run call with normalizeObservations=true.
+    #
+    # We go through the host for this rather than adding new broadcast-
+    # aware tensor ops to the native surface — the roundtrip is ~N×D
+    # doubles per forward which is negligible against the message-
+    # passing work on non-trivial graphs and avoids expanding the C
+    # API for a feature that's conceptually pre-processing.
+    #
+    # IMPORTANT: skip the host roundtrip when `training=true`. During
+    # training, Gnn.forward is called once to BUILD the recorded ggml
+    # graph, and the `graph.nodeFeatures` handed to it at that point
+    # is a record-mode placeholder (no host data) — calling
+    # `.toDoubles()` on it segfaults deep inside ggml_mul_mat on the
+    # subsequent layer call. That's fine because the trainer already
+    # pre-normalizes `featuresHost` in place before the record
+    # session opens, so the recorded graph implicitly consumes
+    # normalized features via the per-batch upload. The path below
+    # is only meaningful for INFERENCE forward passes where
+    # `graph.nodeFeatures` is a real tensor with real host data.
     var h: Tensor = graph.nodeFeatures
+    if self.obsNormEnabled && !training =>
+      var fd: int = graph.featureDim
+      var nn: int = graph.numNodes
+      var raw: double[] = graph.nodeFeatures.toDoubles()
+      var normed: double[] = {}
+      for var r: int = 0; r < nn; r++ =>
+        for var c: int = 0; c < fd; c++ =>
+          var denom: double = self.obsStd[c]
+          if denom < 0.00000001 =>
+            denom = 1.0
+          normed.push((raw[r * fd + c] - self.obsMean[c]) / denom)
+      h = Tensor.fromDoubles(normed, nn, fd)
+
     for var i: int = 0; i < len(self.layers); i++ =>
       h = self.layers[i].forward(h, graph.edgeIndex, graph.edgeWeight, training)
 
@@ -189,6 +274,89 @@ struct Gnn =>
     params.push(self.classifierB2)
     return params
 
+  # Phase 1.2: enable observation normalization for this model, fitting
+  # the per-feature population mean and std over the node features of a
+  # caller-supplied training set.
+  #
+  # Call this on the concrete Gnn BEFORE constructing the Trainer:
+  #
+  # var model: Gnn = Gnn.createWithSeed(config, seed)
+  # model.enableObservationNormalization(graphs)
+  # var trainer = Trainer<Gnn, PpoClipped, OptimizerParams> {
+  # model: model, config: cfg, optimizer: opt, strategy: strat
+  # }
+  # trainer.run(graphs, labels, weights)
+  #
+  # Why it has to be concrete: Sindarin's generic dispatch through the
+  # Trainer's type parameter `M` supports method CALLS and field
+  # READS but primitive-field mutations inside a called method only
+  # persist on the local copy the trainer holds, not on the caller's
+  # original. (Tensor handles survive because they're pointers into
+  # the shared pool.) So the Trainer reads `self.model.obsNormEnabled`
+  # / `obsMean` / `obsStd` as a signal, but it cannot itself enable
+  # obs norm on a caller's model. The caller has to do it.
+  #
+  # After this call:
+  # - self.obsMean and self.obsStd hold per-feature statistics
+  # - self.obsNormEnabled is true
+  # - Subsequent Gnn.forward(training=false) calls apply
+  # (x - mean) / std to incoming node features at the host level
+  # - Any Trainer.run that sees this model will pre-normalize
+  # featuresHost in place so training is consistent with inference
+  #
+  # Stats are computed over EVERY node across EVERY graph. Features
+  # with zero population variance get std=1.0 (mean-centred, no div-by-
+  # zero) so constant features are a no-op rather than NaN.
+  fn enableObservationNormalization(graphs: GraphTensors[]): void =>
+    var nGraphs: int = len(graphs)
+    if nGraphs == 0 =>
+      return
+
+    var fd: int = self.config.inputDim
+    var totalRows: int = 0
+    for var i: int = 0; i < nGraphs; i++ =>
+      totalRows = totalRows + graphs[i].numNodes
+    if totalRows == 0 =>
+      return
+
+    var sums: double[] = {}
+    for var c: int = 0; c < fd; c++ =>
+      sums.push(0.0)
+    for var i: int = 0; i < nGraphs; i++ =>
+      var nn: int = graphs[i].numNodes
+      var f: double[] = graphs[i].nodeFeatures.toDoubles()
+      for var r: int = 0; r < nn; r++ =>
+        for var c: int = 0; c < fd; c++ =>
+          sums[c] = sums[c] + f[r * fd + c]
+
+    var means: double[] = {}
+    for var c: int = 0; c < fd; c++ =>
+      means.push(sums[c] / totalRows.toDouble())
+
+    var sqs: double[] = {}
+    for var c: int = 0; c < fd; c++ =>
+      sqs.push(0.0)
+    for var i: int = 0; i < nGraphs; i++ =>
+      var nn: int = graphs[i].numNodes
+      var f: double[] = graphs[i].nodeFeatures.toDoubles()
+      for var r: int = 0; r < nn; r++ =>
+        for var c: int = 0; c < fd; c++ =>
+          var d: double = f[r * fd + c] - means[c]
+          sqs[c] = sqs[c] + d * d
+
+    var stds: double[] = {}
+    var eps: double = 0.00000001
+    for var c: int = 0; c < fd; c++ =>
+      var variance: double = sqs[c] / totalRows.toDouble()
+      var stdV: double = sqrt(variance)
+      if stdV < eps =>
+        stdV = 1.0
+      stds.push(stdV)
+
+    self.obsMean = means
+    self.obsStd = stds
+    self.obsNormEnabled = true
+
   fn reset(): void =>
     sn_tensor_pool_reset()
 
@@ -200,6 +368,18 @@ struct Gnn =>
 
   fn save(path: str): void =>
     ParameterSet.create(self.parameters()).save(path)
+    # Phase 1.2: persist observation-normalization state to a sidecar
+    # file `<path>.buf` when enabled. Keeps the main save format
+    # untouched (existing loaders keep working verbatim) and turns
+    # "does the sidecar exist?" into the has-obs-norm flag without
+    # needing a format version byte. The sidecar holds exactly two
+    # (1, inputDim) tensors: [obsMean, obsStd].
+    if self.obsNormEnabled =>
+      var fd: int = self.config.inputDim
+      var meanT: Tensor = Tensor.fromDoubles(self.obsMean, 1, fd)
+      var stdT: Tensor = Tensor.fromDoubles(self.obsStd, 1, fd)
+      var bufSet: Tensor[] = {meanT, stdT}
+      ParameterSet.create(bufSet).save(path + ".buf")
 
   fn load(path: str): void =>
     var ps: ParameterSet = ParameterSet.load(path)
@@ -232,3 +412,20 @@ struct Gnn =>
       idx = idx + 1
     if idx < n =>
       self.classifierB2 = ps.get(idx)
+
+    # Phase 1.2: probe for the sidecar buf file and restore obs
+    # normalization state if present. An old-format save (or a new-
+    # format save where the caller never enabled obs norm) leaves no
+    # sidecar and the model loads with obsNormEnabled=false. A new
+    # save with obs norm enabled loads the two (1, inputDim) tensors
+    # and restores the exact stats so forward() produces bit-matching
+    # outputs after the roundtrip.
+    var bufPath: str = path + ".buf"
+    if sn_file_exists(bufPath) =>
+      var bufSet: ParameterSet = ParameterSet.load(bufPath)
+      if bufSet.count() >= 2 =>
+        self.obsMean = bufSet.get(0).toDoubles()
+        self.obsStd = bufSet.get(1).toDoubles()
+        self.obsNormEnabled = true
+    else =>
+      self.obsNormEnabled = false

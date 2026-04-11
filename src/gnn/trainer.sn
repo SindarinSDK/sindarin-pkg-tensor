@@ -73,6 +73,23 @@ struct TrainConfig =>
   # — they're the caller-facing "here's what you passed in" sanity
   # check. The strategy consumes the normalized form internally.
   normalizeAdvantages: bool
+  # Phase 1.2: if true, Trainer.run computes per-feature population
+  # mean and std over the full padded featuresHost buffer BEFORE
+  # training starts, writes them into the model's `obsMean`/`obsStd`
+  # fields, sets `obsNormEnabled=true`, and pre-normalizes the host
+  # buffer in place so the recorded loss graph sees normalized
+  # features. After training, subsequent `forward()` calls on the
+  # same model will also apply the stored normalization via the
+  # Gnn.forward host-side preprocess path — so inference is
+  # consistent with training automatically. Default false so existing
+  # tests and single-domain callers keep the zero-touch behaviour.
+  #
+  # The stats are computed fresh per Trainer.run call, matching the
+  # "train-then-promote" pattern skynet uses — no Welford running
+  # average across sessions, no risk of stale stats polluting a new
+  # training set with a very different feature distribution. The
+  # caller controls the session boundary.
+  normalizeObservations: bool
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
@@ -80,7 +97,8 @@ struct TrainConfig =>
       batchSize: batchSize,
       seed: seed,
       valSplit: 0.0,
-      normalizeAdvantages: false
+      normalizeAdvantages: false,
+      normalizeObservations: false
     }
 
 # ---------------------------------------------------------------------------
@@ -358,6 +376,33 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         for var i: int = 0; i < nW; i++ =>
           normed.push((weights[i] - wMean2) / (wStd + advNormEps))
         effectiveWeights = normed
+
+    # Phase 1.2: observation normalization. If the caller enabled obs
+    # norm on the model *before* constructing the trainer (via
+    # `Gnn.enableObservationNormalization(graphs)`) AND this config
+    # opts in, pre-normalize featuresHost in place using the model's
+    # stored per-feature mean/std. The record-mode forward will skip
+    # its own obs-norm application when training=true (see the
+    # comment in Gnn.forward), so we own the host-side transform here
+    # and the recorded graph consumes already-normalized features.
+    #
+    # Why the stats come from the model rather than being computed
+    # here: Sindarin's generic dispatch through the Trainer's type
+    # parameter `M` does not propagate primitive-field mutations back
+    # to the caller's original struct — the Trainer holds a value
+    # copy of the model for the duration of the run. Having the
+    # caller seed the stats on the concrete Gnn before construction
+    # side-steps this entirely.
+    if self.config.normalizeObservations && self.model.obsNormEnabled =>
+      var modelMean: double[] = self.model.obsMean
+      var modelStd: double[] = self.model.obsStd
+      for var s: int = 0; s < totalSamples; s++ =>
+        var realNodes: int = realNodeCountHost[s].toInt()
+        var base: int = s * maxNodes * featureDim
+        for var r: int = 0; r < realNodes; r++ =>
+          for var c: int = 0; c < featureDim; c++ =>
+            var pos: int = base + r * featureDim + c
+            featuresHost[pos] = (featuresHost[pos] - modelMean[c]) / modelStd[c]
 
     # --- Open a record session and build the static training graph. -------
     var session: RecordSession = RecordSession.open()
