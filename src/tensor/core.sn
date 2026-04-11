@@ -136,8 +136,14 @@ native struct Tensor as ref =>
   fn initSmallScaleSeeded(std: double, seed: long): void =>
     sn_tensor_init_small_scale_seeded(self, std, seed)
 
-  # Phase 3: orthogonal init (Saxe et al. 2014). Rows of the tensor
-  # become orthonormal vectors scaled by `gain`. Standard PPO recipe:
+  # Phase 3: (semi-)orthogonal init (Saxe et al. 2014). Produces a
+  # rectangular matrix whose shorter axis is orthonormal, scaled by
+  # `gain`. Shape semantics match torch.nn.init.orthogonal_:
+  # - rows <= cols: rows are orthonormal, i.e. W Wᵀ = gain² · I_rows
+  # - rows  > cols: columns are orthonormal, i.e. Wᵀ W = gain² · I_cols
+  # (the semi-orthogonal case for expansion layers, e.g. the first
+  # GNN layer with hidden_dim > input_dim)
+  # Standard PPO recipe (Andrychowicz 2021, SB3/CleanRL):
   # - gain=0.01 for the policy output head (keeps π near uniform at
   # init, matches the effect of small-scale init but with the
   # additional "rows are orthogonal directions in feature space"
@@ -145,10 +151,6 @@ native struct Tensor as ref =>
   # - gain=1.0 for value heads and tanh hidden weights
   # - gain=sqrt(2) for ReLU hidden weights (Kaiming-equivalent for
   # orthogonal matrices)
-  # Requires rows <= cols for true orthogonality; the rows>cols case
-  # zeros out the trailing rows after Gram-Schmidt runs out of basis
-  # vectors (deliberately not handled transparently — not needed by
-  # any real use case in this package).
   fn initOrthogonalSeeded(gain: double, seed: long): void =>
     sn_tensor_init_orthogonal_seeded(self, gain, seed)
 

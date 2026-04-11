@@ -119,27 +119,39 @@ RtTensor *sn_tensor_init_small_scale_seeded(RtTensor *t, double std, long long s
 
 /* Phase 3: orthogonal init (Saxe et al. 2014, "Exact solutions to the
  * nonlinear dynamics of learning in deep linear neural networks").
- * Produces a weight matrix whose rows are orthonormal, scaled by
- * `gain`. For policy/value heads in PPO the standard setup is:
- *   - policy head: gain = 0.01  (small-scale, centres π near uniform)
- *   - value head:  gain = 1.0
- *   - hidden weights: gain = sqrt(2) for ReLU, 1.0 for tanh
+ * Produces a (semi-)orthogonal weight matrix scaled by `gain`. For
+ * policy/value heads and hidden layers in PPO the standard setup is:
+ *   - policy head:    gain = 0.01 (small-scale, centres π near uniform)
+ *   - value head:     gain = 1.0
+ *   - ReLU hidden:    gain = sqrt(2)  (Andrychowicz 2021, SB3/CleanRL)
+ *   - tanh hidden:    gain = 1.0
  *
- * Algorithm: modified Gram-Schmidt on rows.
- *   1. Fill the tensor with iid N(0, 1) samples (Box-Muller from xorshift)
- *   2. For each row r:
- *        - Subtract the projection onto every previously-orthonormalized row
- *        - Normalize to unit length and multiply by `gain`
+ * Rectangular semantics (matches torch.nn.init.orthogonal_):
+ *   - rows <= cols: rows are orthonormal, i.e. W Wᵀ = gain² · I_rows.
+ *   - rows  > cols: columns are orthonormal, i.e. Wᵀ W = gain² · I_cols.
+ *     (the "semi-orthogonal" case Saxe et al. 2014 define for
+ *     expansion layers — e.g. skynet's first GNN layer, whose shape
+ *     is hidden_dim × input_dim with hidden_dim > input_dim)
+ *
+ * Algorithm: modified Gram-Schmidt on the shorter axis.
+ *   1. Fill n_elem = rows*cols slots with iid N(0, 1) samples
+ *      (Box-Muller from xorshift).
+ *   2. Run modified Gram-Schmidt on rows, treating the matrix as
+ *      (inner_rows = min(rows, cols), inner_cols = max(rows, cols)).
+ *      This always orthogonalizes the shorter of the two axes, so no
+ *      row collapses from the rows > cols dimensionality mismatch.
+ *   3. Scale everything by `gain` in a single final pass.
+ *
+ * For rows > cols the Gram-Schmidt runs on a scratch buffer laid out
+ * as (cols, rows), and the result is written transposed back into
+ * `pt->data` so the caller's (rows, cols) view sees orthonormal
+ * columns. The scratch buffer is freed before the gain scale pass,
+ * which then runs in-place over `pt->data` exactly like the
+ * rows <= cols path.
  *
  * Tensor shape convention: the caller creates a tensor via
  * Tensor.zeros(rows, cols) which stores ne[0] = cols, ne[1] = rows;
- * the row-major data layout is `data[r * cols + c]`. Gram-Schmidt on
- * rows produces up to min(rows, cols) orthogonal vectors — for the
- * `rows > cols` degenerate case the last `rows - cols` rows will be
- * numerically near-zero after orthogonalization. In practice every
- * real use case (policy/value head, classifier head, GCN layer) has
- * `rows <= cols`, and we deliberately do not try to handle the
- * pathological case transparently here. */
+ * the row-major data layout is `data[r * cols + c]`. */
 static float sample_gaussian(uint64_t *state)
 {
     /* Box-Muller: two uniforms in (0, 1) -> one standard normal */
@@ -153,63 +165,121 @@ static float sample_gaussian(uint64_t *state)
     return mag * cosf(2.0f * 3.14159265358979323846f * u2);
 }
 
-static void orthogonal_fill(TPool *pt, double gain, uint64_t *state)
+/* In-place modified Gram-Schmidt on the rows of a row-major
+ * (inner_rows, inner_cols) buffer. Requires inner_rows <= inner_cols
+ * — the caller is responsible for arranging this via the scratch
+ * transpose path when necessary. Produces UNIT-norm orthonormal rows;
+ * the gain scale is applied by the caller in a single final pass. */
+static void gram_schmidt_rows(float *buf, int64_t inner_rows, int64_t inner_cols)
 {
-    int64_t cols = pt->ne[0];
-    int64_t rows = pt->ne[1];
-
-    /* Step 1: fill with iid N(0, 1) Gaussian samples. */
-    for (int64_t i = 0; i < pt->n_elem; i++) {
-        pt->data[i] = sample_gaussian(state);
-    }
-
-    /* Step 2: modified Gram-Schmidt on rows to produce a UNIT-norm
-     * orthonormal basis. Working at unit norm throughout means the
-     * projection coefficient is simply dot(row_r, row_p) — no gain
-     * factors to track. We apply `gain` in a single final pass
-     * after the orthonormalization is complete. */
-    for (int64_t r = 0; r < rows; r++) {
-        float *row_r = pt->data + (size_t)(r * cols);
+    for (int64_t r = 0; r < inner_rows; r++) {
+        float *row_r = buf + (size_t)(r * inner_cols);
 
         /* Subtract projections onto previously orthonormalized
          * (unit-norm) rows. With row_p unit-norm, proj_p(row_r) is
          * exactly (row_r · row_p) * row_p. */
         for (int64_t p = 0; p < r; p++) {
-            float *row_p = pt->data + (size_t)(p * cols);
+            float *row_p = buf + (size_t)(p * inner_cols);
             float dot = 0.0f;
-            for (int64_t c = 0; c < cols; c++) {
+            for (int64_t c = 0; c < inner_cols; c++) {
                 dot += row_r[c] * row_p[c];
             }
-            for (int64_t c = 0; c < cols; c++) {
+            for (int64_t c = 0; c < inner_cols; c++) {
                 row_r[c] -= dot * row_p[c];
             }
         }
 
         /* Normalize row_r to unit length. */
         float norm_sq = 0.0f;
-        for (int64_t c = 0; c < cols; c++) {
+        for (int64_t c = 0; c < inner_cols; c++) {
             norm_sq += row_r[c] * row_r[c];
         }
         float norm = sqrtf(norm_sq);
         if (norm < 1e-8f) {
-            /* Degenerate row (rows > cols region, or catastrophic
-             * numerical cancellation). Zero it out and move on —
-             * subsequent rows orthogonalize against this zero
-             * vector, which is a no-op. */
-            for (int64_t c = 0; c < cols; c++) row_r[c] = 0.0f;
+            /* Catastrophic numerical cancellation: two random
+             * Gaussian draws collided onto the same direction. The
+             * caller's shape precondition (inner_rows <= inner_cols)
+             * rules out the dimensionality-exhaustion case that the
+             * old code path had to handle, so this branch now only
+             * fires on genuine numerical pathology. Zero it out and
+             * move on — subsequent rows orthogonalize against this
+             * zero vector, which is a no-op. */
+            for (int64_t c = 0; c < inner_cols; c++) row_r[c] = 0.0f;
             continue;
         }
         float inv = 1.0f / norm;
-        for (int64_t c = 0; c < cols; c++) {
+        for (int64_t c = 0; c < inner_cols; c++) {
             row_r[c] *= inv;
         }
     }
+}
 
-    /* Step 3: scale the whole matrix by `gain`. This preserves
-     * orthogonality (scaling every row by the same constant doesn't
-     * change dot products' sign or their zero-ness) and sets each
-     * non-degenerate row's L2 norm to exactly `gain`. */
+static void orthogonal_fill(TPool *pt, double gain, uint64_t *state)
+{
+    int64_t cols = pt->ne[0];
+    int64_t rows = pt->ne[1];
     float g = (float)gain;
+
+    if (rows <= cols) {
+        /* Step 1: fill pt->data with iid N(0, 1) Gaussian samples. */
+        for (int64_t i = 0; i < pt->n_elem; i++) {
+            pt->data[i] = sample_gaussian(state);
+        }
+
+        /* Step 2: Gram-Schmidt on rows; rows <= cols guarantees the
+         * shorter-axis precondition holds. */
+        gram_schmidt_rows(pt->data, rows, cols);
+
+        /* Step 3: gain scale in place. */
+        for (int64_t i = 0; i < pt->n_elem; i++) {
+            pt->data[i] *= g;
+        }
+        return;
+    }
+
+    /* rows > cols: semi-orthogonal case. Build a (cols, rows) scratch
+     * matrix, orthonormalize its rows (cols rows, each in R^rows —
+     * feasible since cols < rows), then transpose back into pt->data
+     * so the caller's (rows, cols) view sees orthonormal columns. */
+    size_t n_elem = (size_t)rows * (size_t)cols;
+    float *scratch = (float *)malloc(n_elem * sizeof(float));
+    if (scratch == NULL) {
+        /* Allocation failure is terminal: the tensor would otherwise
+         * be left in a partially-initialized state. Zero it out so
+         * the caller at least gets a well-defined (if useless)
+         * tensor instead of uninitialized memory. */
+        for (int64_t i = 0; i < pt->n_elem; i++) {
+            pt->data[i] = 0.0f;
+        }
+        return;
+    }
+
+    /* Step 1: fill the scratch buffer with iid N(0, 1) Gaussian
+     * samples. Consumes exactly n_elem samples, matching the
+     * rows <= cols path's RNG consumption for the same element count. */
+    for (size_t i = 0; i < n_elem; i++) {
+        scratch[i] = sample_gaussian(state);
+    }
+
+    /* Step 2: Gram-Schmidt on the scratch treated as (cols, rows).
+     * inner_rows = cols, inner_cols = rows, and cols < rows so the
+     * precondition holds. */
+    gram_schmidt_rows(scratch, cols, rows);
+
+    /* Step 3: transpose scratch[c * rows + r] -> pt->data[r * cols + c].
+     * After this, pt->data's cols columns (each a vector in R^rows)
+     * are orthonormal. */
+    for (int64_t r = 0; r < rows; r++) {
+        for (int64_t c = 0; c < cols; c++) {
+            pt->data[r * cols + c] = scratch[c * rows + r];
+        }
+    }
+
+    free(scratch);
+
+    /* Step 4: gain scale in place. Scaling every entry by the same
+     * constant preserves Wᵀ W = I up to gain² factor, so the result
+     * has column L2 norm = gain. */
     for (int64_t i = 0; i < pt->n_elem; i++) {
         pt->data[i] *= g;
     }

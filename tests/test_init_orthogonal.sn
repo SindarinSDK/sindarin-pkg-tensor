@@ -33,6 +33,20 @@ import "../src/tensor"
 # The Box-Muller + Gram-Schmidt pipeline has log(u1) and division
 # by norm steps that could produce NaN/Inf on degenerate inputs.
 # Run a large (32, 32) init and confirm every element is finite.
+#
+# Part F — Rectangular (rows > cols) semi-orthogonal case:
+# Initialize a (16, 3) tensor — the shape of a hidden GNN layer with
+# hidden_dim=16 and input_dim=3. In this regime torch.nn.init.orthogonal_
+# produces a matrix with orthonormal COLUMNS (Wᵀ W = gain² · I_cols),
+# not orthonormal rows. Verify:
+# F1: gain=1.0 → every column has L2 norm 1.0 and all distinct
+# column pairs have dot product 0.
+# F2: gain=2.0 → column norms scale to gain; pairwise col dots
+# remain ~0 within the gain²-scaled tolerance.
+# F3: Determinism: same seed on (16, 3) is bit-identical, different
+# seeds differ measurably.
+# F4: Finiteness on a larger (48, 16) rows>cols init — catches any
+# NaN/Inf from the scratch-transpose path.
 # ===========================================================================
 
 fn l2NormRow(data: double[], rowIdx: int, cols: int): double =>
@@ -46,6 +60,19 @@ fn dotRows(data: double[], rowA: int, rowB: int, cols: int): double =>
   var sum: double = 0.0
   for var c: int = 0; c < cols; c++ =>
     sum = sum + data[rowA * cols + c] * data[rowB * cols + c]
+  return sum
+
+fn l2NormCol(data: double[], colIdx: int, rows: int, cols: int): double =>
+  var sum: double = 0.0
+  for var r: int = 0; r < rows; r++ =>
+    var v: double = data[r * cols + colIdx]
+    sum = sum + v * v
+  return sqrt(sum)
+
+fn dotCols(data: double[], colA: int, colB: int, rows: int, cols: int): double =>
+  var sum: double = 0.0
+  for var r: int = 0; r < rows; r++ =>
+    sum = sum + data[r * cols + colA] * data[r * cols + colB]
   return sum
 
 fn main(): void =>
@@ -166,6 +193,85 @@ fn main(): void =>
   for var r: int = 0; r < 32; r++ =>
     var n: double = l2NormRow(dataE, r, 32)
     assertApproxDouble(n, 1.0, 0.0001, $"Part E: row {r} has L2 norm 1.0 on 32x32")
+
+  # -------------------------------------------------------------------
+  # Part F — Rectangular rows > cols (semi-orthogonal, expansion layer)
+  # -------------------------------------------------------------------
+  println("--- Part F: rectangular (16x3) semi-orthogonal case ---")
+
+  # F1: gain=1.0, columns orthonormal.
+  var tF1: Tensor = Tensor.zeros(16, 3)
+  tF1.initOrthogonalSeeded(1.0, 77l)
+  var dataF1: double[] = tF1.toDoubles()
+  assertEqualInt(len(dataF1), 48, "Part F1: tensor has 16*3 = 48 elements")
+
+  for var c: int = 0; c < 3; c++ =>
+    var n: double = l2NormCol(dataF1, c, 16, 3)
+    assertApproxDouble(n, 1.0, 0.00001, $"Part F1: col {c} has L2 norm 1.0")
+
+  for var i: int = 0; i < 3; i++ =>
+    for var j: int = i + 1; j < 3; j++ =>
+      var d: double = dotCols(dataF1, i, j, 16, 3)
+      assertApproxDouble(d, 0.0, 0.00001, $"Part F1: cols {i},{j} are orthogonal in R^16")
+
+  # F2: gain=2.0 scales column norms to 2.0.
+  var tF2: Tensor = Tensor.zeros(16, 3)
+  tF2.initOrthogonalSeeded(2.0, 77l)
+  var dataF2: double[] = tF2.toDoubles()
+  for var c: int = 0; c < 3; c++ =>
+    var n: double = l2NormCol(dataF2, c, 16, 3)
+    assertApproxDouble(n, 2.0, 0.00001, $"Part F2: gain=2.0 col {c} has L2 norm 2.0")
+  # Dot products scale with gain^2 = 4, so widen tolerance accordingly.
+  for var i: int = 0; i < 3; i++ =>
+    for var j: int = i + 1; j < 3; j++ =>
+      var d: double = dotCols(dataF2, i, j, 16, 3)
+      assertApproxDouble(d, 0.0, 0.00004, $"Part F2: gain=2.0 cols {i},{j} orthogonal")
+
+  # F3: determinism on rows > cols.
+  var tF3a: Tensor = Tensor.zeros(16, 3)
+  tF3a.initOrthogonalSeeded(1.0, 999l)
+  var dF3a: double[] = tF3a.toDoubles()
+
+  var tF3b: Tensor = Tensor.zeros(16, 3)
+  tF3b.initOrthogonalSeeded(1.0, 999l)
+  var dF3b: double[] = tF3b.toDoubles()
+
+  var sameMaxDeltaF: double = 0.0
+  for var i: int = 0; i < len(dF3a); i++ =>
+    var delta: double = dF3a[i] - dF3b[i]
+    if delta < 0.0 =>
+      delta = -delta
+    if delta > sameMaxDeltaF =>
+      sameMaxDeltaF = delta
+  assertApproxDouble(sameMaxDeltaF, 0.0, 0.00000001, "Part F3: same seed rows>cols bit-identical")
+
+  var tF3c: Tensor = Tensor.zeros(16, 3)
+  tF3c.initOrthogonalSeeded(1.0, 1000l)
+  var dF3c: double[] = tF3c.toDoubles()
+
+  var diffMaxDeltaF: double = 0.0
+  for var i: int = 0; i < len(dF3a); i++ =>
+    var delta: double = dF3a[i] - dF3c[i]
+    if delta < 0.0 =>
+      delta = -delta
+    if delta > diffMaxDeltaF =>
+      diffMaxDeltaF = delta
+  assertTrue(diffMaxDeltaF > 0.01, "Part F3: different seeds rows>cols differ measurably")
+
+  # F4: finiteness on a larger scratch-transpose init.
+  var tF4: Tensor = Tensor.zeros(48, 16)
+  tF4.initOrthogonalSeeded(1.0, 27182l)
+  var dataF4: double[] = tF4.toDoubles()
+  var hasBadF: bool = false
+  for var i: int = 0; i < len(dataF4); i++ =>
+    var v: double = dataF4[i]
+    if v != v =>
+      hasBadF = true
+  assertTrue(!hasBadF, "Part F4: no NaN in 48x16 semi-orthogonal init")
+  # Column norms still 1.0 on the larger matrix.
+  for var c: int = 0; c < 16; c++ =>
+    var n: double = l2NormCol(dataF4, c, 48, 16)
+    assertApproxDouble(n, 1.0, 0.0001, $"Part F4: col {c} has L2 norm 1.0 on 48x16")
 
   summary()
   if failed() > 0 =>
