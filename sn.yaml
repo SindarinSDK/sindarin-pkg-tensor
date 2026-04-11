@@ -8,3 +8,5 @@ dependencies:
 - name: sindarin-pkg-test
   git: https://github.com/SindarinSDK/sindarin-pkg-test.git
   branch: main
+- name: sindarin-pkg-agents
+  git: git@github.com:SindarinSDK/sindarin-pkg-agents.git

@@ -2,6 +2,10 @@
 
 This document describes workflows for developing the Skynet autonomous learning system, built in Sindarin.
 
+This package tracks active ML / RL research. The workflow rules below are stricter than a typical package: every algorithmic suggestion must be grounded in current state-of-the-art literature, not in memory or in the existing code.
+
+See ./.sn/sindarin-pkg-agents/README.md for Sindarin language and tooling reference.
+
 ## !!! ALWAYS DO THIS !!!
 
 !!! ALWAYS ASK FOR PERMISSION BEFORE MAKING CODE CHANGES !!!
@@ -28,60 +32,31 @@ The correct workflow is ALWAYS:
 
 NEVER skip steps 3 and 4. NEVER combine steps 3-5 into one action.
 
+## !!! RESEARCH-FIRST FOR ML/RL !!!
 
-## Sindarin Language Reference
+Before suggesting *any* algorithmic change in this package — especially for reinforcement learning (PPO, GRPO, advantage estimation, value functions, optimizers, loss functions, exploration, normalization, KL handling, reward shaping, etc.) — you MUST perform online research to confirm current state-of-the-art.
 
-This is a pure Sindarin project. All application code is in `.sn` files, with `.sn.c` for C library interop.
+- Use WebSearch / WebFetch against recent arXiv papers, reference implementations (TRL, CleanRL, OpenAI Spinning Up, DeepMind), and recognized practitioner blogs.
+- Cite the specific sources (paper title + year, repo + file, blog post URL) in your report. "I think this is correct" is NOT sufficient. "Standard practice is..." without a citation is NOT sufficient.
+- Memory and training-data recall are NOT acceptable substitutes for live research. The field moves fast and your priors are stale.
+- If you cannot access the web for any reason, say so explicitly and STOP. Do not fall back to memory and pretend it is research.
+- If research surfaces a conflict between the current code and SOTA, treat it as an audit finding: report it and WAIT for instruction. Do not silently fix it (per the existing permission rule).
 
-Full reference: `docs/sindarin-language.md`
+This applies to suggestions, not just to writing code. Reporting "we should add X" without having researched X first is a workflow violation.
 
-**Before writing or reviewing Sindarin code, read the relevant topic(s) from `docs/sindarin/`:**
+## !!! CONTINUOUS SOTA AUDITING !!!
 
-| Topic | File | When to read |
-|-------|------|-------------|
-| Types & variables | `docs/sindarin/types.md` | Declaring variables, choosing types, type inference, **type conversions** |
-| Functions & lambdas | `docs/sindarin/functions.md` | Writing functions, closures, callbacks |
-| Structs | `docs/sindarin/structs.md` | Defining structs, methods, static methods |
-| Memory | `docs/sindarin/memory.md` | `as ref`/`as val`, `copyOf`, `using`/`dispose` |
-| Control flow | `docs/sindarin/control-flow.md` | if/else, match, for, while, break/continue |
-| Strings & arrays | `docs/sindarin/strings-and-arrays.md` | String methods, interpolation, array operations |
-| Generics & interfaces | `docs/sindarin/generics.md` | Generic structs/functions, interfaces, iterators, operators |
-| Serialization | `docs/sindarin/serialization.md` | `@serializable`, encode/decode |
-| Threading | `docs/sindarin/threading.md` | `sync var`, `lock`, thread spawn (`&`) and join (`!`) |
-| Native C interop | `docs/sindarin/native-interop.md` | `@source`, `@alias`, `.sn.c` files, type mapping |
-| Packages & tooling | `docs/sindarin/packages.md` | `sn.yaml`, imports, CLI commands, built-in functions |
+Whenever you read RL / training / optimizer / loss / advantage / normalization code for any reason — even unrelated to the user's immediate request — audit it against current SOTA in passing.
 
-Do NOT load all topics at once. Read only what is relevant to the current task.
+- Surface any drift, theoretical bugs, outdated formulations, sign errors, known-bad patterns, or numerical issues as findings in your report.
+- Theoretical correctness and up-to-dateness outrank consistency with the existing implementation. The code in this repo is NOT authoritative — the literature is.
+- Do not assume an existing pattern is correct just because it is committed. Do not assume a recent commit is correct just because it is recent. Verify against sources.
+- Audit findings are reports, not authorizations. Report them and wait, same as any other suggestion.
 
-## Type Conversions (Critical)
+## API DESIGN PRINCIPLES
 
-Sindarin has **NO `as` cast operator**. The `as` keyword is only for memory qualifiers (`as ref` / `as val`).
+- **Breaking changes are fine.** This package has no stability contract. Do not preserve old APIs, do not add compatibility shims, do not deprecate-then-remove. If a cleaner design exists, propose replacing the old one outright.
+- **Clean, composable API.** Prefer small orthogonal pieces (strategies, optimizers, schedulers, normalizers, advantage estimators) that consumers compose, over monolithic configs with dozens of flags.
+- **Consumer choice over opinionated defaults.** Where SOTA offers multiple valid approaches (e.g. advantage normalization on/off, KL penalty vs. clip, GAE vs. Monte Carlo returns, AdamW vs. Lion, value clipping on/off), expose them as selectable strategies rather than hard-coding one. Sensible defaults are fine, but every choice must be overridable.
+- **No speculative knobs.** Only add a configuration option when SOTA actually presents a real choice between defensible alternatives. Do not add flags "just in case" or for hypothetical future needs.
 
-All type conversions use **explicit dot-method calls**:
-
-```sindarin
-var x: int = 42
-var d: double = x.toDouble()       # int → double
-var l: long = x.toLong()           # int → long
-var b: byte = x.toByte()           # int → byte
-
-var ms: long = 5000
-var i: int = ms.toInt()            # long → int
-
-var pi: double = 3.14
-var n: int = pi.toInt()            # double → int (truncates)
-var m: long = pi.toLong()          # double → long
-
-var b: byte = 0xFF
-var bi: int = b.toInt()            # byte → int
-
-var s: str = "42"
-var parsed: int = s.toInt()        # str → int
-var pd: double = "3.14".toDouble() # str → double
-var bytes: byte[] = s.toBytes()    # str → byte[]
-var text: str = bytes.toString()   # byte[] → str
-```
-
-**Never write `x as int` or `val as double` — this will not compile.**
-
-Full reference: `docs/sindarin/types.md` (Type Conversions section).
