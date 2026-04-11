@@ -1,0 +1,125 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_gnn_value_head_forward.sn — Phase 4.1 value head forward-pass guard
+#
+# Pins the behaviour of the optional two-layer value head added by
+# Gnn.enableValueHead(seed). All four assertions matter for the Phase
+# 4.2 VF loss wiring downstream:
+#
+# Part A — Disabled by default.
+# Gnn.createWithSeed with no enableValueHead call leaves
+# valueHeadEnabled=false, parameters() at the pre-Phase-4 count
+# (layer params + classifier W1/B1/W2/B2), and forward().
+# valueEstimate as the (1,1) placeholder zero tensor.
+#
+# Part B — enableValueHead flips the flag, grows parameters() by 4.
+# After calling enableValueHead, the flag is true and parameters()
+# has exactly four more entries than before. This is the
+# pre-condition the Trainer reads when deciding whether to collect
+# the oldValues snapshot for the VF loss.
+#
+# Part C — forward().valueEstimate has the right shape.
+# After enabling, forward() on a single-graph input produces a
+# (1, 1) scalar-per-graph tensor. batchRows=1 here because the
+# test graph has one sample in the output.
+#
+# Part D — Value head weights drive the output.
+# Two Gnns created with different value-head seeds produce
+# different valueEstimate values for the same input graph.
+# Confirms the head is actually wired through forward() rather
+# than defaulting to a zero-placeholder path.
+# ===========================================================================
+
+fn singleNodeGraph(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 3),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 3
+  }
+
+fn makeConfig(): GnnConfig =>
+  return GnnConfig {
+    inputDim: 3, hiddenDim: 8, numActions: 2,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+
+fn main(): void =>
+  println("=== test_gnn_value_head_forward ===")
+
+  var probe: GraphTensors = singleNodeGraph({0.2, 0.5, 0.3})
+
+  # -------------------------------------------------------------------------
+  # Part A: disabled by default
+  # -------------------------------------------------------------------------
+  println("--- Part A: disabled by default ---")
+  var modelA: Gnn = Gnn.createWithSeed(makeConfig(), 42l)
+  assertFalse(modelA.valueHeadEnabled, "A: valueHeadEnabled=false by default")
+  var paramsBefore: int = len(modelA.parameters())
+  var outA: GnnOutput = modelA.forward(probe, false)
+  # Placeholder is a (1,1) zero tensor. Its .toDoubles() should be
+  # exactly {0.0} with length 1.
+  var placeholderVals: double[] = outA.valueEstimate.toDoubles()
+  assertEqualInt(len(placeholderVals), 1, "A: placeholder valueEstimate has 1 element")
+  assertApproxDouble(placeholderVals[0], 0.0, 0.00000001, "A: placeholder valueEstimate == 0")
+
+  # -------------------------------------------------------------------------
+  # Part B: enableValueHead grows parameters() by exactly 4
+  # -------------------------------------------------------------------------
+  println("--- Part B: enableValueHead grows parameters() by 4 ---")
+  modelA.enableValueHead(42l)
+  assertTrue(modelA.valueHeadEnabled, "B: valueHeadEnabled=true after enable")
+  var paramsAfter: int = len(modelA.parameters())
+  assertEqualInt(paramsAfter, paramsBefore + 4,
+    "B: parameters() has 4 more tensors after enableValueHead")
+
+  # -------------------------------------------------------------------------
+  # Part C: forward().valueEstimate shape after enable
+  # -------------------------------------------------------------------------
+  println("--- Part C: valueEstimate shape after enable ---")
+  var outC: GnnOutput = modelA.forward(probe, false)
+  var veC: double[] = outC.valueEstimate.toDoubles()
+  # The probe has a single graph, so the value estimate is one scalar.
+  # Tensor.zeros uses (rows, cols); the value head output shape is
+  # (batchRows=1, 1) — one scalar per input graph.
+  assertEqualInt(len(veC), 1, "C: valueEstimate has 1 scalar for a 1-graph probe")
+
+  # -------------------------------------------------------------------------
+  # Part D: different seeds produce different value estimates
+  # -------------------------------------------------------------------------
+  println("--- Part D: value head weights drive the output ---")
+  var modelD1: Gnn = Gnn.createWithSeed(makeConfig(), 7l)
+  modelD1.enableValueHead(1001l)
+  var modelD2: Gnn = Gnn.createWithSeed(makeConfig(), 7l)
+  modelD2.enableValueHead(2002l)
+  var ve1: double[] = modelD1.forward(probe, false).valueEstimate.toDoubles()
+  var ve2: double[] = modelD2.forward(probe, false).valueEstimate.toDoubles()
+  var diff: double = ve1[0] - ve2[0]
+  if diff < 0.0 =>
+    diff = -diff
+  assertTrue(diff > 0.00001,
+    $"D: different VH seeds produce different outputs (v1={ve1[0]}, v2={ve2[0]})")
+
+  # Both should also differ from the disabled placeholder (0.0) in
+  # magnitude — if the valueEstimate were silently stuck on the
+  # placeholder path, Part D's assertion might still pass by
+  # coincidence if two zeros were returned. Guard the placeholder
+  # corner explicitly:
+  var mag1: double = ve1[0]
+  if mag1 < 0.0 =>
+    mag1 = -mag1
+  var mag2: double = ve2[0]
+  if mag2 < 0.0 =>
+    mag2 = -mag2
+  assertTrue(mag1 > 0.00001 || mag2 > 0.00001,
+    "D: at least one value head output is non-zero (not stuck on placeholder)")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

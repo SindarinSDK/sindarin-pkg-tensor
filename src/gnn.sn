@@ -47,12 +47,24 @@ struct GnnConfig =>
 
 # ---------------------------------------------------------------------------
 # GNN forward pass output
+#
+# `valueEstimate` is always populated. When the model has no value head
+# (`valueHeadEnabled == false`), it is a (1, 1) zero-tensor placeholder
+# so callers never have to null-check it; the PPO loss op treats it as
+# a dead input whenever the VF coefficient is zero.
+#
+# When the value head IS enabled, the shape is (batchRows, 1) — one
+# scalar value estimate per input graph. In ggml terms this is
+# ne[0]=1, ne[1]=batchRows, matching the contract the PPO VF loss
+# expects for `valueEstimates`. See the enableValueHead() comment
+# below for the init recipe and the architectural rationale.
 # ---------------------------------------------------------------------------
 
 struct GnnOutput =>
   probs: Tensor
   logits: Tensor
   embedding: Tensor
+  valueEstimate: Tensor
 
 # ---------------------------------------------------------------------------
 # GnnLayer is defined in ./gnn/layer.sn and imported above.
@@ -97,6 +109,55 @@ struct Gnn =>
   obsNormEnabled: bool
   obsMean: double[]
   obsStd: double[]
+  # Phase 4: optional value head for PPO value-function loss.
+  #
+  # `valueHeadEnabled` gates the whole mechanism — when false (default),
+  # forward() leaves `output.valueEstimate` as a (1,1) zero placeholder,
+  # parameters() does not include the value head tensors (so the
+  # optimizer doesn't update them), and save()/load() writes no sidecar.
+  # When true, forward() computes a two-layer MLP value head off the
+  # pooled embedding (hiddenDim -> hiddenDim -> 1) and returns a
+  # (batchRows, 1) scalar-per-graph value estimate; parameters() appends
+  # the four value-head tensors after the classifier tensors; save()
+  # writes them to a `.vh` sidecar alongside the main file.
+  #
+  # The architecture mirrors the classifier head's two-layer structure
+  # for consistency — a single linear head would be slightly cheaper
+  # but gives the critic one fewer hidden transformation than the
+  # actor, which is rarely what you want. Both heads share the
+  # message-passing trunk up through the mean-pool embedding and
+  # diverge afterwards: the actor path runs through
+  # classifierW1/B1/W2/B2 to produce logits, the critic path runs
+  # through valueHeadW1/B1/W2/B2 to produce a single scalar. This
+  # shared-trunk-but-separate-heads layout is the common pattern for
+  # on-policy actor-critic methods (CleanRL, SB3); the two heads
+  # compete less than a fully shared output because only the
+  # message-passing layers and the readout are shared.
+  #
+  # Initialization (applied in enableValueHead):
+  # valueHeadW1 : Kaiming-normal, matching classifierW1's recipe.
+  # valueHeadW2 : small-scale init with std=1.0. This matches the
+  # Andrychowicz et al. 2021 "value output layer std=1"
+  # convention (contrast with the policy output which
+  # uses std=0.01 — see Gnn.create comment for the
+  # policy rationale). The difference is deliberate:
+  # the policy wants a near-uniform softmax at init,
+  # the value wants a non-degenerate scalar spread
+  # so gradient flow into the head is observable
+  # from step one.
+  #
+  # Why the concrete-method pattern: per docs/issues/compiler-problems.
+  # 36.md, primitive-field mutations on a Gnn passed through the
+  # Trainer's generic `M` parameter do not propagate back to the
+  # caller. So the value head must be enabled on the concrete Gnn
+  # BEFORE it is handed to the Trainer — same pattern as
+  # enableObservationNormalization(). The Trainer only READS
+  # self.model.valueHeadEnabled / self.model.forward(...).valueEstimate.
+  valueHeadEnabled: bool
+  valueHeadW1: Tensor
+  valueHeadB1: Tensor
+  valueHeadW2: Tensor
+  valueHeadB2: Tensor
 
   static fn create(config: GnnConfig): Gnn =>
     var gnnLayers: GnnLayer[] = {}
@@ -128,6 +189,17 @@ struct Gnn =>
       initMean.push(0.0)
       initStd.push(1.0)
 
+    # Phase 4: placeholder value-head tensors. Zero-sized (1x1) until
+    # enableValueHead() is called; not part of parameters() until then
+    # so the optimizer never touches them and their pool slots are
+    # cheap. Flipping valueHeadEnabled=true without re-allocating
+    # would leave the head at the wrong shape, so the enable-method
+    # re-allocates these slots in place.
+    var vhPlaceholder1: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder2: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder3: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder4: Tensor = Tensor.zeros(1, 1)
+
     return Gnn {
       layers: gnnLayers,
       classifierW1: w1,
@@ -137,7 +209,12 @@ struct Gnn =>
       config: config,
       obsNormEnabled: false,
       obsMean: initMean,
-      obsStd: initStd
+      obsStd: initStd,
+      valueHeadEnabled: false,
+      valueHeadW1: vhPlaceholder1,
+      valueHeadB1: vhPlaceholder2,
+      valueHeadW2: vhPlaceholder3,
+      valueHeadB2: vhPlaceholder4
     }
 
   # Deterministic variant of create(): every Kaiming-initialized weight
@@ -177,6 +254,12 @@ struct Gnn =>
       initMean.push(0.0)
       initStd.push(1.0)
 
+    # Phase 4: placeholder value-head tensors (see Gnn.create comment).
+    var vhPlaceholder1: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder2: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder3: Tensor = Tensor.zeros(1, 1)
+    var vhPlaceholder4: Tensor = Tensor.zeros(1, 1)
+
     return Gnn {
       layers: gnnLayers,
       classifierW1: w1,
@@ -186,7 +269,12 @@ struct Gnn =>
       config: config,
       obsNormEnabled: false,
       obsMean: initMean,
-      obsStd: initStd
+      obsStd: initStd,
+      valueHeadEnabled: false,
+      valueHeadW1: vhPlaceholder1,
+      valueHeadB1: vhPlaceholder2,
+      valueHeadW2: vhPlaceholder3,
+      valueHeadB2: vhPlaceholder4
     }
 
   fn forward(graph: GraphTensors, training: bool): GnnOutput =>
@@ -239,10 +327,28 @@ struct Gnn =>
     var logits: Tensor = c.gnnMatmul(self.classifierW2).add(self.classifierB2)
     var probs: Tensor = logits.softmax(1)
 
+    # Phase 4: value head. Two-layer MLP off the same mean-pool
+    # embedding the classifier reads, mirroring the classifier's
+    # (hidden -> hidden -> output) shape but with a single scalar
+    # output per graph instead of numActions logits.
+    #
+    # When `valueHeadEnabled` is false we still need to put *something*
+    # into GnnOutput.valueEstimate so callers don't have to null-check.
+    # The placeholder (1,1) zero tensor set in create() is reused
+    # verbatim — ggml sees no extra ops in the recorded graph when
+    # nothing reads it, and the PPO loss op treats it as an inert input
+    # whenever valueCoeff == 0.
+    var valueEstimate: Tensor = self.valueHeadW1
+    if self.valueHeadEnabled =>
+      var vh: Tensor = embedding.gnnMatmul(self.valueHeadW1).add(self.valueHeadB1).relu()
+      vh = vh.dropout(self.config.dropoutRate, training)
+      valueEstimate = vh.gnnMatmul(self.valueHeadW2).add(self.valueHeadB2)
+
     return GnnOutput {
       probs: probs,
       logits: logits,
-      embedding: embedding
+      embedding: embedding,
+      valueEstimate: valueEstimate
     }
 
   # Predict on a list of graphs in inference mode. Equivalent to calling
@@ -273,6 +379,17 @@ struct Gnn =>
     params.push(self.classifierB1)
     params.push(self.classifierW2)
     params.push(self.classifierB2)
+    # Phase 4: append the value-head tensors only when the head is
+    # enabled. When disabled the head's placeholder tensors have shape
+    # (1,1) and carry no training signal, so keeping them out of
+    # parameters() prevents the optimizer from maintaining moment
+    # buffers for them and keeps existing tests' param-count
+    # expectations unchanged.
+    if self.valueHeadEnabled =>
+      params.push(self.valueHeadW1)
+      params.push(self.valueHeadB1)
+      params.push(self.valueHeadW2)
+      params.push(self.valueHeadB2)
     return params
 
   # Phase 1.2: enable observation normalization for this model, fitting
@@ -358,6 +475,59 @@ struct Gnn =>
     self.obsStd = stds
     self.obsNormEnabled = true
 
+  # Phase 4: enable the optional two-layer value head on this model
+  # for PPO value-function loss training.
+  #
+  # Shape and init:
+  # valueHeadW1 = (hiddenDim, hiddenDim), Kaiming-normal (seeded)
+  # valueHeadB1 = (1, hiddenDim)          zeros
+  # valueHeadW2 = (1, hiddenDim)          small-scale normal, std=1.0
+  # (Andrychowicz et al. 2021)
+  # valueHeadB2 = (1, 1)                  zero
+  #
+  # Seeds are offset from `seed` by +1000/+1001 so they decorrelate
+  # from any seeds that createWithSeed used for the layer and
+  # classifier weights. The +1000 stride is arbitrary but leaves
+  # plenty of room below it for future classifier extensions without
+  # colliding.
+  #
+  # IMPORTANT — call this on the concrete Gnn BEFORE constructing the
+  # Trainer:
+  #
+  # var model: Gnn = Gnn.createWithSeed(config, seed)
+  # model.enableValueHead(seed)
+  # var trainer = Trainer<Gnn, PpoClipped, OptimizerParams> {
+  # model: model, config: cfg, optimizer: opt, strategy: strat
+  # }
+  #
+  # Per docs/issues/compiler-problems.36.md, mutating `valueHeadEnabled`
+  # from inside Trainer.run (via a generic dispatch on `M`) would not
+  # persist to the caller's model — the Trainer holds a value copy and
+  # primitive-field writes on that copy are invisible after return.
+  # Calling this on the concrete `Gnn` before construction side-steps
+  # the whole problem: the mutation lands on the caller's variable,
+  # and the trainer only READS self.model.valueHeadEnabled (which
+  # field-reads through the generic correctly).
+  fn enableValueHead(seed: long): void =>
+    var hd: int = self.config.hiddenDim
+    var vw1: Tensor = Tensor.zeros(hd, hd)
+    var vb1: Tensor = Tensor.zeros(1, hd)
+    var vw2: Tensor = Tensor.zeros(1, hd)
+    var vb2: Tensor = Tensor.zeros(1, 1)
+    vw1.initKaimingSeeded(seed + 1000l)
+    # Andrychowicz et al. 2021 "What Matters in On-Policy RL": value
+    # output layer initialized with std=1 (vs. std=0.01 for the policy
+    # output layer). Rationale: the policy wants a near-uniform
+    # softmax at init, the value wants a non-degenerate scalar
+    # spread so the critic produces observable gradient signal from
+    # the first training step.
+    vw2.initSmallScaleSeeded(1.0, seed + 1001l)
+    self.valueHeadW1 = vw1
+    self.valueHeadB1 = vb1
+    self.valueHeadW2 = vw2
+    self.valueHeadB2 = vb2
+    self.valueHeadEnabled = true
+
   fn reset(): void =>
     sn_tensor_pool_reset()
 
@@ -368,7 +538,27 @@ struct Gnn =>
     sn_tensor_pool_restore(cp)
 
   fn save(path: str): void =>
-    ParameterSet.create(self.parameters()).save(path)
+    # Phase 4: the main save file contains ONLY the non-value-head
+    # parameters (layer weights + classifier head). Value-head
+    # parameters go to the `.vh` sidecar below. Keeping them out of
+    # the main file means a load() on an un-enabled model never sees
+    # orphaned value-head tensors and keeps the main format
+    # positional-load contract stable: [layer params ... classifier
+    # W1/B1/W2/B2]. Building the core list by re-walking the layer
+    # + classifier slots avoids the "parameters() minus last four"
+    # arithmetic, which would drift if the parameters() layout ever
+    # changes.
+    var coreParams: Tensor[] = {}
+    for var i: int = 0; i < len(self.layers); i++ =>
+      var layerParams: Tensor[] = self.layers[i].parameters()
+      for var j: int = 0; j < len(layerParams); j++ =>
+        coreParams.push(layerParams[j])
+    coreParams.push(self.classifierW1)
+    coreParams.push(self.classifierB1)
+    coreParams.push(self.classifierW2)
+    coreParams.push(self.classifierB2)
+    ParameterSet.create(coreParams).save(path)
+
     # Phase 1.2: persist observation-normalization state to a sidecar
     # file `<path>.buf` when enabled. Keeps the main save format
     # untouched (existing loaders keep working verbatim) and turns
@@ -381,6 +571,23 @@ struct Gnn =>
       var stdT: Tensor = Tensor.fromDoubles(self.obsStd, 1, fd)
       var bufSet: Tensor[] = {meanT, stdT}
       ParameterSet.create(bufSet).save(path + ".buf")
+
+    # Phase 4: persist value-head tensors to a `.vh` sidecar when the
+    # head is enabled. Same mechanism as the obs-norm sidecar: the
+    # existence of the file IS the "this model has a value head" flag,
+    # no format version byte needed. The sidecar holds exactly four
+    # tensors in parameters()-order: [valueHeadW1, B1, W2, B2]. When
+    # load() probes for the sidecar and finds it, it reads the four
+    # tensors AND flips valueHeadEnabled=true so forward() starts
+    # routing the critic path.
+    if self.valueHeadEnabled =>
+      var vhSet: Tensor[] = {
+        self.valueHeadW1,
+        self.valueHeadB1,
+        self.valueHeadW2,
+        self.valueHeadB2
+      }
+      ParameterSet.create(vhSet).save(path + ".vh")
 
   fn load(path: str): void =>
     var ps: ParameterSet = ParameterSet.load(path)
@@ -430,3 +637,22 @@ struct Gnn =>
         self.obsNormEnabled = true
     else =>
       self.obsNormEnabled = false
+
+    # Phase 4: probe for the `.vh` sidecar and restore the value head
+    # tensors if present. Same pattern as `.buf` — sidecar existence
+    # is the enable flag, no format version byte needed. On a hit we
+    # overwrite the placeholder (1,1) value-head tensors with the
+    # saved ones and flip valueHeadEnabled=true so subsequent
+    # forward() calls route through the critic path. On a miss the
+    # placeholders stay in place and valueHeadEnabled stays false.
+    var vhPath: str = path + ".vh"
+    if sn_file_exists(vhPath) =>
+      var vhSet: ParameterSet = ParameterSet.load(vhPath)
+      if vhSet.count() >= 4 =>
+        self.valueHeadW1 = vhSet.get(0)
+        self.valueHeadB1 = vhSet.get(1)
+        self.valueHeadW2 = vhSet.get(2)
+        self.valueHeadB2 = vhSet.get(3)
+        self.valueHeadEnabled = true
+    else =>
+      self.valueHeadEnabled = false

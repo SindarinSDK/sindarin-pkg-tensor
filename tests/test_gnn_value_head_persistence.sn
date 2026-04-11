@@ -1,0 +1,118 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+import "../src/gnn"
+
+# ===========================================================================
+# test_gnn_value_head_persistence.sn — Phase 4.1 save/load sidecar
+#
+# Verifies the .vh sidecar contract added for the optional value head:
+#
+# Part A — Roundtrip with value head enabled.
+# Enable the value head on model M1, save to a temp path, load into
+# a fresh model M2, assert:
+# - M2.valueHeadEnabled == true after load()
+# - M2.forward(probe).valueEstimate matches M1's to 1e-6
+# - M2.parameters() has the same count as M1
+# - M2.forward(probe).probs matches M1's to 1e-6 (policy path
+# must not regress — the value head is additive)
+#
+# Part B — Save without the value head writes no .vh sidecar.
+# Save a vanilla (non-value-head) M3 to a separate path and confirm
+# sn_file_exists(path + ".vh") is false. Load into a fresh M4 and
+# confirm M4.valueHeadEnabled stays false.
+#
+# Part C — A fresh model that enables the head then loads a non-VH
+# save file flips back to disabled.
+# Prevents a stale value head from surviving a load of a saved
+# model that doesn't have one. The .vh sidecar's absence is
+# authoritative.
+# ===========================================================================
+
+fn singleNodeGraph(features: double[]): GraphTensors =>
+  return GraphTensors {
+    nodeFeatures: Tensor.fromDoubles(features, 1, 3),
+    edgeIndex: Tensor.fromDoubles({0.0, 0.0}, 2, 1),
+    edgeWeight: Tensor.fromDoubles({1.0}, 1, 1),
+    batchIndex: Tensor.fromDoubles({0.0}, 1, 1),
+    numNodes: 1, numEdges: 1, featureDim: 3
+  }
+
+fn makeConfig(): GnnConfig =>
+  return GnnConfig {
+    inputDim: 3, hiddenDim: 8, numActions: 2,
+    numLayers: 1, arch: "gat", dropoutRate: 0.0
+  }
+
+fn main(): void =>
+  println("=== test_gnn_value_head_persistence ===")
+
+  var probe: GraphTensors = singleNodeGraph({0.3, 0.7, 0.5})
+
+  # -------------------------------------------------------------------------
+  # Part A: roundtrip with VH enabled
+  # -------------------------------------------------------------------------
+  println("--- Part A: roundtrip with value head enabled ---")
+  var m1: Gnn = Gnn.createWithSeed(makeConfig(), 11l)
+  m1.enableValueHead(1111l)
+  var m1Out: GnnOutput = m1.forward(probe, false)
+  var m1Value: double[] = m1Out.valueEstimate.toDoubles()
+  var m1Probs: double[] = m1Out.probs.toDoubles()
+  var m1ParamCount: int = len(m1.parameters())
+
+  var pathA: str = "/tmp/test_gnn_value_head_persistence_A.bin"
+  m1.save(pathA)
+  assertTrue(sn_file_exists(pathA + ".vh"),
+    "A: .vh sidecar exists after save when value head is enabled")
+
+  var m2: Gnn = Gnn.createWithSeed(makeConfig(), 999l)
+  assertFalse(m2.valueHeadEnabled, "A: fresh m2 starts with disabled value head")
+  m2.load(pathA)
+  assertTrue(m2.valueHeadEnabled, "A: m2 flips valueHeadEnabled=true after load")
+  assertEqualInt(len(m2.parameters()), m1ParamCount,
+    "A: m2 parameter count matches m1 after load")
+
+  var m2Out: GnnOutput = m2.forward(probe, false)
+  var m2Value: double[] = m2Out.valueEstimate.toDoubles()
+  var m2Probs: double[] = m2Out.probs.toDoubles()
+
+  assertEqualInt(len(m2Value), len(m1Value),
+    "A: loaded valueEstimate has same length as saved")
+  assertApproxDouble(m2Value[0], m1Value[0], 0.000001,
+    "A: valueEstimate roundtrips through save/load")
+
+  for var i: int = 0; i < len(m1Probs); i++ =>
+    assertApproxDouble(m2Probs[i], m1Probs[i], 0.000001,
+      $"A: probs[{i}] roundtrips (policy path unchanged by value head)")
+
+  # -------------------------------------------------------------------------
+  # Part B: save without value head writes no sidecar
+  # -------------------------------------------------------------------------
+  println("--- Part B: no sidecar when value head is disabled ---")
+  var m3: Gnn = Gnn.createWithSeed(makeConfig(), 22l)
+  assertFalse(m3.valueHeadEnabled, "B: m3 starts disabled")
+  var pathB: str = "/tmp/test_gnn_value_head_persistence_B.bin"
+  m3.save(pathB)
+  assertFalse(sn_file_exists(pathB + ".vh"),
+    "B: .vh sidecar absent after save without value head enabled")
+
+  var m4: Gnn = Gnn.createWithSeed(makeConfig(), 999l)
+  m4.load(pathB)
+  assertFalse(m4.valueHeadEnabled,
+    "B: m4 stays disabled after loading a non-value-head save")
+
+  # -------------------------------------------------------------------------
+  # Part C: a previously-enabled model that loads a non-VH save flips off
+  # -------------------------------------------------------------------------
+  println("--- Part C: stale value head does not survive a non-VH load ---")
+  var m5: Gnn = Gnn.createWithSeed(makeConfig(), 33l)
+  m5.enableValueHead(3333l)
+  assertTrue(m5.valueHeadEnabled, "C: m5 starts enabled")
+  m5.load(pathB)
+  assertFalse(m5.valueHeadEnabled,
+    "C: m5 flips off after loading a save file with no .vh sidecar")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0
