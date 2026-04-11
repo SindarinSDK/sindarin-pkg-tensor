@@ -1,0 +1,172 @@
+import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
+import "sindarin-pkg-sdk/src/core/math"
+import "../src/tensor"
+
+# ===========================================================================
+# test_init_orthogonal.sn — Phase 3 regression guard
+#
+# Direct unit test of Tensor.initOrthogonalSeeded. Verifies:
+#
+# Part A — Orthogonality math on a square matrix:
+# Initialize a (d, d) tensor with gain=1.0; assert each row has L2
+# norm 1.0 (within 1e-5) and every pair of distinct rows has dot
+# product 0.0 (within 1e-5). This is the definition of an
+# orthonormal basis, the property that makes orthogonal init useful
+# for deep-net gradient flow.
+#
+# Part B — Rectangular (rows < cols) case:
+# Initialize a (3, 16) tensor — the typical shape for a PPO policy
+# head (numActions x hiddenDim). Assert that the 3 rows are each
+# unit-norm and mutually orthogonal in the 16-dim embedding space.
+#
+# Part C — Gain scaling:
+# Initialize a (4, 8) tensor with gain=0.01 (the Andrychowicz policy-
+# head convention). Assert each row's L2 norm is 0.01 within 1e-6.
+# Pair with gain=2.0 and assert the same.
+#
+# Part D — Determinism:
+# Two tensors initialized with the same seed and gain produce bit-
+# identical element values. Two tensors with different seeds do NOT.
+#
+# Part E — No NaN or Inf:
+# The Box-Muller + Gram-Schmidt pipeline has log(u1) and division
+# by norm steps that could produce NaN/Inf on degenerate inputs.
+# Run a large (32, 32) init and confirm every element is finite.
+# ===========================================================================
+
+fn l2NormRow(data: double[], rowIdx: int, cols: int): double =>
+  var sum: double = 0.0
+  for var c: int = 0; c < cols; c++ =>
+    var v: double = data[rowIdx * cols + c]
+    sum = sum + v * v
+  return sqrt(sum)
+
+fn dotRows(data: double[], rowA: int, rowB: int, cols: int): double =>
+  var sum: double = 0.0
+  for var c: int = 0; c < cols; c++ =>
+    sum = sum + data[rowA * cols + c] * data[rowB * cols + c]
+  return sum
+
+fn main(): void =>
+  println("=== test_init_orthogonal ===")
+
+  # -------------------------------------------------------------------
+  # Part A — Square matrix, gain=1.0
+  # -------------------------------------------------------------------
+  println("--- Part A: square (8x8) matrix with gain=1.0 ---")
+  var tA: Tensor = Tensor.zeros(8, 8)
+  tA.initOrthogonalSeeded(1.0, 42l)
+  var dataA: double[] = tA.toDoubles()
+  assertEqualInt(len(dataA), 64, "Part A: tensor has 8*8 = 64 elements")
+
+  for var r: int = 0; r < 8; r++ =>
+    var n: double = l2NormRow(dataA, r, 8)
+    assertApproxDouble(n, 1.0, 0.00001, $"Part A: row {r} has L2 norm 1.0")
+
+  for var i: int = 0; i < 8; i++ =>
+    for var j: int = i + 1; j < 8; j++ =>
+      var d: double = dotRows(dataA, i, j, 8)
+      assertApproxDouble(d, 0.0, 0.00001, $"Part A: rows {i} and {j} are orthogonal")
+
+  # -------------------------------------------------------------------
+  # Part B — Rectangular rows < cols (policy head shape)
+  # -------------------------------------------------------------------
+  println("--- Part B: rectangular (3x16) policy-head shape ---")
+  var tB: Tensor = Tensor.zeros(3, 16)
+  tB.initOrthogonalSeeded(1.0, 7l)
+  var dataB: double[] = tB.toDoubles()
+  assertEqualInt(len(dataB), 48, "Part B: tensor has 3*16 = 48 elements")
+
+  for var r: int = 0; r < 3; r++ =>
+    var n: double = l2NormRow(dataB, r, 16)
+    assertApproxDouble(n, 1.0, 0.00001, $"Part B: row {r} has L2 norm 1.0")
+
+  for var i: int = 0; i < 3; i++ =>
+    for var j: int = i + 1; j < 3; j++ =>
+      var d: double = dotRows(dataB, i, j, 16)
+      assertApproxDouble(d, 0.0, 0.00001, $"Part B: rows {i} and {j} are orthogonal in 16-dim space")
+
+  # -------------------------------------------------------------------
+  # Part C — Gain scaling
+  # -------------------------------------------------------------------
+  println("--- Part C: gain scaling ---")
+
+  var tSmall: Tensor = Tensor.zeros(4, 8)
+  tSmall.initOrthogonalSeeded(0.01, 99l)
+  var dataSmall: double[] = tSmall.toDoubles()
+  for var r: int = 0; r < 4; r++ =>
+    var n: double = l2NormRow(dataSmall, r, 8)
+    assertApproxDouble(n, 0.01, 0.000001, $"Part C: gain=0.01 row {r} has L2 norm 0.01")
+
+  var tBig: Tensor = Tensor.zeros(4, 8)
+  tBig.initOrthogonalSeeded(2.0, 99l)
+  var dataBig: double[] = tBig.toDoubles()
+  for var r: int = 0; r < 4; r++ =>
+    var n: double = l2NormRow(dataBig, r, 8)
+    assertApproxDouble(n, 2.0, 0.00001, $"Part C: gain=2.0 row {r} has L2 norm 2.0")
+
+  # Orthogonality must hold for any gain.
+  for var i: int = 0; i < 4; i++ =>
+    for var j: int = i + 1; j < 4; j++ =>
+      var d: double = dotRows(dataSmall, i, j, 8)
+      # Dot product scales with gain^2, so the threshold scales too.
+      # For gain=0.01, 0*0.0001 = 0, so the bound is still ~0.
+      assertApproxDouble(d, 0.0, 0.000001, $"Part C: gain=0.01 rows {i},{j} orthogonal")
+
+  # -------------------------------------------------------------------
+  # Part D — Determinism
+  # -------------------------------------------------------------------
+  println("--- Part D: determinism (seed reproducibility) ---")
+  var t1: Tensor = Tensor.zeros(4, 8)
+  t1.initOrthogonalSeeded(1.0, 123l)
+  var d1: double[] = t1.toDoubles()
+
+  var t2: Tensor = Tensor.zeros(4, 8)
+  t2.initOrthogonalSeeded(1.0, 123l)
+  var d2: double[] = t2.toDoubles()
+
+  var sameMaxDelta: double = 0.0
+  for var i: int = 0; i < len(d1); i++ =>
+    var delta: double = d1[i] - d2[i]
+    if delta < 0.0 =>
+      delta = -delta
+    if delta > sameMaxDelta =>
+      sameMaxDelta = delta
+  assertApproxDouble(sameMaxDelta, 0.0, 0.00000001, "Part D: same seed produces bit-identical values")
+
+  var t3: Tensor = Tensor.zeros(4, 8)
+  t3.initOrthogonalSeeded(1.0, 456l)
+  var d3: double[] = t3.toDoubles()
+
+  var diffMaxDelta: double = 0.0
+  for var i: int = 0; i < len(d1); i++ =>
+    var delta: double = d1[i] - d3[i]
+    if delta < 0.0 =>
+      delta = -delta
+    if delta > diffMaxDelta =>
+      diffMaxDelta = delta
+  assertTrue(diffMaxDelta > 0.01, "Part D: different seeds produce measurably different values")
+
+  # -------------------------------------------------------------------
+  # Part E — Finiteness on large matrix
+  # -------------------------------------------------------------------
+  println("--- Part E: no NaN or Inf on a 32x32 init ---")
+  var tE: Tensor = Tensor.zeros(32, 32)
+  tE.initOrthogonalSeeded(1.0, 31415l)
+  var dataE: double[] = tE.toDoubles()
+  var hasBad: bool = false
+  for var i: int = 0; i < len(dataE); i++ =>
+    var v: double = dataE[i]
+    if v != v =>
+      hasBad = true
+  assertTrue(!hasBad, "Part E: no NaN in 32x32 orthogonal init")
+
+  # Row norms still 1.0 on the larger matrix.
+  for var r: int = 0; r < 32; r++ =>
+    var n: double = l2NormRow(dataE, r, 32)
+    assertApproxDouble(n, 1.0, 0.0001, $"Part E: row {r} has L2 norm 1.0 on 32x32")
+
+  summary()
+  if failed() > 0 =>
+    var crash: int = 1 / 0

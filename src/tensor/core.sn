@@ -136,6 +136,22 @@ native struct Tensor as ref =>
   fn initSmallScaleSeeded(std: double, seed: long): void =>
     sn_tensor_init_small_scale_seeded(self, std, seed)
 
+  # Phase 3: orthogonal init (Saxe et al. 2014). Rows of the tensor
+  # become orthonormal vectors scaled by `gain`. Standard PPO recipe:
+  # - gain=0.01 for the policy output head (keeps π near uniform at
+  # init, matches the effect of small-scale init but with the
+  # additional "rows are orthogonal directions in feature space"
+  # property that stabilizes gradient flow)
+  # - gain=1.0 for value heads and tanh hidden weights
+  # - gain=sqrt(2) for ReLU hidden weights (Kaiming-equivalent for
+  # orthogonal matrices)
+  # Requires rows <= cols for true orthogonality; the rows>cols case
+  # zeros out the trailing rows after Gram-Schmidt runs out of basis
+  # vectors (deliberately not handled transparently — not needed by
+  # any real use case in this package).
+  fn initOrthogonalSeeded(gain: double, seed: long): void =>
+    sn_tensor_init_orthogonal_seeded(self, gain, seed)
+
 # ---------------------------------------------------------------------------
 # Native function declarations
 # ---------------------------------------------------------------------------
@@ -181,6 +197,7 @@ native fn sn_tensor_init_kaiming(t: Tensor): void
 native fn sn_tensor_init_kaiming_seeded(t: Tensor, seed: long): void
 native fn sn_tensor_init_small_scale(t: Tensor, std: double): void
 native fn sn_tensor_init_small_scale_seeded(t: Tensor, std: double, seed: long): void
+native fn sn_tensor_init_orthogonal_seeded(t: Tensor, gain: double, seed: long): void
 native fn sn_gpu_available(): bool
 native fn sn_tensor_to_device(t: Tensor, device: str): Tensor
 native fn sn_model_save(params: Tensor[], path: str): void
