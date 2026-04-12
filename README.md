@@ -354,3 +354,9 @@ Tensor operations run on the [ggml](https://github.com/ggerganov/ggml) backend:
 
 - `sindarin-pkg-sdk` (transitive, for core types and `Random`)
 - `ggml`, `ggml-base`, `ggml-cpu` (built from the overlay port under `vcpkg-overlay/ggml/`)
+
+## License
+
+This package is licensed under the [MIT License](LICENSE).
+
+The vendored [ggml](https://github.com/ggerganov/ggml) library is also MIT-licensed. See `vendor/ggml/LICENSE` for details.
