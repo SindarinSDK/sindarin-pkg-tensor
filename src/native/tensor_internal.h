@@ -144,6 +144,17 @@ extern struct ggml_opt_optimizer_params g_opt_params;
 struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata);
 
 /* ======================================================================
+ * Optimizer state persistence (defined in tensor_record.sn.c)
+ *
+ * sn_opt_state_save writes the AdamW m/v moment buffers and the iter
+ * counter to a binary file. sn_opt_state_set_restore stores a path
+ * that the lazy-init block in sn_graph_train_epoch_impl will pick up
+ * on the next training cycle.
+ * ====================================================================== */
+
+extern char *g_opt_restore_path;
+
+/* ======================================================================
  * Training metric callback (defined in tensor_train.sn.c)
  * ====================================================================== */
 

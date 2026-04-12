@@ -316,6 +316,14 @@ native fn sn_graph_train_epoch(
 # See docs/issues/ppo-clipped-objective.md for the design note.
 native fn sn_graph_set_grad_clip_norm(v: double): void
 
+# Optimizer state persistence — save/load AdamW m/v moment buffers
+# across training rounds. sn_opt_state_save writes the current
+# g_opt_ctx moments to a binary file. sn_opt_state_set_restore stores
+# a path that the lazy-init block in the training driver will load
+# from on the next cycle. Both are no-ops when the path is empty.
+native fn sn_opt_state_save(path: str): void
+native fn sn_opt_state_set_restore(path: str): void
+
 native fn sn_graph_train_epoch_ppo(
   loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
   oldLogProbs: Tensor,

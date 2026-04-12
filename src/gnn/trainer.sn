@@ -127,6 +127,20 @@ struct TrainConfig =>
   # zero overhead). A typical enabled value is 0.01 to 0.02 for PPO
   # — matches SB3's recommendation.
   targetKl: double
+  # Optimizer state persistence. When optStateRestorePath is non-empty,
+  # the training loop loads AdamW m/v moments + iter counter from a
+  # `.opt` sidecar file before the first epoch, giving the optimizer
+  # continuity across training rounds. When optStateSavePath is non-
+  # empty, the moments are saved after the last epoch. Both default to
+  # "" (disabled).
+  optStateRestorePath: str
+  optStateSavePath: str
+  # PPO clip epsilon for clip-fraction diagnostics. When > 0.0,
+  # Trainer.run() computes the fraction of policy ratios that were
+  # clipped per epoch and reports it in TrainResult.clipFracCurve.
+  # Set to the PPO strategy's epsilon (typically 0.2). Default 0.0
+  # disables clip-fraction tracking.
+  clipEpsilon: double
 
   static fn create(epochs: int, batchSize: int, seed: long): TrainConfig =>
     return TrainConfig {
@@ -138,7 +152,10 @@ struct TrainConfig =>
       normalizeObservations: false,
       lrSchedule: LrSchedule.constant(),
       gradClipNorm: 0.0,
-      targetKl: 0.0
+      targetKl: 0.0,
+      optStateRestorePath: "",
+      optStateSavePath: "",
+      clipEpsilon: 0.0
     }
 
 # ---------------------------------------------------------------------------
@@ -223,6 +240,12 @@ struct TrainResult =>
   # Length matches the number of COMPLETED epochs (same semantics as
   # lossCurve / klCurve under target-KL early stop).
   valueLossCurve: double[]
+  # Per-epoch clip fraction: fraction of policy ratios that fell
+  # outside [1-epsilon, 1+epsilon] after each epoch's training step.
+  # Healthy range: 0.1-0.3. Zero means the policy isn't moving. >0.5
+  # means updates are too aggressive. Only populated when
+  # TrainConfig.clipEpsilon > 0.0; otherwise empty.
+  clipFracCurve: double[]
 
 # ---------------------------------------------------------------------------
 # Trainer<M, S, O>
@@ -278,6 +301,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       var emptyD6: double[] = {}
       var emptyD7: double[] = {}
       var emptyD8: double[] = {}
+      var emptyD9: double[] = {}
       return TrainResult {
         loss: 0.0,
         accuracy: 0.0,
@@ -294,7 +318,8 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         lrCurve: emptyD6,
         klCurve: emptyD7,
         stoppedEarly: false,
-        valueLossCurve: emptyD8
+        valueLossCurve: emptyD8,
+        clipFracCurve: emptyD9
       }
 
     var totalSamples: int = len(graphs)
@@ -530,6 +555,11 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # none) starts from a clean slate.
     sn_graph_set_grad_clip_norm(self.config.gradClipNorm)
 
+    # Optimizer state: set the deferred restore path so the native lazy-
+    # init block uploads saved AdamW moments on the first training batch.
+    if self.config.optStateRestorePath != "" =>
+      sn_opt_state_set_restore(self.config.optStateRestorePath + ".opt")
+
     # --- Open a record session and build the static training graph. -------
     var session: RecordSession = RecordSession.open()
 
@@ -605,6 +635,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # the full training set between current V_θ(s) and the
     # value targets (advantages + V_old captured pre-training).
     var valueLossCurve: double[] = {}
+    var clipFracCurve: double[] = {}
 
     # Capture the base LR before the epoch loop so the schedule can
     # compute effectiveLr(baseLr, epoch, totalEpochs) from a fixed
@@ -637,7 +668,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         # Bundle up the per-epoch context and hand it to the strategy's
         # dispatcher. WeightedCrossEntropy calls sn_graph_train_epoch;
         # PpoClipped calls sn_graph_train_epoch_ppo with its extras.
-        var ctx: EpochContext = EpochContext {
+        var ctx: EpochContext = {
           loss: loss,
           features: nodeFeaturesInput,
           labels: labelsInput,
@@ -710,18 +741,13 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
 
         epochsCompleted = epochsCompleted + 1
 
-        # Phase 2: target-KL drift check. Pause the record session
-        # (so inference forward passes don't add nodes to the
-        # recorded training graph), checkpoint the tensor pool
-        # (so intermediate allocations get reclaimed), run the
-        # current model's forward over every training sample,
-        # compute the mean KL divergence between the current
-        # distributions and the initial snapshot, restore the pool,
-        # and resume recording. If KL > targetKl, set stoppedEarly
-        # and break out of the epoch loop — the model stays at
-        # this epoch's post-update state, which is the "moved
-        # but not ridiculously far" snapshot.
-        if self.config.targetKl > 0.0 =>
+        # Per-epoch diagnostics: KL divergence and clip fraction.
+        # Both require a forward pass over every training sample to
+        # get the current policy's predictions. The forward pass is
+        # amortized — run once, used for both metrics. Gated on
+        # either targetKl > 0 or clipEpsilon > 0.
+        var needDiagForward: bool = self.config.targetKl > 0.0 || self.config.clipEpsilon > 0.0
+        if needDiagForward =>
           var cp: long = sn_tensor_pool_checkpoint()
           var prevRec: bool = sn_graph_pause_recording()
 
@@ -734,27 +760,53 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
           sn_graph_resume_recording(prevRec)
           sn_tensor_pool_restore(cp)
 
-          # Mean per-sample KL(current || initial). distributionDivergence
-          # with kind="kl" computes KL(a || b) = Σ a_i * log(a_i / b_i),
-          # so passing (current, initial) measures "how far new has
-          # drifted away from where it started" — the SB3 target_kl
-          # semantic.
-          var klSum: double = 0.0
-          for var i: int = 0; i < totalSamples; i++ =>
-            var a: double[] = {}
-            var b: double[] = {}
-            for var j: int = 0; j < numClasses; j++ =>
-              a.push(currentProbsFlat[i * numClasses + j])
-              b.push(initialProbsFlat[i * numClasses + j])
-            klSum = klSum + distributionDivergence(a, b, "kl")
-          var klMean: double = klSum / totalSamples.toDouble()
-          klCurve.push(klMean)
+          # KL divergence: mean per-sample KL(current || initial).
+          if self.config.targetKl > 0.0 =>
+            var klSum: double = 0.0
+            for var i: int = 0; i < totalSamples; i++ =>
+              var a: double[] = {}
+              var b: double[] = {}
+              for var j: int = 0; j < numClasses; j++ =>
+                a.push(currentProbsFlat[i * numClasses + j])
+                b.push(initialProbsFlat[i * numClasses + j])
+              klSum = klSum + distributionDivergence(a, b, "kl")
+            var klMean: double = klSum / totalSamples.toDouble()
+            klCurve.push(klMean)
+            MetricEmitter.emit("kl_divergence", klMean, epochLabels)
 
-          MetricEmitter.emit("kl_divergence", klMean, epochLabels)
+            if klMean > self.config.targetKl =>
+              stoppedEarly = true
 
-          if klMean > self.config.targetKl =>
-            stoppedEarly = true
+          # Clip fraction: for each sample, compute the policy ratio
+          # for the taken action and count how many fall outside
+          # [1-epsilon, 1+epsilon].
+          if self.config.clipEpsilon > 0.0 =>
+            var clipCount: int = 0
+            var epsClip: double = self.config.clipEpsilon
+            for var i: int = 0; i < totalSamples; i++ =>
+              # Find the taken action from the one-hot targets.
+              var takenIdx: int = 0
+              for var j: int = 0; j < numClasses; j++ =>
+                if targets[i * numClasses + j] > 0.5 =>
+                  takenIdx = j
+              var piNew: double = currentProbsFlat[i * numClasses + takenIdx]
+              var piOld: double = initialProbsFlat[i * numClasses + takenIdx]
+              if piOld < 0.000000001 =>
+                piOld = 0.000000001
+              var ratio: double = piNew / piOld
+              if ratio < 1.0 - epsClip || ratio > 1.0 + epsClip =>
+                clipCount = clipCount + 1
+            var clipFrac: double = clipCount.toDouble() / totalSamples.toDouble()
+            clipFracCurve.push(clipFrac)
+            MetricEmitter.emit("clip_fraction", clipFrac, epochLabels)
+
+          if stoppedEarly =>
             break
+
+    # Optimizer state: save m/v moments before the session tears down
+    # g_opt_ctx. Must happen while the opt context is still alive.
+    if self.config.optStateSavePath != "" =>
+      sn_opt_state_save(self.config.optStateSavePath + ".opt")
 
     session.dispose()
 
@@ -865,5 +917,6 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       lrCurve: lrCurve,
       klCurve: klCurve,
       stoppedEarly: stoppedEarly,
-      valueLossCurve: valueLossCurve
+      valueLossCurve: valueLossCurve,
+      clipFracCurve: clipFracCurve
     }

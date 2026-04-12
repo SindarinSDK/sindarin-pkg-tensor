@@ -109,6 +109,7 @@ struct Gnn =>
   obsNormEnabled: bool
   obsMean: double[]
   obsStd: double[]
+  obsCount: long
   # Phase 4: optional value head for PPO value-function loss.
   #
   # `valueHeadEnabled` gates the whole mechanism — when false (default),
@@ -210,6 +211,7 @@ struct Gnn =>
       obsNormEnabled: false,
       obsMean: initMean,
       obsStd: initStd,
+      obsCount: 0l,
       valueHeadEnabled: false,
       valueHeadW1: vhPlaceholder1,
       valueHeadB1: vhPlaceholder2,
@@ -270,6 +272,7 @@ struct Gnn =>
       obsNormEnabled: false,
       obsMean: initMean,
       obsStd: initStd,
+      obsCount: 0l,
       valueHeadEnabled: false,
       valueHeadW1: vhPlaceholder1,
       valueHeadB1: vhPlaceholder2,
@@ -425,55 +428,96 @@ struct Gnn =>
   # Stats are computed over EVERY node across EVERY graph. Features
   # with zero population variance get std=1.0 (mean-centred, no div-by-
   # zero) so constant features are a no-op rather than NaN.
+  # Compute or update observation normalization stats from a batch of
+  # graphs. On first call (obsNormEnabled=false or obsCount=0), computes
+  # fresh population stats. On subsequent calls, merges the new batch
+  # stats with the existing running stats via Welford's parallel
+  # algorithm — numerically stable incremental mean/variance.
+  #
+  # This gives the normalizer continuity across training rounds: each
+  # round's stats are a weighted blend of all prior rounds, preventing
+  # the discontinuous normalization jumps that a per-round one-shot
+  # recalculation produces.
   fn enableObservationNormalization(graphs: GraphTensors[]): void =>
     var nGraphs: int = len(graphs)
     if nGraphs == 0 =>
       return
 
     var fd: int = self.config.inputDim
-    var totalRows: int = 0
+    var batchCount: long = 0l
     for var i: int = 0; i < nGraphs; i++ =>
-      totalRows = totalRows + graphs[i].numNodes
-    if totalRows == 0 =>
+      batchCount = batchCount + graphs[i].numNodes.toLong()
+    if batchCount == 0l =>
       return
 
-    var sums: double[] = {}
+    # Compute batch mean.
+    var batchSums: double[] = {}
     for var c: int = 0; c < fd; c++ =>
-      sums.push(0.0)
+      batchSums.push(0.0)
     for var i: int = 0; i < nGraphs; i++ =>
       var nn: int = graphs[i].numNodes
       var f: double[] = graphs[i].nodeFeatures.toDoubles()
       for var r: int = 0; r < nn; r++ =>
         for var c: int = 0; c < fd; c++ =>
-          sums[c] = sums[c] + f[r * fd + c]
-
-    var means: double[] = {}
+          batchSums[c] = batchSums[c] + f[r * fd + c]
+    var batchMean: double[] = {}
     for var c: int = 0; c < fd; c++ =>
-      means.push(sums[c] / totalRows.toDouble())
+      batchMean.push(batchSums[c] / batchCount.toDouble())
 
-    var sqs: double[] = {}
+    # Compute batch variance.
+    var batchVarSums: double[] = {}
     for var c: int = 0; c < fd; c++ =>
-      sqs.push(0.0)
+      batchVarSums.push(0.0)
     for var i: int = 0; i < nGraphs; i++ =>
       var nn: int = graphs[i].numNodes
       var f: double[] = graphs[i].nodeFeatures.toDoubles()
       for var r: int = 0; r < nn; r++ =>
         for var c: int = 0; c < fd; c++ =>
-          var d: double = f[r * fd + c] - means[c]
-          sqs[c] = sqs[c] + d * d
+          var d: double = f[r * fd + c] - batchMean[c]
+          batchVarSums[c] = batchVarSums[c] + d * d
+    var batchVar: double[] = {}
+    for var c: int = 0; c < fd; c++ =>
+      batchVar.push(batchVarSums[c] / batchCount.toDouble())
 
-    var stds: double[] = {}
     var eps: double = 0.00000001
-    for var c: int = 0; c < fd; c++ =>
-      var variance: double = sqs[c] / totalRows.toDouble()
-      var stdV: double = sqrt(variance)
-      if stdV < eps =>
-        stdV = 1.0
-      stds.push(stdV)
 
-    self.obsMean = means
-    self.obsStd = stds
-    self.obsNormEnabled = true
+    if !self.obsNormEnabled || self.obsCount == 0l =>
+      # First call — use batch stats directly.
+      var stds: double[] = {}
+      for var c: int = 0; c < fd; c++ =>
+        var stdV: double = sqrt(batchVar[c])
+        if stdV < eps =>
+          stdV = 1.0
+        stds.push(stdV)
+      self.obsMean = batchMean
+      self.obsStd = stds
+      self.obsCount = batchCount
+      self.obsNormEnabled = true
+    else =>
+      # Welford parallel merge: combine running (mean, var, count)
+      # with the new batch (batchMean, batchVar, batchCount).
+      var runCount: long = self.obsCount
+      var totalCount: long = runCount + batchCount
+      var mergedMean: double[] = {}
+      var mergedStd: double[] = {}
+      for var c: int = 0; c < fd; c++ =>
+        var delta: double = batchMean[c] - self.obsMean[c]
+        var newMean: double = self.obsMean[c] + delta * batchCount.toDouble() / totalCount.toDouble()
+
+        # Welford M2 merge: M2_total = M2_a + M2_b + delta^2 * n_a * n_b / n_total
+        var runningVar: double = self.obsStd[c] * self.obsStd[c]
+        var m2a: double = runningVar * runCount.toDouble()
+        var m2b: double = batchVar[c] * batchCount.toDouble()
+        var m2Total: double = m2a + m2b + delta * delta * runCount.toDouble() * batchCount.toDouble() / totalCount.toDouble()
+        var newVar: double = m2Total / totalCount.toDouble()
+        var stdV: double = sqrt(newVar)
+        if stdV < eps =>
+          stdV = 1.0
+        mergedMean.push(newMean)
+        mergedStd.push(stdV)
+      self.obsMean = mergedMean
+      self.obsStd = mergedStd
+      self.obsCount = totalCount
 
   # Phase 4: enable the optional two-layer value head on this model
   # for PPO value-function loss training.
@@ -569,7 +613,9 @@ struct Gnn =>
       var fd: int = self.config.inputDim
       var meanT: Tensor = Tensor.fromDoubles(self.obsMean, 1, fd)
       var stdT: Tensor = Tensor.fromDoubles(self.obsStd, 1, fd)
-      var bufSet: Tensor[] = {meanT, stdT}
+      var countArr: double[] = {self.obsCount.toDouble()}
+      var countT: Tensor = Tensor.fromDoubles(countArr, 1, 1)
+      var bufSet: Tensor[] = {meanT, stdT, countT}
       ParameterSet.create(bufSet).save(path + ".buf")
 
     # Phase 4: persist value-head tensors to a `.vh` sidecar when the
@@ -635,8 +681,21 @@ struct Gnn =>
         self.obsMean = bufSet.get(0).toDoubles()
         self.obsStd = bufSet.get(1).toDoubles()
         self.obsNormEnabled = true
+        # New format includes a third (1,1) tensor holding the running
+        # observation count. Old format (2 tensors only) sets count to
+        # 0, which triggers a full overwrite on the next
+        # enableObservationNormalization call.
+        if bufSet.count() >= 3 =>
+          var countArr: double[] = bufSet.get(2).toDoubles()
+          if len(countArr) > 0 =>
+            self.obsCount = countArr[0].toLong()
+          else =>
+            self.obsCount = 0l
+        else =>
+          self.obsCount = 0l
     else =>
       self.obsNormEnabled = false
+      self.obsCount = 0l
 
     # Phase 4: probe for the `.vh` sidecar and restore the value head
     # tensors if present. Same pattern as `.buf` — sidecar existence

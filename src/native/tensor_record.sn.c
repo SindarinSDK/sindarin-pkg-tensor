@@ -281,6 +281,182 @@ double sn_graph_compute_loss(RtTensor *loss_rt) {
     return (double)loss_value;
 }
 
+/* ======================================================================
+ * Optimizer state persistence — .opt sidecar save / deferred restore
+ *
+ * File format (binary, little-endian):
+ *   uint32_t magic    = 0x4F505453  ("OPTS")
+ *   uint32_t version  = 1
+ *   int64_t  iter     (AdamW step counter for bias correction)
+ *   int64_t  n_params (number of PARAM nodes with m/v tensors)
+ *   Per param (n_params entries):
+ *     int64_t ne0     (columns)
+ *     int64_t ne1     (rows)
+ *     float   m[ne0 * ne1]
+ *     float   v[ne0 * ne1]
+ *
+ * Parameter ordering follows the forward-graph node index, which is
+ * deterministic for a given model architecture. Save and load must
+ * use the same GNN config (same layer count, hidden dim, etc.).
+ * ====================================================================== */
+
+#define OPT_STATE_MAGIC   0x4F505453u
+#define OPT_STATE_VERSION 1u
+
+char *g_opt_restore_path = NULL;
+
+void sn_opt_state_save(const char *path) {
+    if (!g_opt_ctx || !path) return;
+
+    int64_t n_nodes = ggml_opt_n_graph_nodes(g_opt_ctx);
+
+    /* Count PARAM nodes that have moment tensors. */
+    int64_t n_params = 0;
+    for (int64_t i = 0; i < n_nodes; i++) {
+        if (ggml_opt_get_m(g_opt_ctx, i) != NULL) n_params++;
+    }
+    if (n_params == 0) return;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "sn_opt_state_save: cannot open %s for writing\n", path);
+        return;
+    }
+
+    uint32_t magic   = OPT_STATE_MAGIC;
+    uint32_t version = OPT_STATE_VERSION;
+    int64_t  iter    = ggml_opt_get_iter(g_opt_ctx);
+
+    fwrite(&magic,    sizeof(uint32_t), 1, f);
+    fwrite(&version,  sizeof(uint32_t), 1, f);
+    fwrite(&iter,     sizeof(int64_t),  1, f);
+    fwrite(&n_params, sizeof(int64_t),  1, f);
+
+    for (int64_t i = 0; i < n_nodes; i++) {
+        struct ggml_tensor *m = ggml_opt_get_m(g_opt_ctx, i);
+        struct ggml_tensor *v = ggml_opt_get_v(g_opt_ctx, i);
+        if (!m || !v) continue;
+
+        int64_t ne0 = m->ne[0];
+        int64_t ne1 = m->ne[1];
+        size_t  n_bytes = (size_t)(ne0 * ne1) * sizeof(float);
+
+        fwrite(&ne0, sizeof(int64_t), 1, f);
+        fwrite(&ne1, sizeof(int64_t), 1, f);
+
+        float *buf = (float *)malloc(n_bytes);
+        ggml_backend_tensor_get(m, buf, 0, n_bytes);
+        fwrite(buf, sizeof(float), (size_t)(ne0 * ne1), f);
+
+        ggml_backend_tensor_get(v, buf, 0, n_bytes);
+        fwrite(buf, sizeof(float), (size_t)(ne0 * ne1), f);
+
+        free(buf);
+    }
+
+    fclose(f);
+}
+
+/* Deferred restore: store the path; the lazy-init block in
+ * sn_graph_train_epoch_impl will pick it up after creating g_opt_ctx. */
+void sn_opt_state_set_restore(const char *path) {
+    if (g_opt_restore_path) { free(g_opt_restore_path); g_opt_restore_path = NULL; }
+    if (path && path[0] != '\0') {
+        size_t len = strlen(path);
+        g_opt_restore_path = (char *)malloc(len + 1);
+        memcpy(g_opt_restore_path, path, len + 1);
+    }
+}
+
+/* Called from sn_graph_train_epoch_impl right after g_opt_ctx is created.
+ * Reads the .opt file and uploads m/v data + sets iter on the fresh context. */
+void sn_opt_state_restore(void) {
+    if (!g_opt_restore_path || !g_opt_ctx) return;
+
+    FILE *f = fopen(g_opt_restore_path, "rb");
+    if (!f) {
+        /* File doesn't exist — cold start, nothing to restore. */
+        free(g_opt_restore_path);
+        g_opt_restore_path = NULL;
+        return;
+    }
+
+    uint32_t magic = 0, version = 0;
+    int64_t  iter = 0, n_params = 0;
+
+    fread(&magic,    sizeof(uint32_t), 1, f);
+    fread(&version,  sizeof(uint32_t), 1, f);
+    fread(&iter,     sizeof(int64_t),  1, f);
+    fread(&n_params, sizeof(int64_t),  1, f);
+
+    if (magic != OPT_STATE_MAGIC || version != OPT_STATE_VERSION) {
+        fprintf(stderr, "sn_opt_state_restore: bad magic/version in %s\n", g_opt_restore_path);
+        fclose(f);
+        free(g_opt_restore_path);
+        g_opt_restore_path = NULL;
+        return;
+    }
+
+    /* Verify the current model has the same number of PARAM nodes. */
+    int64_t n_nodes = ggml_opt_n_graph_nodes(g_opt_ctx);
+    int64_t n_model_params = 0;
+    for (int64_t i = 0; i < n_nodes; i++) {
+        if (ggml_opt_get_m(g_opt_ctx, i) != NULL) n_model_params++;
+    }
+
+    if (n_params != n_model_params) {
+        fprintf(stderr, "sn_opt_state_restore: param count mismatch (file=%lld, model=%lld) in %s\n",
+                (long long)n_params, (long long)n_model_params, g_opt_restore_path);
+        fclose(f);
+        free(g_opt_restore_path);
+        g_opt_restore_path = NULL;
+        return;
+    }
+
+    ggml_opt_set_iter(g_opt_ctx, iter);
+
+    int64_t param_idx = 0;
+    for (int64_t i = 0; i < n_nodes && param_idx < n_params; i++) {
+        struct ggml_tensor *m = ggml_opt_get_m(g_opt_ctx, i);
+        struct ggml_tensor *v = ggml_opt_get_v(g_opt_ctx, i);
+        if (!m || !v) continue;
+
+        int64_t ne0 = 0, ne1 = 0;
+        fread(&ne0, sizeof(int64_t), 1, f);
+        fread(&ne1, sizeof(int64_t), 1, f);
+
+        /* Shape must match — same architecture guarantees this. */
+        if (ne0 != m->ne[0] || ne1 != m->ne[1]) {
+            fprintf(stderr, "sn_opt_state_restore: shape mismatch at param %lld "
+                    "(file=%lldx%lld, model=%lldx%lld)\n",
+                    (long long)param_idx,
+                    (long long)ne0, (long long)ne1,
+                    (long long)m->ne[0], (long long)m->ne[1]);
+            break;
+        }
+
+        size_t n_bytes = (size_t)(ne0 * ne1) * sizeof(float);
+        float *buf = (float *)malloc(n_bytes);
+
+        fread(buf, sizeof(float), (size_t)(ne0 * ne1), f);
+        ggml_backend_tensor_set(m, buf, 0, n_bytes);
+
+        fread(buf, sizeof(float), (size_t)(ne0 * ne1), f);
+        ggml_backend_tensor_set(v, buf, 0, n_bytes);
+
+        free(buf);
+        param_idx++;
+    }
+
+    fclose(f);
+
+    fprintf(stderr, "sn_opt_state_restore: loaded %lld params, iter=%lld from %s\n",
+            (long long)n_params, (long long)iter, g_opt_restore_path);
+
+    free(g_opt_restore_path);
+    g_opt_restore_path = NULL;
+}
+
 RtTensor *sn_graph_param(RtTensor *rt) {
     if (!g_record_mode || !rt) return rt;
     TPool *s = unwrap(rt);

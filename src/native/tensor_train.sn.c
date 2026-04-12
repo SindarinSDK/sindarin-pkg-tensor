@@ -269,6 +269,13 @@ static double sn_graph_train_epoch_impl(
         g_opt_old_log_probs_tensor   = old_log_probs; /* NULL in weighted-CE mode */
         g_opt_value_targets_tensor   = value_targets;  /* NULL in weighted-CE mode */
         g_opt_old_values_tensor      = old_values;     /* NULL in weighted-CE mode */
+
+        /* Deferred optimizer state restore: if sn_opt_state_set_restore()
+         * was called before this training cycle, load the saved m/v moments
+         * and iter counter into the freshly-created g_opt_ctx. This gives
+         * AdamW continuity across training rounds — the optimizer picks up
+         * exactly where the previous round left off. */
+        sn_opt_state_restore();
     }
 
     /* Sanity check: caller must use the same tensors as the init call.
