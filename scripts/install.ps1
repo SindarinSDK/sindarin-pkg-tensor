@@ -71,7 +71,7 @@ function Install-SindarinLibs {
     )
 
     # Check package cache first
-    $cacheDir = Join-Path $env:USERPROFILE ".sn-cache" "downloads"
+    $cacheDir = Join-Path (Join-Path $env:USERPROFILE ".sn-cache") "downloads"
     $cachedZip = Join-Path $cacheDir $Release.Name
 
     if (Test-Path $cachedZip) {
