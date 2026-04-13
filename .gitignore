@@ -1,14 +1,8 @@
 .sn/
-build/
-libs/
 bin/
+libs/
+vcpkg/
 *.exe
-
-# Claude Code per-project config (hooks, settings, MCP servers)
-.claude/
-.mcp.json
-
-# Core dumps from ggml aborts / test crashes.
-# Anchored to the repo root so they don't collide with e.g. src/tensor/core.sn.
-/core
-/core.[0-9]*
+*.o
+*.so
+*.a
