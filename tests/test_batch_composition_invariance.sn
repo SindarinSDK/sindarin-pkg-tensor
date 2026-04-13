@@ -318,7 +318,12 @@ fn partC(): void =>
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var _cfg0: TrainConfig = TrainConfig.create(30, 3, 42l)
   var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var _trainer0: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: _cfg0,
+    optimizer: opt,
+    strategy: _strat0
+  }
   var result: TrainResult = _trainer0.run({buildG1(), buildG2(), buildG3()}, labels, weights)
   println($"  trained: loss={result.loss} accuracy={result.accuracy}")
 

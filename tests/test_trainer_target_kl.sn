@@ -65,7 +65,14 @@ fn buildBigAdvantages(): double[] =>
   return {50.0, -50.0, 40.0, -40.0, 60.0, -60.0}
 
 fn trainWith(targetKl: double, epochs: int): TrainResult =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -75,11 +82,23 @@ fn trainWith(targetKl: double, epochs: int): TrainResult =>
   cfg.targetKl = targetKl
   var opt: OptimizerParams = AdamW.create(0.05, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   return trainer.run(graphs, labels, weights)
 
 fn trainAndFlatten(targetKl: double, epochs: int): double[] =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -89,7 +108,12 @@ fn trainAndFlatten(targetKl: double, epochs: int): double[] =>
   cfg.targetKl = targetKl
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var _r: TrainResult = trainer.run(graphs, labels, weights)
 
   var params: Tensor[] = model.parameters()

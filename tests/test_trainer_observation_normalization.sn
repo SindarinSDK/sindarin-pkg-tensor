@@ -101,7 +101,14 @@ fn normalizeGraphs(graphs: GraphTensors[], m0: double, m1: double, s0: double, s
   return out
 
 fn trainAndFlatten(graphs: GraphTensors[], enableObsNorm: bool): double[] =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   if enableObsNorm =>
     model.enableObservationNormalization(graphs)
@@ -112,7 +119,12 @@ fn trainAndFlatten(graphs: GraphTensors[], enableObsNorm: bool): double[] =>
   cfg.normalizeObservations = enableObsNorm
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var _result: TrainResult = trainer.run(graphs, labels, weights)
 
   var params: Tensor[] = model.parameters()
@@ -131,7 +143,14 @@ fn main(): void =>
   # -------------------------------------------------------------------
   println("--- Part E: enableObservationNormalization fits correct stats ---")
   var graphsE: GraphTensors[] = buildScaledGraphs()
-  var configE: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var configE: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var modelE: Gnn = Gnn.createWithSeed(configE, 42l)
   assertTrue(!modelE.obsNormEnabled, "Part E: obsNormEnabled starts false")
 
@@ -177,7 +196,14 @@ fn main(): void =>
   # Part B — Save/load roundtrip
   # -------------------------------------------------------------------
   println("--- Part B: save/load roundtrip ---")
-  var configB: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var configB: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var modelB: Gnn = Gnn.createWithSeed(configB, 42l)
   modelB.enableObservationNormalization(rawGraphs)
 
@@ -188,7 +214,12 @@ fn main(): void =>
   cfgB.normalizeObservations = true
   var optB: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var stratB: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainerB: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: modelB, config: cfgB, optimizer: optB, strategy: stratB}
+  var trainerB: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: modelB,
+    config: cfgB,
+    optimizer: optB,
+    strategy: stratB
+  }
   var _resultB: TrainResult = trainerB.run(rawGraphs, labelsB, weightsB)
 
   assertTrue(modelB.obsNormEnabled, "Part B: obsNormEnabled still set on caller's Gnn after train")
@@ -229,7 +260,14 @@ fn main(): void =>
   # Part C — Backwards compatibility
   # -------------------------------------------------------------------
   println("--- Part C: backwards compatibility (no-sidecar load resets obsNormEnabled) ---")
-  var configC: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var configC: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var oldPath: str = "/tmp/test_obsnorm_oldformat.bin"
   var producer: Gnn = Gnn.createWithSeed(configC, 7l)
   producer.save(oldPath)
@@ -250,7 +288,14 @@ fn main(): void =>
   var defaultCfg: TrainConfig = TrainConfig.create(10, 2, 42l)
   assertTrue(!defaultCfg.normalizeObservations, "Part D: TrainConfig.create returns normalizeObservations=false")
 
-  var configD: GnnConfig = {inputDim: 3, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var configD: GnnConfig = {
+    inputDim: 3,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var freshGnn: Gnn = Gnn.create(configD)
   assertTrue(!freshGnn.obsNormEnabled, "Part D: Gnn.create returns obsNormEnabled=false")
   assertEqualInt(len(freshGnn.obsMean), 3, "Part D: Gnn.create initializes obsMean with length=inputDim")

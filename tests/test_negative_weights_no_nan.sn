@@ -128,7 +128,12 @@ fn main(): void =>
   println("  training 50 epochs, batchSize=9 (single batch), negative-weight mix...")
   var _cfg0: TrainConfig = TrainConfig.create(50, 9, 42l)
   var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var _trainer0: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: _cfg0,
+    optimizer: opt,
+    strategy: _strat0
+  }
   var result: TrainResult = _trainer0.run(trainGraphs, labels, weights)
   println($"  final loss = {result.loss}")
   println("")
@@ -184,7 +189,12 @@ fn main(): void =>
   var multiOpt: OptimizerParams = AdamW.create(0.001, 0.0001).params()
   var _cfg1: TrainConfig = TrainConfig.create(4, 8, 42l)
   var _strat1: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var _trainer1: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: multiModel, config: _cfg1, optimizer: multiOpt, strategy: _strat1}
+  var _trainer1: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: multiModel,
+    config: _cfg1,
+    optimizer: multiOpt,
+    strategy: _strat1
+  }
   var multiResult: TrainResult = _trainer1.run(multiGraphs, multiLabels, multiWeights)
   println($"  multi-batch final loss = {multiResult.loss}")
 

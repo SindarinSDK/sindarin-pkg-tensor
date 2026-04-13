@@ -14,7 +14,14 @@ fn main(): void =>
   println("=== Test Gnn.train (per-epoch path) ===")
 
   # Simple 1-layer GCN: inputDim=2, hiddenDim=4, numActions=2
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
 
   var params: Tensor[] = model.parameters()
@@ -39,7 +46,12 @@ fn main(): void =>
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var _cfg0: TrainConfig = TrainConfig.create(50, 1, 42l)
   var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var _trainer0: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: _cfg0,
+    optimizer: opt,
+    strategy: _strat0
+  }
   var result: TrainResult = _trainer0.run(trainGraphs, labels, weights)
   println($"  loss: {result.loss}, accuracy: {result.accuracy}, epochs: {result.epochs}")
 

@@ -21,7 +21,14 @@ fn singleNode(features: double[], featureDim: int): GraphTensors =>
 fn main(): void =>
   println("=== Test Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> ===")
 
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
 
   var trainGraphs: GraphTensors[] = {
@@ -46,7 +53,7 @@ fn main(): void =>
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
 
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
     model: model,
     config: cfg,
     optimizer: opt,

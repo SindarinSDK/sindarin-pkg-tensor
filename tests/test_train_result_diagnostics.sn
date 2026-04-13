@@ -155,7 +155,12 @@ fn main(): void =>
   var epochs: int = 25
   var _cfg0: TrainConfig = TrainConfig.create(epochs, 3, 42l)
   var _strat0: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var _trainer0: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: _cfg0, optimizer: opt, strategy: _strat0}
+  var _trainer0: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: _cfg0,
+    optimizer: opt,
+    strategy: _strat0
+  }
   var result: TrainResult = _trainer0.run(graphs, labels, weights)
 
   println($"  loss={result.loss} accuracy={result.accuracy} epochs={result.epochs}")

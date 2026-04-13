@@ -94,7 +94,14 @@ fn normalizeExternally(w: double[]): double[] =>
 
 # Run a full Trainer pass and return the final flat parameter vector.
 fn trainAndFlatten(weights: double[], normalize: bool): double[] =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -103,7 +110,12 @@ fn trainAndFlatten(weights: double[], normalize: bool): double[] =>
   cfg.normalizeAdvantages = normalize
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var _result: TrainResult = trainer.run(graphs, labels, weights)
 
   var params: Tensor[] = model.parameters()
@@ -115,7 +127,14 @@ fn trainAndFlatten(weights: double[], normalize: bool): double[] =>
   return flat
 
 fn trainAndGetResult(weights: double[], normalize: bool): TrainResult =>
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -124,7 +143,12 @@ fn trainAndGetResult(weights: double[], normalize: bool): TrainResult =>
   cfg.normalizeAdvantages = normalize
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   return trainer.run(graphs, labels, weights)
 
 fn main(): void =>

@@ -70,7 +70,7 @@ fn main(): void =>
 
   # Linear: warmup ramps 0 -> baseLr across `warmup` epochs, then
   # decays baseLr -> minLr across (totalEpochs - warmup) epochs.
-  var linearSched: LrSchedule = LrSchedule {
+  var linearSched: LrSchedule = {
     kind: "linear",
     warmupEpochs: warmup,
     minLr: minLr
@@ -88,7 +88,7 @@ fn main(): void =>
   assertApproxDouble(linearSched.effectiveLr(baseLr, 9, totalEpochs), minLr, 0.000000001, "Part A linear: post-warmup epoch 9 == minLr (progress=1)")
 
   # Cosine: warmup same, then 0.5*(baseLr-minLr)*(1+cos(pi*progress)) + minLr
-  var cosSched: LrSchedule = LrSchedule {
+  var cosSched: LrSchedule = {
     kind: "cosine",
     warmupEpochs: warmup,
     minLr: minLr
@@ -110,7 +110,7 @@ fn main(): void =>
   assertApproxDouble(cosSched.effectiveLr(baseLr, 6, totalEpochs), cosMid, 0.000000001, "Part A cosine: midpoint epoch 6 at 50% of decay range")
 
   # Warmup > totalEpochs guard: decaySpan <= 0, clamp to baseLr after warmup ramp.
-  var bigWarmup: LrSchedule = LrSchedule {
+  var bigWarmup: LrSchedule = {
     kind: "linear",
     warmupEpochs: 20,
     minLr: 0.0001
@@ -122,7 +122,14 @@ fn main(): void =>
   # -------------------------------------------------------------------
   println("--- Part B: lrCurve reflects schedule during training ---")
 
-  var config: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model: Gnn = Gnn.createWithSeed(config, 42l)
   var graphs: GraphTensors[] = buildGraphs()
   var labels: double[] = buildLabels()
@@ -136,7 +143,12 @@ fn main(): void =>
   }
   var opt: OptimizerParams = AdamW.create(0.01, 0.0).params()
   var strat: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model, config: cfg, optimizer: opt, strategy: strat}
+  var trainer: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model,
+    config: cfg,
+    optimizer: opt,
+    strategy: strat
+  }
   var result: TrainResult = trainer.run(graphs, labels, weights)
 
   assertEqualInt(len(result.lrCurve), 10, "Part B: lrCurve length == epochs")
@@ -162,13 +174,25 @@ fn main(): void =>
   # Part C — Default constant schedule is a flat vector of baseLr
   # -------------------------------------------------------------------
   println("--- Part C: constant schedule returns baseLr every epoch ---")
-  var config2: GnnConfig = {inputDim: 2, hiddenDim: 4, numActions: 2, numLayers: 1, arch: "gcn", dropoutRate: 0.0}
+  var config2: GnnConfig = {
+    inputDim: 2,
+    hiddenDim: 4,
+    numActions: 2,
+    numLayers: 1,
+    arch: "gcn",
+    dropoutRate: 0.0
+  }
   var model2: Gnn = Gnn.createWithSeed(config2, 42l)
   var cfg2: TrainConfig = TrainConfig.create(5, 2, 42l)
   # No lrSchedule override — get the factory default (constant).
   var opt2: OptimizerParams = AdamW.create(0.005, 0.0).params()
   var strat2: WeightedCrossEntropy = WeightedCrossEntropy.create()
-  var trainer2: Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > = Trainer < Gnn, WeightedCrossEntropy, OptimizerParams > {model: model2, config: cfg2, optimizer: opt2, strategy: strat2}
+  var trainer2: Trainer<Gnn, WeightedCrossEntropy, OptimizerParams> = {
+    model: model2,
+    config: cfg2,
+    optimizer: opt2,
+    strategy: strat2
+  }
   var result2: TrainResult = trainer2.run(graphs, labels, weights)
 
   assertEqualInt(len(result2.lrCurve), 5, "Part C: lrCurve length == epochs")
