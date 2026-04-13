@@ -1,11 +1,12 @@
 # Sindarin native library installer for Windows
-# Downloads the latest release from GitHub to ./libs/windows
+# Downloads versioned binaries from S3 to ./libs/windows
+# Name and version are read from sn.yaml in the package root
 # Caches archives in ~/.sn-cache/downloads/ to avoid re-downloading
 
 $ErrorActionPreference = "Stop"
 
-$REPO = "SindarinSDK/sindarin-pkg-tensor"
-$PKG_NAME = "sindarin-tensor"
+$S3_BUCKET = "cryosharp-sindarin-pkg-binaries"
+$S3_REGION = "eu-west-2"
 $INSTALL_DIR = Join-Path (Get-Location) "libs\windows"
 
 function Write-Status {
@@ -34,60 +35,50 @@ function Get-Architecture {
     }
 }
 
-function Get-LatestWindowsRelease {
-    param([string]$Arch)
+function Read-YamlField {
+    param([string]$Field)
 
-    Write-Status "Fetching latest release information..."
-
-    $apiUrl = "https://api.github.com/repos/$REPO/releases/latest"
-    $headers = @{ "User-Agent" = "sindarin-installer" }
-    if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
-
-    try {
-        $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
-
-        $pattern = "windows-$Arch.zip"
-        $asset = $release.assets | Where-Object { $_.name -like "*$pattern*" } | Select-Object -First 1
-
-        if (-not $asset) {
-            throw "No Windows release asset found for windows-$Arch"
-        }
-
-        return @{
-            Url = $asset.browser_download_url
-            Name = $asset.name
-            Version = $release.tag_name
-        }
-    }
-    catch {
-        Write-Status "Failed to fetch release info: $_" -Type "Error"
+    $yamlPath = Join-Path (Get-Location) "sn.yaml"
+    if (-not (Test-Path $yamlPath)) {
+        Write-Status "sn.yaml not found" -Type "Error"
         exit 1
     }
+
+    $line = Get-Content $yamlPath | Where-Object { $_ -match "^${Field}:\s*(.+)$" } | Select-Object -First 1
+    if (-not $line) {
+        Write-Status "Failed to read '$Field' from sn.yaml" -Type "Error"
+        exit 1
+    }
+
+    return ($line -replace "^${Field}:\s*", "").Trim()
 }
 
 function Install-SindarinLibs {
     param(
-        [hashtable]$Release
+        [string]$PkgName,
+        [string]$Version,
+        [string]$Arch
     )
+
+    $archiveName = "$PkgName-v$Version-windows-$Arch.zip"
+    $downloadUrl = "https://$S3_BUCKET.s3.$S3_REGION.amazonaws.com/$PkgName/v$Version/$archiveName"
 
     # Check package cache first
     $cacheDir = Join-Path (Join-Path $env:USERPROFILE ".sn-cache") "downloads"
-    $cachedZip = Join-Path $cacheDir $Release.Name
+    $cachedZip = Join-Path $cacheDir $archiveName
 
     if (Test-Path $cachedZip) {
-        Write-Status "Using cached $($Release.Name)"
+        Write-Status "Using cached $archiveName"
     }
     else {
-        Write-Status "Downloading $PKG_NAME $($Release.Version)..."
+        Write-Status "Downloading $PkgName v$Version for windows-$Arch..."
 
         if (-not (Test-Path $cacheDir)) {
             New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
         }
 
         try {
-            $dlHeaders = @{ "User-Agent" = "sindarin-installer" }
-            if ($env:GITHUB_TOKEN) { $dlHeaders["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
-            Invoke-WebRequest -Uri $Release.Url -OutFile $cachedZip -Headers $dlHeaders -UseBasicParsing
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $cachedZip -UseBasicParsing
         }
         catch {
             Write-Status "Download failed: $_" -Type "Error"
@@ -98,7 +89,7 @@ function Install-SindarinLibs {
         }
     }
 
-    $tempDir = Join-Path $env:TEMP "$PKG_NAME-install"
+    $tempDir = Join-Path $env:TEMP "$PkgName-install"
 
     if (Test-Path $tempDir) {
         Remove-Item -Recurse -Force $tempDir
@@ -126,7 +117,7 @@ function Install-SindarinLibs {
             Get-ChildItem -Path $extractDir | Move-Item -Destination $INSTALL_DIR
         }
 
-        Write-Status "Successfully installed $PKG_NAME $($Release.Version) to $INSTALL_DIR" -Type "Success"
+        Write-Status "Successfully installed $PkgName v$Version to $INSTALL_DIR" -Type "Success"
     }
     catch {
         Write-Status "Installation failed: $_" -Type "Error"
@@ -140,14 +131,17 @@ function Install-SindarinLibs {
 }
 
 # Main execution
-Write-Status "$PKG_NAME - native library installer" -Type "Info"
+$pkgName = Read-YamlField -Field "name"
+$version = Read-YamlField -Field "version"
+
+Write-Status "$pkgName - native library installer" -Type "Info"
 Write-Status "========================================" -Type "Info"
 
 $arch = Get-Architecture
 Write-Status "Detected: windows ($arch)" -Type "Info"
+Write-Status "Package version: v$version" -Type "Info"
 
-$release = Get-LatestWindowsRelease -Arch $arch
-Install-SindarinLibs -Release $release
+Install-SindarinLibs -PkgName $pkgName -Version $version -Arch $arch
 
 Write-Status ""
 Write-Status "Installation complete!" -Type "Success"
