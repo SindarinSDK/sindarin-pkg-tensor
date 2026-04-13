@@ -59,6 +59,12 @@ detect_os() {
 }
 
 detect_arch() {
+    # Allow override via SN_LIBS_ARCH (e.g. for cross-compilation)
+    if [ -n "$SN_LIBS_ARCH" ]; then
+        echo "$SN_LIBS_ARCH"
+        return
+    fi
+
     local arch
     arch="$(uname -m)"
 

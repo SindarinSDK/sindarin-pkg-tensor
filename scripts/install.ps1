@@ -27,6 +27,11 @@ function Write-Status {
 }
 
 function Get-Architecture {
+    # Allow override via SN_LIBS_ARCH (e.g. for cross-compilation)
+    if ($env:SN_LIBS_ARCH) {
+        return $env:SN_LIBS_ARCH
+    }
+
     $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
     switch ($arch) {
         "X64"   { return "x64" }
