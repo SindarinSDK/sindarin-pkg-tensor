@@ -73,34 +73,26 @@ $(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
 	 $(SN) $< -o $@ -l 1
 
 #------------------------------------------------------------------------------
-# vcpkg bootstrap (shared between release-build and any future vcpkg targets)
+# Release build (called by sindarin-pipelines/sindarin-lib-release.yml)
+# Env (from CI): VCPKG_ROOT, TRIPLET, PLATFORM, ARCH, VERSION
+# Defaults (for local builds): auto-detected from platform
 #------------------------------------------------------------------------------
 VCPKG_ROOT ?= $(CURDIR)/vcpkg
-
-$(VCPKG_ROOT)/vcpkg $(VCPKG_ROOT)/vcpkg.exe:
-	git clone --depth=1 https://github.com/microsoft/vcpkg.git "$(VCPKG_ROOT)"
-ifeq ($(OS),Windows_NT)
-	"$(VCPKG_ROOT)/bootstrap-vcpkg.bat" -disableMetrics
-else
-	"$(VCPKG_ROOT)/bootstrap-vcpkg.sh" -disableMetrics
-endif
-
-#------------------------------------------------------------------------------
-# Architecture detection (for local builds; CI passes these via env)
-#------------------------------------------------------------------------------
-TRIPLET  ?= $(if $(filter windows,$(PLATFORM)),x64-mingw-static,$(if $(filter aarch64,$(shell uname -m 2>/dev/null)),arm64,x64)-$(if $(filter darwin,$(PLATFORM)),osx,linux))
-ARCH     ?= $(if $(filter aarch64,$(shell uname -m 2>/dev/null)),arm64,x64)
-VERSION  ?= local
+TRIPLET    ?= $(if $(filter windows,$(PLATFORM)),x64-mingw-static,$(if $(filter aarch64,$(shell uname -m 2>/dev/null)),arm64,x64)-$(if $(filter darwin,$(PLATFORM)),osx,linux))
+ARCH       ?= $(if $(filter aarch64,$(shell uname -m 2>/dev/null)),arm64,x64)
+VERSION    ?= local
 
 VCPKG_FEATURES :=
 ifeq ($(PLATFORM),darwin)
     VCPKG_FEATURES := --x-feature=metal
 endif
 
-#------------------------------------------------------------------------------
-# Release build (called by sindarin-pipelines/sindarin-lib-release.yml)
-#------------------------------------------------------------------------------
-release-build: $(VCPKG_ROOT)/vcpkg
+release-build:
+	@if [ ! -x "$(VCPKG_ROOT)/vcpkg" ] && [ ! -x "$(VCPKG_ROOT)/vcpkg.exe" ]; then \
+	    echo "Bootstrapping vcpkg into $(VCPKG_ROOT)..." && \
+	    git clone --depth=1 https://github.com/microsoft/vcpkg.git "$(VCPKG_ROOT)" && \
+	    "$(VCPKG_ROOT)/bootstrap-vcpkg.sh" -disableMetrics; \
+	fi
 	"$(VCPKG_ROOT)/vcpkg" install $(VCPKG_FEATURES) --triplet=$(TRIPLET) --x-install-root=vcpkg/installed
 	mkdir -p libs/$(PLATFORM)/lib libs/$(PLATFORM)/include
 	find vcpkg/installed/$(TRIPLET)/lib -maxdepth 1 -name "*.a" -exec cp {} libs/$(PLATFORM)/lib/ \;
