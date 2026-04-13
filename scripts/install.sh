@@ -1,15 +1,13 @@
 #!/bin/bash
 # Sindarin native library installer for Linux/macOS
 # Downloads versioned binaries from S3 to ./libs/{os}
-# Version is read from sn.yaml in the package root
+# Name and version are read from sn.yaml in the package root
 # Caches archives in ~/.sn-cache/downloads/ to avoid re-downloading
 
 set -e
 
 S3_BUCKET="cryosharp-sindarin-pkg-binaries"
 S3_REGION="eu-west-2"
-S3_PREFIX="sindarin-pkg-tensor"
-PKG_NAME="sindarin-tensor"
 BASE_DIR="$(pwd)/libs"
 
 # Colors for output
@@ -102,25 +100,27 @@ download_file() {
     fi
 }
 
-get_version() {
-    local version
-    version=$(grep '^version:' sn.yaml 2>/dev/null | head -1 | sed 's/^version:[[:space:]]*//')
+read_yaml_field() {
+    local field="$1"
+    local value
+    value=$(grep "^${field}:" sn.yaml 2>/dev/null | head -1 | sed "s/^${field}:[[:space:]]*//")
 
-    if [ -z "$version" ]; then
-        write_status "Failed to read version from sn.yaml" "error"
+    if [ -z "$value" ]; then
+        write_status "Failed to read '${field}' from sn.yaml" "error"
         exit 1
     fi
 
-    echo "$version"
+    echo "$value"
 }
 
 install_libs() {
-    local os="$1"
-    local arch="$2"
-    local version="$3"
+    local pkg_name="$1"
+    local os="$2"
+    local arch="$3"
+    local version="$4"
 
-    local archive_name="${PKG_NAME}-v${version}-${os}-${arch}.tar.gz"
-    local download_url="https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${S3_PREFIX}/v${version}/${archive_name}"
+    local archive_name="${pkg_name}-v${version}-${os}-${arch}.tar.gz"
+    local download_url="https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${pkg_name}/v${version}/${archive_name}"
 
     # Check package cache first
     local cache_dir="${HOME}/.sn-cache/downloads"
@@ -129,7 +129,7 @@ install_libs() {
     if [ -f "$cached_archive" ]; then
         write_status "Using cached ${archive_name}"
     else
-        write_status "Downloading ${PKG_NAME} v${version} for ${os}-${arch}..."
+        write_status "Downloading ${pkg_name} v${version} for ${os}-${arch}..."
         mkdir -p "$cache_dir"
         if ! download_file "$download_url" "$cached_archive"; then
             write_status "Download failed" "error"
@@ -167,12 +167,17 @@ install_libs() {
         mv "${extract_dir}"/.[!.]* "$INSTALL_DIR/" 2>/dev/null || true
     fi
 
-    write_status "Successfully installed ${PKG_NAME} v${version} to ${INSTALL_DIR}" "success"
+    write_status "Successfully installed ${pkg_name} v${version} to ${INSTALL_DIR}" "success"
 }
 
 # Main execution
 main() {
-    write_status "${PKG_NAME} — native library installer"
+    local pkg_name
+    pkg_name=$(read_yaml_field "name")
+    local version
+    version=$(read_yaml_field "version")
+
+    write_status "${pkg_name} — native library installer"
     write_status "========================================"
 
     local os
@@ -180,15 +185,12 @@ main() {
     local arch
     arch=$(detect_arch)
     write_status "Detected OS: ${os} (${arch})"
-
-    local version
-    version=$(get_version)
     write_status "Package version: v${version}"
 
     # Set install directory based on OS
     INSTALL_DIR="${BASE_DIR}/${os}"
 
-    install_libs "$os" "$arch" "$version"
+    install_libs "$pkg_name" "$os" "$arch" "$version"
 
     echo ""
     write_status "Installation complete!" "success"
