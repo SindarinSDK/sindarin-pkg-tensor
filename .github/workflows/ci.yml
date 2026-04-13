@@ -70,8 +70,6 @@ jobs:
 
       - name: Install Sindarin
         uses: SindarinSDK/sindarin-pipelines/.github/actions/install-sindarin@main
-        with:
-          github-token: ${{ github.token }}
 
       - name: Install dependencies
         uses: SindarinSDK/sindarin-pipelines/.github/actions/install-deps@main
