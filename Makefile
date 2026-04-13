@@ -1,6 +1,6 @@
 # Sindarin Tensor Package - Makefile
 
-.PHONY: all test hooks install-libs clean help
+.PHONY: all test hooks install-libs release-build clean help
 
 # Disable implicit rules for .sn.c files (compiled by the Sindarin compiler)
 %.sn: %.sn.c
@@ -71,6 +71,23 @@ $(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
 	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
 	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
 	 $(SN) $< -o $@ -l 1
+
+#------------------------------------------------------------------------------
+# Release build (called by sindarin-pipelines/sindarin-lib-release.yml)
+# Env: VCPKG_ROOT, TRIPLET, PLATFORM, ARCH, VERSION
+#------------------------------------------------------------------------------
+VCPKG_FEATURES :=
+ifeq ($(PLATFORM),darwin)
+    VCPKG_FEATURES := --x-feature=metal
+endif
+
+release-build:
+	"$(VCPKG_ROOT)/vcpkg" install $(VCPKG_FEATURES) --triplet=$(TRIPLET) --x-install-root=vcpkg/installed
+	mkdir -p libs/$(PLATFORM)/lib libs/$(PLATFORM)/include
+	find vcpkg/installed/$(TRIPLET)/lib -maxdepth 1 -name "*.a" -exec cp {} libs/$(PLATFORM)/lib/ \;
+	cp -r vcpkg/installed/$(TRIPLET)/include/* libs/$(PLATFORM)/include/
+	echo "$(VERSION)" > libs/$(PLATFORM)/VERSION
+	echo "$(PLATFORM)" > libs/$(PLATFORM)/PLATFORM
 
 install-libs:
 	@bash scripts/install.sh
