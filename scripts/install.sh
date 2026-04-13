@@ -1,11 +1,14 @@
 #!/bin/bash
 # Sindarin native library installer for Linux/macOS
-# Downloads the latest release from GitHub to ./libs/{os}
+# Downloads versioned binaries from S3 to ./libs/{os}
+# Version is read from sn.yaml in the package root
 # Caches archives in ~/.sn-cache/downloads/ to avoid re-downloading
 
 set -e
 
-REPO="SindarinSDK/sindarin-pkg-tensor"
+S3_BUCKET="cryosharp-sindarin-pkg-binaries"
+S3_REGION="eu-west-2"
+S3_PREFIX="sindarin-pkg-tensor"
 PKG_NAME="sindarin-tensor"
 BASE_DIR="$(pwd)/libs"
 
@@ -86,27 +89,6 @@ get_download_tool() {
     fi
 }
 
-fetch_url() {
-    local url="$1"
-    local tool
-    tool=$(get_download_tool)
-
-    # Use GITHUB_TOKEN for authentication if available (avoids rate limiting)
-    if [ "$tool" = "curl" ]; then
-        if [ -n "$GITHUB_TOKEN" ]; then
-            curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" "$url"
-        else
-            curl -fsSL "$url"
-        fi
-    else
-        if [ -n "$GITHUB_TOKEN" ]; then
-            wget -qO- --header="Authorization: Bearer $GITHUB_TOKEN" "$url"
-        else
-            wget -qO- "$url"
-        fi
-    fi
-}
-
 download_file() {
     local url="$1"
     local output="$2"
@@ -120,47 +102,25 @@ download_file() {
     fi
 }
 
-get_latest_release() {
-    local os="$1"
-    local api_url="https://api.github.com/repos/${REPO}/releases/latest"
-
-    write_status "Fetching latest release information..."
-
-    local release_info
-    release_info=$(fetch_url "$api_url")
-
-    if [ -z "$release_info" ]; then
-        write_status "Failed to fetch release information" "error"
-        exit 1
-    fi
-
-    # Extract version
+get_version() {
     local version
-    version=$(echo "$release_info" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    version=$(grep '^version:' sn.yaml 2>/dev/null | head -1 | sed 's/^version:[[:space:]]*//')
 
-    # Find the appropriate asset URL based on OS and arch
-    local arch="$2"
-    local asset_pattern="${os}-${arch}.tar.gz"
-    local download_url
-    download_url=$(echo "$release_info" | grep '"browser_download_url"' | grep "$asset_pattern" | head -1 | sed 's/.*"browser_download_url": *"\([^"]*\)".*/\1/')
-
-    if [ -z "$download_url" ]; then
-        write_status "No release asset found for $os" "error"
+    if [ -z "$version" ]; then
+        write_status "Failed to read version from sn.yaml" "error"
         exit 1
     fi
 
-    echo "$version|$download_url"
+    echo "$version"
 }
 
 install_libs() {
     local os="$1"
-    local release_info="$2"
+    local arch="$2"
+    local version="$3"
 
-    local version="${release_info%%|*}"
-    local download_url="${release_info#*|}"
-
-    local archive_name
-    archive_name=$(basename "$download_url")
+    local archive_name="${PKG_NAME}-v${version}-${os}-${arch}.tar.gz"
+    local download_url="https://${S3_BUCKET}.s3.${S3_REGION}.amazonaws.com/${S3_PREFIX}/v${version}/${archive_name}"
 
     # Check package cache first
     local cache_dir="${HOME}/.sn-cache/downloads"
@@ -169,7 +129,7 @@ install_libs() {
     if [ -f "$cached_archive" ]; then
         write_status "Using cached ${archive_name}"
     else
-        write_status "Downloading ${PKG_NAME} ${version} for ${os}..."
+        write_status "Downloading ${PKG_NAME} v${version} for ${os}-${arch}..."
         mkdir -p "$cache_dir"
         if ! download_file "$download_url" "$cached_archive"; then
             write_status "Download failed" "error"
@@ -207,7 +167,7 @@ install_libs() {
         mv "${extract_dir}"/.[!.]* "$INSTALL_DIR/" 2>/dev/null || true
     fi
 
-    write_status "Successfully installed ${PKG_NAME} ${version} to ${INSTALL_DIR}" "success"
+    write_status "Successfully installed ${PKG_NAME} v${version} to ${INSTALL_DIR}" "success"
 }
 
 # Main execution
@@ -221,13 +181,14 @@ main() {
     arch=$(detect_arch)
     write_status "Detected OS: ${os} (${arch})"
 
+    local version
+    version=$(get_version)
+    write_status "Package version: v${version}"
+
     # Set install directory based on OS
     INSTALL_DIR="${BASE_DIR}/${os}"
 
-    local release_info
-    release_info=$(get_latest_release "$os" "$arch")
-
-    install_libs "$os" "$release_info"
+    install_libs "$os" "$arch" "$version"
 
     echo ""
     write_status "Installation complete!" "success"
