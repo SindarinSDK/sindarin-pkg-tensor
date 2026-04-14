@@ -724,10 +724,10 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         # arrays so the trainer doesn't have to poke into the
         # strategy's private fields.
         if self.model.valueHeadEnabled =>
-          var cpVh: long = sn_tensor_pool_checkpoint()
           var prevRecVh: bool = sn_graph_pause_recording()
           var vSqSum: double = 0.0
           for var i: int = 0; i < totalSamples; i++ =>
+            var cpVh: long = sn_tensor_pool_checkpoint()
             var vEst: double[] = self.model.forward(graphs[i], false).valueEstimate.toDoubles()
             var vPred: double = 0.0
             if len(vEst) > 0 =>
@@ -735,8 +735,8 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             var vTarget: double = weights[i] + initialValuesFlat[i]
             var dd: double = vPred - vTarget
             vSqSum = vSqSum + dd * dd
+            sn_tensor_pool_restore(cpVh)
           sn_graph_resume_recording(prevRecVh)
-          sn_tensor_pool_restore(cpVh)
           var vMse: double = vSqSum / totalSamples.toDouble()
           valueLossCurve.push(vMse)
           MetricEmitter.emit("value_loss", vMse, epochLabels)
@@ -750,17 +750,17 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         # either targetKl > 0 or clipEpsilon > 0.
         var needDiagForward: bool = self.config.targetKl > 0.0 || self.config.clipEpsilon > 0.0
         if needDiagForward =>
-          var cp: long = sn_tensor_pool_checkpoint()
           var prevRec: bool = sn_graph_pause_recording()
 
           var currentProbsFlat: double[] = {}
           for var i: int = 0; i < totalSamples; i++ =>
+            var cp: long = sn_tensor_pool_checkpoint()
             var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
             for var j: int = 0; j < len(probs); j++ =>
               currentProbsFlat.push(probs[j])
+            sn_tensor_pool_restore(cp)
 
           sn_graph_resume_recording(prevRec)
-          sn_tensor_pool_restore(cp)
 
           # KL divergence: mean per-sample KL(current || initial).
           if self.config.targetKl > 0.0 =>
