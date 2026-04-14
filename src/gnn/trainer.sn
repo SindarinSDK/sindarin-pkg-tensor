@@ -835,6 +835,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # --- Phase C: training-set accuracy after the final epoch. -------------
     var correct: int = 0
     for var i: int = 0; i < totalSamples; i++ =>
+      var cpAcc: long = sn_tensor_pool_checkpoint()
       var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
       var predIdx: int = 0
       for var j: int = 1; j < numClasses; j++ =>
@@ -846,6 +847,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
           trueIdx = j
       if predIdx == trueIdx =>
         correct = correct + 1
+      sn_tensor_pool_restore(cpAcc)
     var accuracy: double = correct.toDouble() / totalSamples.toDouble()
 
     var finalLoss: double = lossCurve[len(lossCurve) - 1]
