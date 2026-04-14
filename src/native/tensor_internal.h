@@ -154,6 +154,8 @@ struct ggml_opt_optimizer_params sn_get_opt_params(void *userdata);
 
 extern char *g_opt_restore_path;
 
+void sn_opt_state_restore(void);
+
 /* ======================================================================
  * Training metric callback (defined in tensor_train.sn.c)
  * ====================================================================== */
