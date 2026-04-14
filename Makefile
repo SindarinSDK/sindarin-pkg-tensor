@@ -55,6 +55,12 @@ VERSION    ?= local
 VCPKG_FEATURES :=
 
 build:
+ifeq ($(PLATFORM),darwin)
+	@if ! brew list libomp >/dev/null 2>&1; then \
+	    echo "Installing libomp via Homebrew so ggml's find_package(OpenMP) succeeds..."; \
+	    brew install libomp; \
+	fi
+endif
 	@if [ ! -x "$(VCPKG_ROOT)/vcpkg" ] && [ ! -x "$(VCPKG_ROOT)/vcpkg.exe" ]; then \
 	    echo "Bootstrapping vcpkg..." && \
 	    git clone --depth=1 https://github.com/microsoft/vcpkg.git "$(VCPKG_ROOT)" && \
