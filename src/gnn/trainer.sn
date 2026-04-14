@@ -364,6 +364,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
     # the existing probs readback.
     var initialProbsFlat: double[] = {}
     var initialValuesFlat: double[] = {}
+    var cpInit: long = self.model.checkpoint()
     for var i: int = 0; i < totalSamples; i++ =>
       var out: GnnOutput = self.model.forward(graphs[i], false)
       var probs: double[] = out.probs.toDoubles()
@@ -374,6 +375,7 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
       if len(v) > 0 =>
         vScalar = v[0]
       initialValuesFlat.push(vScalar)
+    self.model.restore(cpInit)
     # VF targets must be computed from the RAW advantages, not the
     # advantage-normalized form — otherwise V_target = (normalized adv)
     # + V_old drifts away from the real GAE returns and the value head
