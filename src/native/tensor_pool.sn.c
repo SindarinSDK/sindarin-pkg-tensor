@@ -76,6 +76,49 @@ SnArray *sn_tensor_to_doubles(RtTensor *rt)
     return arr;
 }
 
+/* Activation summary stats — single pass over the host data, returns
+ * 5 doubles in fixed order: [mean, std, min, max, zero_fraction].
+ *
+ * `zero_fraction` counts EXACT zeros (not near-zero) — appropriate for
+ * post-ReLU activations where dead neurons output 0 exactly. The whole
+ * computation is one O(n_elem) pass; cheap enough to call per-sample
+ * in diagnostic forward loops. Returns all-zeros if the tensor has no
+ * data (e.g. record-mode placeholder). */
+SnArray *sn_tensor_activation_stats(RtTensor *rt)
+{
+    TPool *s = unwrap(rt);
+    SnArray *out = sn_array_new(sizeof(double), 5);
+    double zero = 0.0;
+    if (!s->data || s->n_elem <= 0) {
+        for (int i = 0; i < 5; i++) sn_array_push(out, &zero);
+        return out;
+    }
+    double sum = 0.0, sum_sq = 0.0;
+    double mn = (double)s->data[0];
+    double mx = (double)s->data[0];
+    int64_t zero_count = 0;
+    for (int64_t i = 0; i < s->n_elem; i++) {
+        double v = (double)s->data[i];
+        sum += v;
+        sum_sq += v * v;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        if (s->data[i] == 0.0f) zero_count++;
+    }
+    double n = (double)s->n_elem;
+    double mean = sum / n;
+    double var = sum_sq / n - mean * mean;
+    if (var < 0.0) var = 0.0;
+    double std = sqrt(var);
+    double zero_frac = (double)zero_count / n;
+    sn_array_push(out, &mean);
+    sn_array_push(out, &std);
+    sn_array_push(out, &mn);
+    sn_array_push(out, &mx);
+    sn_array_push(out, &zero_frac);
+    return out;
+}
+
 SnArray *sn_tensor_shape(RtTensor *rt)
 {
     TPool *s = unwrap(rt);

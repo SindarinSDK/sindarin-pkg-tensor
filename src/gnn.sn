@@ -65,6 +65,15 @@ struct GnnOutput =>
   logits: Tensor
   embedding: Tensor
   valueEstimate: Tensor
+  # Per-layer post-activation tensors, populated only when forward()
+  # is called in inference mode (training=false). Empty in record-mode
+  # forward calls because intermediate ggml ops have no host data to
+  # read. Order: layer0, layer1, ..., layerN-1, embedding,
+  # classifier_hidden, logits, value_hidden (if valueHeadEnabled).
+  # `hiddenNames[i]` labels `hiddenStates[i]` so consumers can emit
+  # symbolic per-layer metrics without re-deriving the architecture.
+  hiddenStates: Tensor[]
+  hiddenNames: str[]
 
 # ---------------------------------------------------------------------------
 # GnnLayer is defined in ./gnn/layer.sn and imported above.
@@ -318,16 +327,35 @@ struct Gnn =>
           normed.push((raw[r * fd + c] - self.obsMean[c]) / denom)
       h = Tensor.fromDoubles(normed, nn, fd)
 
+    # Per-layer hidden state collection — only when forward is run in
+    # inference mode. Record mode (training=true) builds the recorded
+    # ggml graph; intermediate tensors are deferred ops with no host
+    # data, so collecting them would be a no-op at best and a segfault
+    # at worst. Skipped via the !training guard.
+    var hiddenStates: Tensor[] = {}
+    var hiddenNames: str[] = {}
     for var i: int = 0; i < len(self.layers); i++ =>
       h = self.layers[i].forward(h, graph.edgeIndex, graph.edgeWeight, training)
+      if !training =>
+        hiddenStates.push(h)
+        hiddenNames.push($"layer{i}")
 
     # Graph-level readout via mean pooling
     var embedding: Tensor = h.meanPool(graph.batchIndex)
+    if !training =>
+      hiddenStates.push(embedding)
+      hiddenNames.push("embedding")
 
     # Classification head
     var c: Tensor = embedding.gnnMatmul(self.classifierW1).add(self.classifierB1).relu()
     c = c.dropout(self.config.dropoutRate, training)
+    if !training =>
+      hiddenStates.push(c)
+      hiddenNames.push("classifier_hidden")
     var logits: Tensor = c.gnnMatmul(self.classifierW2).add(self.classifierB2)
+    if !training =>
+      hiddenStates.push(logits)
+      hiddenNames.push("logits")
     var probs: Tensor = logits.softmax(1)
 
     # Phase 4: value head. Two-layer MLP off the same mean-pool
@@ -345,13 +373,21 @@ struct Gnn =>
     if self.valueHeadEnabled =>
       var vh: Tensor = embedding.gnnMatmul(self.valueHeadW1).add(self.valueHeadB1).relu()
       vh = vh.dropout(self.config.dropoutRate, training)
+      if !training =>
+        hiddenStates.push(vh)
+        hiddenNames.push("value_hidden")
       valueEstimate = vh.gnnMatmul(self.valueHeadW2).add(self.valueHeadB2)
+      if !training =>
+        hiddenStates.push(valueEstimate)
+        hiddenNames.push("value_estimate")
 
     return GnnOutput {
       probs: probs,
       logits: logits,
       embedding: embedding,
-      valueEstimate: valueEstimate
+      valueEstimate: valueEstimate,
+      hiddenStates: hiddenStates,
+      hiddenNames: hiddenNames
     }
 
   # Predict on a list of graphs in inference mode. Equivalent to calling

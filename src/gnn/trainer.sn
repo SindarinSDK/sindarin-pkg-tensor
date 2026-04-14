@@ -790,12 +790,30 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
           # from policy_entropy in skynet (single round-end measure)
           # and from the parametric entropy term in the loss. Lets the
           # dashboard see entropy decay across the 10 epochs.
+          #
+          # Tier 6: per-layer activation stats. Reads hiddenStates from
+          # GnnOutput (populated by Gnn.forward only when training=false)
+          # and aggregates per-sample [mean, std, min, max, zero_fraction]
+          # tuples per layer across the diagnostic forward sweep. Lets
+          # the dashboard distinguish "classifier dead because GNN
+          # features collapsed upstream" from "GNN features fine,
+          # classifier itself dead". Stats are computed BEFORE the
+          # per-iteration restore so the pool-backed tensors are still
+          # live data, not freed slots.
           var currentProbsFlat: double[] = {}
           var entropySum: double = 0.0
           var maxProbSum: double = 0.0
+          var actNames: str[] = {}
+          var actMeanSum: double[] = {}
+          var actStdSum: double[] = {}
+          var actZeroFracSum: double[] = {}
+          var actMin: double[] = {}
+          var actMax: double[] = {}
+          var actInit: bool = false
           for var i: int = 0; i < totalSamples; i++ =>
             var cp: long = sn_tensor_pool_checkpoint()
-            var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+            var fwdOut: GnnOutput = self.model.forward(graphs[i], false)
+            var probs: double[] = fwdOut.probs.toDoubles()
             var sampleEntropy: double = 0.0
             var sampleMaxP: double = 0.0
             for var j: int = 0; j < len(probs); j++ =>
@@ -807,11 +825,55 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
                 sampleEntropy = sampleEntropy - pp * log(pp)
             entropySum = entropySum + sampleEntropy
             maxProbSum = maxProbSum + sampleMaxP
+
+            # Tier 6 per-layer aggregation. First sample seeds the
+            # parallel arrays (one slot per layer); subsequent samples
+            # update sums + global min/max in place.
+            if !actInit =>
+              for var li: int = 0; li < len(fwdOut.hiddenStates); li++ =>
+                actNames.push(fwdOut.hiddenNames[li])
+                actMeanSum.push(0.0)
+                actStdSum.push(0.0)
+                actZeroFracSum.push(0.0)
+                actMin.push(0.0)
+                actMax.push(0.0)
+              actInit = true
+            for var li: int = 0; li < len(fwdOut.hiddenStates); li++ =>
+              var st: double[] = fwdOut.hiddenStates[li].activationStats()
+              actMeanSum[li] = actMeanSum[li] + st[0]
+              actStdSum[li] = actStdSum[li] + st[1]
+              actZeroFracSum[li] = actZeroFracSum[li] + st[4]
+              if i == 0 =>
+                actMin[li] = st[2]
+                actMax[li] = st[3]
+              if st[2] < actMin[li] =>
+                actMin[li] = st[2]
+              if st[3] > actMax[li] =>
+                actMax[li] = st[3]
             sn_tensor_pool_restore(cp)
           MetricEmitter.emit("policy_entropy_train",
             entropySum / totalSamples.toDouble(), epochLabels)
           MetricEmitter.emit("prob_max_mean",
             maxProbSum / totalSamples.toDouble(), epochLabels)
+
+          # Emit per-layer activation stats — one set per layer per epoch.
+          var nSamplesD: double = totalSamples.toDouble()
+          for var li: int = 0; li < len(actNames); li++ =>
+            var lyrLabels: StringField[] = {
+              StringField {
+                key: "epoch",
+                value: $"{epoch}"
+              },
+              StringField {
+                key: "layer",
+                value: actNames[li]
+              }
+            }
+            MetricEmitter.emit("activation_mean", actMeanSum[li] / nSamplesD, lyrLabels)
+            MetricEmitter.emit("activation_std", actStdSum[li] / nSamplesD, lyrLabels)
+            MetricEmitter.emit("activation_zero_frac", actZeroFracSum[li] / nSamplesD, lyrLabels)
+            MetricEmitter.emit("activation_min", actMin[li], lyrLabels)
+            MetricEmitter.emit("activation_max", actMax[li], lyrLabels)
 
           sn_graph_resume_recording(prevRec)
 

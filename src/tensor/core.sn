@@ -57,6 +57,13 @@ native struct Tensor as ref =>
   fn shape(): int[] =>
     return sn_tensor_shape(self)
 
+  # Returns [mean, std, min, max, zero_fraction] in one O(n_elem) pass.
+  # Cheap diagnostic for activation collapse / saturation detection in
+  # the per-epoch trainer telemetry. zero_fraction counts EXACT zeros
+  # (matches post-ReLU dead-neuron semantics).
+  fn activationStats(): double[] =>
+    return sn_tensor_activation_stats(self)
+
   fn dispose(): void =>
     sn_tensor_free(self)
 
@@ -162,6 +169,7 @@ native fn sn_tensor_zeros(rows: int, cols: int): Tensor
 native fn sn_tensor_from_doubles(data: double[], rows: int, cols: int): Tensor
 native fn sn_tensor_to_doubles(t: Tensor): double[]
 native fn sn_tensor_shape(t: Tensor): int[]
+native fn sn_tensor_activation_stats(t: Tensor): double[]
 native fn sn_tensor_free(t: Tensor): void
 native fn sn_tensor_matmul(a: Tensor, b: Tensor): Tensor
 native fn sn_tensor_add(a: Tensor, b: Tensor): Tensor
