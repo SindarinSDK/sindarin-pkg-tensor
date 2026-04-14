@@ -779,26 +779,64 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             if klMean > self.config.targetKl =>
               stoppedEarly = true
 
-          # Clip fraction: for each sample, compute the policy ratio
-          # for the taken action and count how many fall outside
-          # [1-epsilon, 1+epsilon].
+          # Clip fraction + policy-ratio distribution + approx_kl
+          # (Schulman's k1 estimator). Compute the chosen-action ratio
+          # for each sample once and accumulate every downstream signal
+          # off it. The clip count is conditionally accumulated (only
+          # meaningful when clipEpsilon > 0) but the ratio distribution
+          # and approx_kl are always emitted when needDiagForward fires
+          # — they're just-as-cheap and let the dashboard show how far
+          # the policy actually moved per epoch in ratio space.
+          var ratioMin: double = 1.0
+          var ratioMax: double = 1.0
+          var ratioSum: double = 0.0
+          var ratioSqSum: double = 0.0
+          var approxKlSum: double = 0.0
+          var clipCountAll: int = 0
+          var epsClipAll: double = self.config.clipEpsilon
+          var firstSample: bool = true
+          for var i: int = 0; i < totalSamples; i++ =>
+            var takenIdx: int = 0
+            for var j: int = 0; j < numClasses; j++ =>
+              if targets[i * numClasses + j] > 0.5 =>
+                takenIdx = j
+            var piNew: double = currentProbsFlat[i * numClasses + takenIdx]
+            var piOld: double = initialProbsFlat[i * numClasses + takenIdx]
+            if piOld < 0.000000001 =>
+              piOld = 0.000000001
+            if piNew < 0.000000001 =>
+              piNew = 0.000000001
+            var ratio: double = piNew / piOld
+            if firstSample =>
+              ratioMin = ratio
+              ratioMax = ratio
+              firstSample = false
+            if ratio < ratioMin =>
+              ratioMin = ratio
+            if ratio > ratioMax =>
+              ratioMax = ratio
+            ratioSum = ratioSum + ratio
+            ratioSqSum = ratioSqSum + ratio * ratio
+            # Schulman k1: unbiased low-variance KL estimator
+            # https://joschu.net/blog/kl-approx.html
+            approxKlSum = approxKlSum + (ratio - 1.0) - log(ratio)
+            if epsClipAll > 0.0 && (ratio < 1.0 - epsClipAll || ratio > 1.0 + epsClipAll) =>
+              clipCountAll = clipCountAll + 1
+
+          var ratioMean: double = ratioSum / totalSamples.toDouble()
+          var ratioVar: double = ratioSqSum / totalSamples.toDouble() - ratioMean * ratioMean
+          if ratioVar < 0.0 =>
+            ratioVar = 0.0
+          var ratioStd: double = sqrt(ratioVar)
+          var approxKl: double = approxKlSum / totalSamples.toDouble()
+          MetricEmitter.emit("ratio_mean", ratioMean, epochLabels)
+          MetricEmitter.emit("ratio_std", ratioStd, epochLabels)
+          MetricEmitter.emit("ratio_min", ratioMin, epochLabels)
+          MetricEmitter.emit("ratio_max", ratioMax, epochLabels)
+          MetricEmitter.emit("approx_kl", approxKl, epochLabels)
+
           if self.config.clipEpsilon > 0.0 =>
-            var clipCount: int = 0
-            var epsClip: double = self.config.clipEpsilon
-            for var i: int = 0; i < totalSamples; i++ =>
-              # Find the taken action from the one-hot targets.
-              var takenIdx: int = 0
-              for var j: int = 0; j < numClasses; j++ =>
-                if targets[i * numClasses + j] > 0.5 =>
-                  takenIdx = j
-              var piNew: double = currentProbsFlat[i * numClasses + takenIdx]
-              var piOld: double = initialProbsFlat[i * numClasses + takenIdx]
-              if piOld < 0.000000001 =>
-                piOld = 0.000000001
-              var ratio: double = piNew / piOld
-              if ratio < 1.0 - epsClip || ratio > 1.0 + epsClip =>
-                clipCount = clipCount + 1
-            var clipFrac: double = clipCount.toDouble() / totalSamples.toDouble()
+            var clipFrac: double = clipCountAll.toDouble() / totalSamples.toDouble()
             clipFracCurve.push(clipFrac)
             MetricEmitter.emit("clip_fraction", clipFrac, epochLabels)
 
