@@ -42,6 +42,22 @@ vcpkg_cmake_configure(
 vcpkg_cmake_install()
 vcpkg_cmake_config_fixup(CONFIG_PATH lib/cmake/ggml)
 
+# ggml's CMakeLists.txt clears CMAKE_STATIC_LIBRARY_PREFIX on WIN32, producing
+# ggml.a / ggml-base.a / ggml-cpu.a. Downstream linkage via -lggml under
+# LLVM-MinGW expects libggml.a (GNU naming), so -l lookup can't find the
+# prefix-less archives. Restore the `lib` prefix after install so standard
+# -l<name> link flags resolve without special-casing in the compiler config.
+if (VCPKG_TARGET_IS_WINDOWS AND VCPKG_LIBRARY_LINKAGE STREQUAL "static")
+    file(GLOB _static_libs "${CURRENT_PACKAGES_DIR}/lib/*.a")
+    foreach(_lib IN LISTS _static_libs)
+        get_filename_component(_dir "${_lib}" DIRECTORY)
+        get_filename_component(_name "${_lib}" NAME)
+        if (NOT _name MATCHES "^lib")
+            file(RENAME "${_lib}" "${_dir}/lib${_name}")
+        endif()
+    endforeach()
+endif()
+
 # Move the headers ggml installs into a typical layout. Some ggml versions
 # install headers directly under include/ rather than include/ggml/, which
 # matches what sindarin-pkg-tensor's tensor.sn.c expects (#include <ggml.h>).
