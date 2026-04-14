@@ -455,6 +455,7 @@ void sn_opt_state_restore(void) {
 
     free(g_opt_restore_path);
     g_opt_restore_path = NULL;
+    fprintf(stderr, "[trace] sn_opt_state_restore EXIT pool=%d\n", g_pool_count);
 }
 
 RtTensor *sn_graph_param(RtTensor *rt) {
