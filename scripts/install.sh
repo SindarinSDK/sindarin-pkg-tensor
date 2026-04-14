@@ -198,6 +198,17 @@ main() {
 
     install_libs "$pkg_name" "$os" "$arch" "$version"
 
+    # ggml was built with GGML_OPENMP=ON, so downstream binaries need libomp at
+    # link/runtime. On macOS the OpenMP runtime is LLVM's libomp (not GNU's
+    # libgomp), shipped via Homebrew. Install it here so `@link gomp` — which
+    # the darwin compiler config resolves to `-lomp` — has something to link.
+    if [ "$os" = "darwin" ]; then
+        if ! brew list libomp &>/dev/null; then
+            write_status "Installing libomp via Homebrew (required for ggml OpenMP)..."
+            brew install libomp
+        fi
+    fi
+
     echo ""
     write_status "Installation complete!" "success"
 }
