@@ -1,5 +1,5 @@
 name: sindarin-pkg-tensor
-version: 1.5.1
+version: 1.5.2
 license: MIT
 dependencies:
 - name: sindarin-pkg-sdk

@@ -53,9 +53,6 @@ ARCH       ?= $(if $(filter aarch64,$(shell uname -m 2>/dev/null)),arm64,x64)
 VERSION    ?= local
 
 VCPKG_FEATURES :=
-ifeq ($(PLATFORM),darwin)
-    VCPKG_FEATURES := --x-feature=metal
-endif
 
 build:
 	@if [ ! -x "$(VCPKG_ROOT)/vcpkg" ] && [ ! -x "$(VCPKG_ROOT)/vcpkg.exe" ]; then \

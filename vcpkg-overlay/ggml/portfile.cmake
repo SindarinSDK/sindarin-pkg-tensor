@@ -36,6 +36,15 @@ vcpkg_cmake_configure(
         -DGGML_NATIVE=OFF
         -DGGML_BUILD_TESTS=OFF
         -DGGML_BUILD_EXAMPLES=OFF
+        # BLAS/Metal on darwin wire ggml_backend_blas_reg / ggml_backend_metal_reg
+        # into libggml's backend registry, forcing downstream consumers to link
+        # the extra backend archives + a cascade of Apple frameworks (Metal,
+        # MetalKit, MetalPerformanceShaders, Foundation, Accelerate). ggml-cpu
+        # already pulls Accelerate via its own vDSP path (linked explicitly in
+        # the darwin compiler config), which is enough for the workloads we
+        # actually dispatch. Force both off for cross-platform consistency.
+        -DGGML_BLAS=OFF
+        -DGGML_METAL=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 )
 
