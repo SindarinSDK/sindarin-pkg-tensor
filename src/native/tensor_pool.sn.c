@@ -13,15 +13,21 @@
 
 TPool g_pool[SN_TENSOR_MAX];
 int   g_pool_count = 0;
+static int g_pool_peak = 0;
 
 /* Allocate a new pool slot and return its index */
 int pool_alloc(int64_t ne0, int64_t ne1, int n_dims)
 {
     if (g_pool_count >= SN_TENSOR_MAX) {
-        fprintf(stderr, "tensor pool exhausted\n");
+        fprintf(stderr, "tensor pool exhausted: count=%d peak=%d limit=%d\n",
+                g_pool_count, g_pool_peak, SN_TENSOR_MAX);
         abort();
     }
     int idx = g_pool_count++;
+    if (g_pool_count > g_pool_peak) g_pool_peak = g_pool_count;
+    if (g_pool_count % 5000 == 0) {
+        fprintf(stderr, "[pool] count=%d peak=%d\n", g_pool_count, g_pool_peak);
+    }
     TPool *s = &g_pool[idx];
     s->ne[0] = ne0;
     s->ne[1] = ne1;
@@ -103,6 +109,8 @@ void sn_tensor_free(RtTensor *rt)
 
 void sn_tensor_pool_reset(void)
 {
+    fprintf(stderr, "[pool] reset: count=%d -> 0 (peak was %d)\n",
+            g_pool_count, g_pool_peak);
     for (int i = 0; i < g_pool_count; i++) {
         if (g_pool[i].data) {
             free(g_pool[i].data);
@@ -110,6 +118,7 @@ void sn_tensor_pool_reset(void)
         }
     }
     g_pool_count = 0;
+    g_pool_peak = 0;
 }
 
 static int g_pool_checkpoint = 0;
@@ -124,6 +133,7 @@ void sn_tensor_pool_restore(long long checkpoint)
 {
     int cp = (int)checkpoint;
     if (cp < 0 || cp > g_pool_count) return;
+    fprintf(stderr, "[pool] restore: count=%d -> %d\n", g_pool_count, cp);
     for (int i = cp; i < g_pool_count; i++) {
         if (g_pool[i].data) {
             free(g_pool[i].data);
