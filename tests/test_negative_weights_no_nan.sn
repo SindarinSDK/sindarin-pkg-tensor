@@ -1,4 +1,5 @@
 import "sindarin-pkg-test/src/assert"
+import "./assert/helpers"
 import "../src/tensor"
 import "../src/gnn"
 
@@ -202,10 +203,11 @@ fn main(): void =>
   # Pre-fix this would crash with NaN inference because the final
   # AdamW step in the last batch wrote NaN params via the backward
   # gradient through ggml_log(0).
-  multiModel.save("/tmp/test_neg_weights_multibatch.bin")
+  var multiPath: str = tempPath("test_neg_weights_multibatch.bin")
+  multiModel.save(multiPath)
   multiModel.reset()
   var loadedModel: Gnn = Gnn.create(multiCfg)
-  loadedModel.load("/tmp/test_neg_weights_multibatch.bin")
+  loadedModel.load(multiPath)
   # Build a fresh graph after reset+load — old multiGraphs slots have
   # NULL data after reset and would crash inference.
   var checkGraph: GraphTensors = buildGraph(4, 0, 99)

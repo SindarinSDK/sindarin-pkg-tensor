@@ -183,7 +183,7 @@ fn main(): void =>
   println("=== test_save_load_roundtrip_under_train — Phase I ===")
   println("")
 
-  var savePath: str = "/tmp/test_save_load_roundtrip_model.bin"
+  var savePath: str = tempPath("test_save_load_roundtrip_model.bin")
 
   # -----------------------------------------------------------------------
   # Part A — Save/load preserves predictions and parameters.

@@ -1,4 +1,6 @@
 import "sindarin-pkg-test/src/assert"
+import "sindarin-pkg-sdk/src/os/os"
+import "sindarin-pkg-sdk/src/os/env"
 
 # ===========================================================================
 # tests/assert/helpers.sn — package-local test assertion helpers
@@ -34,3 +36,17 @@ fn assertApproxDouble(actual: double, expected: double,
   else =>
     var fullMsg: str = $"{message} (expected {expected}, got {actual}, diff {diff}, tol {tolerance})"
     check(false, fullMsg)
+
+# ---------------------------------------------------------------------------
+# tempPath — platform-aware temp file path builder.
+#
+# Hardcoding "/tmp/..." breaks on Windows where /tmp doesn't exist and
+# fopen silently fails, which manifests as save/load tests failing
+# because sidecar files were never written. Route through %TEMP% (or
+# C:\Temp) on Windows, /tmp elsewhere.
+# ---------------------------------------------------------------------------
+fn tempPath(name: str): str =>
+  if OS.isWindows() =>
+    var base: str = Environment.getOr("TEMP", "C:\\Temp")
+    return $"{base}\\{name}"
+  return $"/tmp/{name}"

@@ -229,7 +229,7 @@ fn main(): void =>
   var origProbs: double[] = modelB.forward(probe, false).probs.toDoubles()
   println($"  original probs[0]={origProbs[0]}, probs[1]={origProbs[1]}")
 
-  var savePath: str = "/tmp/test_obsnorm_save.bin"
+  var savePath: str = tempPath("test_obsnorm_save.bin")
   modelB.save(savePath)
   assertTrue(sn_file_exists(savePath), "Part B: main save file written")
   assertTrue(sn_file_exists(savePath + ".buf"), "Part B: sidecar .buf written when obsNormEnabled=true")
@@ -268,7 +268,7 @@ fn main(): void =>
     arch: "gcn",
     dropoutRate: 0.0
   }
-  var oldPath: str = "/tmp/test_obsnorm_oldformat.bin"
+  var oldPath: str = tempPath("test_obsnorm_oldformat.bin")
   var producer: Gnn = Gnn.createWithSeed(configC, 7l)
   producer.save(oldPath)
   assertTrue(sn_file_exists(oldPath), "Part C: main save file exists")

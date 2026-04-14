@@ -61,7 +61,7 @@ fn main(): void =>
   var m1Probs: double[] = m1Out.probs.toDoubles()
   var m1ParamCount: int = len(m1.parameters())
 
-  var pathA: str = "/tmp/test_gnn_value_head_persistence_A.bin"
+  var pathA: str = tempPath("test_gnn_value_head_persistence_A.bin")
   m1.save(pathA)
   assertTrue(sn_file_exists(pathA + ".vh"),
     "A: .vh sidecar exists after save when value head is enabled")
@@ -92,7 +92,7 @@ fn main(): void =>
   println("--- Part B: no sidecar when value head is disabled ---")
   var m3: Gnn = Gnn.createWithSeed(makeConfig(), 22l)
   assertFalse(m3.valueHeadEnabled, "B: m3 starts disabled")
-  var pathB: str = "/tmp/test_gnn_value_head_persistence_B.bin"
+  var pathB: str = tempPath("test_gnn_value_head_persistence_B.bin")
   m3.save(pathB)
   assertFalse(sn_file_exists(pathB + ".vh"),
     "B: .vh sidecar absent after save without value head enabled")
