@@ -176,7 +176,6 @@ static double sn_graph_train_epoch_impl(
     double    eps,
     double    wd)
 {
-    fprintf(stderr, "[trace] sn_graph_train_epoch_impl ENTER pool=%d\n", g_pool_count);
     if (!g_record_mode || !g_record_ctx) return -1.0;
 
     struct ggml_tensor *loss     = rec_tensor(loss_rt);
@@ -278,7 +277,6 @@ static double sn_graph_train_epoch_impl(
          * exactly where the previous round left off. */
         sn_opt_state_restore();
     }
-    fprintf(stderr, "[trace] lazy_init_or_skip DONE pool=%d\n", g_pool_count);
 
     /* Sanity check: caller must use the same tensors as the init call.
      * Includes the optional PPO slots — switching loss kinds mid-cycle
@@ -375,9 +373,7 @@ static double sn_graph_train_epoch_impl(
             }
         }
     }
-    fprintf(stderr, "[trace] clip_snapshots DONE pool=%d\n", g_pool_count);
 
-    fprintf(stderr, "[trace] batch_loop ENTER pool=%d n_batches=%lld\n", g_pool_count, n_batches);
     for (long long batch_idx = 0; batch_idx < n_batches; batch_idx++) {
         /* Zero the assembled buffers for this batch (block-diagonal layout
          * means most cells are padding zeros). */
@@ -645,7 +641,6 @@ static double sn_graph_train_epoch_impl(
         }
     }
 
-    fprintf(stderr, "[trace] sn_graph_train_epoch_impl EXIT pool=%d\n", g_pool_count);
     return total_loss / (double)n_batches;
 }
 
