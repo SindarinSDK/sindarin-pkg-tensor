@@ -395,6 +395,30 @@ struct Gnn =>
       params.push(self.valueHeadB2)
     return params
 
+  # Per-parameter human-readable names. Mirrors `parameters()` 1:1 so
+  # the i-th name corresponds to the i-th tensor for telemetry that
+  # wants symbolic labels (e.g. `adamw_m_l2_norm{param_name=...}`).
+  # Added so dashboards can identify dead parameters without a manual
+  # index-to-name lookup against the model architecture.
+  fn parameterNames(): str[] =>
+    var names: str[] = {}
+    for var i: int = 0; i < len(self.layers); i++ =>
+      names.push($"layer{i}.weight")
+      names.push($"layer{i}.bias")
+      if self.layers[i].arch == "gat" =>
+        names.push($"layer{i}.attSrc")
+        names.push($"layer{i}.attDst")
+    names.push("classifier.W1")
+    names.push("classifier.B1")
+    names.push("classifier.W2")
+    names.push("classifier.B2")
+    if self.valueHeadEnabled =>
+      names.push("valueHead.W1")
+      names.push("valueHead.B1")
+      names.push("valueHead.W2")
+      names.push("valueHead.B2")
+    return names
+
   # Phase 1.2: enable observation normalization for this model, fitting
   # the per-feature population mean and std over the node features of a
   # caller-supplied training set.

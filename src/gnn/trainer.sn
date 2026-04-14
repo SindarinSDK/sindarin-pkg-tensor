@@ -720,7 +720,11 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         # by len > 0 so this is a no-op then.
         var mNorms: double[] = sn_opt_get_m_norms()
         var vNorms: double[] = sn_opt_get_v_norms()
+        var paramNames: str[] = self.model.parameterNames()
         for var pi: int = 0; pi < len(mNorms); pi++ =>
+          var pName: str = $"unknown_{pi}"
+          if pi < len(paramNames) =>
+            pName = paramNames[pi]
           var pLabels: StringField[] = {
             StringField {
               key: "epoch",
@@ -729,6 +733,10 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             StringField {
               key: "param_idx",
               value: $"{pi}"
+            },
+            StringField {
+              key: "param_name",
+              value: pName
             }
           }
           MetricEmitter.emit("adamw_m_l2_norm", mNorms[pi], pLabels)
