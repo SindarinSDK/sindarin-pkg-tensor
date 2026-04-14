@@ -457,6 +457,50 @@ void sn_opt_state_restore(void) {
     g_opt_restore_path = NULL;
 }
 
+/* ======================================================================
+ * AdamW moment-norm accessors — Tier 3 telemetry. Walks every PARAM
+ * tensor in the active opt context, reads its m (smoothed gradient) or
+ * v (squared gradient) moment, and returns the L2 norms as a flat
+ * SnArray of doubles. Empty array if no opt context (e.g. called
+ * before the first sn_graph_train_epoch_*). Matches the canonical
+ * iteration order of sn_opt_state_save so consumers can correlate
+ * indices with saved state.
+ * ====================================================================== */
+
+static SnArray *sn_opt_collect_moment_norms(int kind /* 0 = m, 1 = v */) {
+    SnArray *out = sn_array_new(sizeof(double), 16);
+    if (!g_opt_ctx) return out;
+    int64_t n_nodes = ggml_opt_n_graph_nodes(g_opt_ctx);
+    for (int64_t i = 0; i < n_nodes; i++) {
+        struct ggml_tensor *t = (kind == 0)
+            ? ggml_opt_get_m(g_opt_ctx, i)
+            : ggml_opt_get_v(g_opt_ctx, i);
+        if (!t) continue;
+        size_t n_elem = (size_t)ggml_nelements(t);
+        size_t n_bytes = n_elem * sizeof(float);
+        float *buf = (float *)malloc(n_bytes);
+        if (t->buffer) {
+            ggml_backend_tensor_get(t, buf, 0, n_bytes);
+        } else if (t->data) {
+            memcpy(buf, t->data, n_bytes);
+        } else {
+            free(buf);
+            continue;
+        }
+        double sum_sq = 0.0;
+        for (size_t j = 0; j < n_elem; j++) {
+            sum_sq += (double)buf[j] * (double)buf[j];
+        }
+        free(buf);
+        double norm = sqrt(sum_sq);
+        sn_array_push(out, &norm);
+    }
+    return out;
+}
+
+SnArray *sn_opt_get_m_norms(void) { return sn_opt_collect_moment_norms(0); }
+SnArray *sn_opt_get_v_norms(void) { return sn_opt_collect_moment_norms(1); }
+
 RtTensor *sn_graph_param(RtTensor *rt) {
     if (!g_record_mode || !rt) return rt;
     TPool *s = unwrap(rt);

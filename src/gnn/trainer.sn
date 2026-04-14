@@ -711,6 +711,30 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
 
         MetricEmitter.emit("grad_norm_l2", gradThisEpoch, epochLabels)
 
+        # Tier 3: AdamW moment norms — per-param L2 of m (smoothed
+        # gradient) and v (squared gradient) after the epoch's batch
+        # loop. Reveals (a) which params have non-zero gradient signal,
+        # (b) whether any param has run-away v (Adam denominator
+        # collapse), (c) cross-param scale balance. Empty arrays in the
+        # weighted-CE driver path before the first opt_eval — guarded
+        # by len > 0 so this is a no-op then.
+        var mNorms: double[] = sn_opt_get_m_norms()
+        var vNorms: double[] = sn_opt_get_v_norms()
+        for var pi: int = 0; pi < len(mNorms); pi++ =>
+          var pLabels: StringField[] = {
+            StringField {
+              key: "epoch",
+              value: $"{epoch}"
+            },
+            StringField {
+              key: "param_idx",
+              value: $"{pi}"
+            }
+          }
+          MetricEmitter.emit("adamw_m_l2_norm", mNorms[pi], pLabels)
+          if pi < len(vNorms) =>
+            MetricEmitter.emit("adamw_v_l2_norm", vNorms[pi], pLabels)
+
         # Phase 4: post-hoc value-loss computation. Skipped entirely
         # when the model has no value head so existing tests pay zero
         # cost. When enabled, this runs one forward pass per training
@@ -752,13 +776,34 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
         if needDiagForward =>
           var prevRec: bool = sn_graph_pause_recording()
 
+          # Tier 1: per-epoch entropy of the current policy and mean
+          # max-prob (confidence proxy). Computed on the same probs
+          # we collect here for the KL/clip-frac diagnostics. Distinct
+          # from policy_entropy in skynet (single round-end measure)
+          # and from the parametric entropy term in the loss. Lets the
+          # dashboard see entropy decay across the 10 epochs.
           var currentProbsFlat: double[] = {}
+          var entropySum: double = 0.0
+          var maxProbSum: double = 0.0
           for var i: int = 0; i < totalSamples; i++ =>
             var cp: long = sn_tensor_pool_checkpoint()
             var probs: double[] = self.model.forward(graphs[i], false).probs.toDoubles()
+            var sampleEntropy: double = 0.0
+            var sampleMaxP: double = 0.0
             for var j: int = 0; j < len(probs); j++ =>
               currentProbsFlat.push(probs[j])
+              var pp: double = probs[j]
+              if pp > sampleMaxP =>
+                sampleMaxP = pp
+              if pp > 0.000000001 =>
+                sampleEntropy = sampleEntropy - pp * log(pp)
+            entropySum = entropySum + sampleEntropy
+            maxProbSum = maxProbSum + sampleMaxP
             sn_tensor_pool_restore(cp)
+          MetricEmitter.emit("policy_entropy_train",
+            entropySum / totalSamples.toDouble(), epochLabels)
+          MetricEmitter.emit("prob_max_mean",
+            maxProbSum / totalSamples.toDouble(), epochLabels)
 
           sn_graph_resume_recording(prevRec)
 
@@ -792,6 +837,9 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
           var ratioSum: double = 0.0
           var ratioSqSum: double = 0.0
           var approxKlSum: double = 0.0
+          var pgUnclippedSum: double = 0.0
+          var pgClippedSum: double = 0.0
+          var advAbsSum: double = 0.0
           var clipCountAll: int = 0
           var epsClipAll: double = self.config.clipEpsilon
           var firstSample: bool = true
@@ -820,6 +868,30 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             # Schulman k1: unbiased low-variance KL estimator
             # https://joschu.net/blog/kl-approx.html
             approxKlSum = approxKlSum + (ratio - 1.0) - log(ratio)
+            # Tier 1: clipped + unclipped policy-gradient surrogate
+            # contribution per sample. The unclipped term is the raw
+            # importance-weighted advantage; the clipped term is the
+            # PPO objective post min(). Difference between the two
+            # per-sample sums tells us how much value the clip
+            # mechanism is taking off the table this epoch.
+            var adv: double = weights[i]
+            var pgUn: double = ratio * adv
+            var pgClRatio: double = ratio
+            if epsClipAll > 0.0 =>
+              if pgClRatio < 1.0 - epsClipAll =>
+                pgClRatio = 1.0 - epsClipAll
+              if pgClRatio > 1.0 + epsClipAll =>
+                pgClRatio = 1.0 + epsClipAll
+            var pgCl: double = pgClRatio * adv
+            var pgFinal: double = pgUn
+            if pgCl < pgFinal =>
+              pgFinal = pgCl
+            pgUnclippedSum = pgUnclippedSum + pgUn
+            pgClippedSum = pgClippedSum + pgFinal
+            var aAbs: double = adv
+            if aAbs < 0.0 =>
+              aAbs = -aAbs
+            advAbsSum = advAbsSum + aAbs
             if epsClipAll > 0.0 && (ratio < 1.0 - epsClipAll || ratio > 1.0 + epsClipAll) =>
               clipCountAll = clipCountAll + 1
 
@@ -829,11 +901,21 @@ struct Trainer < M, S: TrainStrategy, O: Optimizer > =>
             ratioVar = 0.0
           var ratioStd: double = sqrt(ratioVar)
           var approxKl: double = approxKlSum / totalSamples.toDouble()
+          # PPO loss sign convention: surrogate is maximised, so the
+          # loss is -mean(surrogate). Emitting the loss form so it
+          # composes additively with value_loss / entropy_term
+          # downstream.
+          var policyLossTerm: double = 0.0 - pgClippedSum / totalSamples.toDouble()
+          var policyLossUnclipped: double = 0.0 - pgUnclippedSum / totalSamples.toDouble()
+          var advAbsMean: double = advAbsSum / totalSamples.toDouble()
           MetricEmitter.emit("ratio_mean", ratioMean, epochLabels)
           MetricEmitter.emit("ratio_std", ratioStd, epochLabels)
           MetricEmitter.emit("ratio_min", ratioMin, epochLabels)
           MetricEmitter.emit("ratio_max", ratioMax, epochLabels)
           MetricEmitter.emit("approx_kl", approxKl, epochLabels)
+          MetricEmitter.emit("policy_loss_term", policyLossTerm, epochLabels)
+          MetricEmitter.emit("policy_loss_unclipped", policyLossUnclipped, epochLabels)
+          MetricEmitter.emit("advantage_abs_mean", advAbsMean, epochLabels)
 
           if self.config.clipEpsilon > 0.0 =>
             var clipFrac: double = clipCountAll.toDouble() / totalSamples.toDouble()

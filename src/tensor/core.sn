@@ -324,6 +324,15 @@ native fn sn_graph_set_grad_clip_norm(v: double): void
 native fn sn_opt_state_save(path: str): void
 native fn sn_opt_state_set_restore(path: str): void
 
+# AdamW moment-norm telemetry — returns L2 norms of the m (first
+# moment, smoothed gradient) and v (second moment, squared gradient)
+# tensors for every PARAM in the active opt context. Both arrays share
+# the canonical iteration order of sn_opt_state_save so the i-th
+# entry corresponds to the same param across both arrays. Empty if no
+# opt context (e.g. before the first sn_graph_train_epoch_*).
+native fn sn_opt_get_m_norms(): double[]
+native fn sn_opt_get_v_norms(): double[]
+
 native fn sn_graph_train_epoch_ppo(
   loss: Tensor, features: Tensor, labels: Tensor, weights: Tensor,
   oldLogProbs: Tensor,
