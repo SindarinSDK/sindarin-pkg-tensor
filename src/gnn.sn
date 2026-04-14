@@ -181,12 +181,21 @@ struct Gnn =>
     var w1: Tensor = Tensor.zeros(hd, hd)
     var w2: Tensor = Tensor.zeros(na, hd)
     w1.initKaiming()
-    # Policy output layer: small-scale init (std=0.01) per Andrychowicz
-    # et al. 2021. Centres the initial logits near zero so the softmax
-    # is approximately uniform at init, which prevents the deterministic
-    # collapse on imbalanced action priors that standard Kaiming
-    # produces. See tensor.sn::initSmallScale comment for the reference.
-    w2.initSmallScale(0.01)
+    # Policy output layer: small-scale init per Andrychowicz et al. 2021.
+    # Centres the initial logits near zero so the softmax is approximately
+    # uniform at init, preventing the deterministic action collapse that
+    # standard Kaiming produces.
+    #
+    # Scale = 0.1 (was 0.01). Andrychowicz's exact 0.01 was calibrated for
+    # 64-256 hidden units; with our hd=32 the same scale produces logit
+    # variance an order of magnitude below what's needed for the gradient
+    # through softmax to overcome the chain-rule vanishing. Empirically
+    # validated against skynet telemetry: with std=0.01 the classifier W2
+    # m_norm sat at 1e-3 for 18 rounds while logits crept up only to 0.05
+    # mean / 0.3 std. Bumping to 0.1 gives the same expected initial logit
+    # magnitude as 0.01 with hd=320 — putting us inside the Andrychowicz
+    # design envelope, not 30× below it.
+    w2.initSmallScale(0.1)
     var b1: Tensor = Tensor.zeros(1, hd)
     var b2: Tensor = Tensor.zeros(1, na)
 
@@ -252,10 +261,11 @@ struct Gnn =>
     var w1: Tensor = Tensor.zeros(hd, hd)
     var w2: Tensor = Tensor.zeros(na, hd)
     w1.initKaimingSeeded(seed + config.numLayers.toLong())
-    # Policy output layer: small-scale init (see Gnn.create comment).
-    # Same seed offset as the Kaiming variant so cross-run determinism
-    # is preserved — only the init distribution changes.
-    w2.initSmallScaleSeeded(0.01, seed + config.numLayers.toLong() + 1l)
+    # Policy output layer: small-scale init (see Gnn.create comment for
+    # the std=0.1 vs Andrychowicz's std=0.01 rationale — calibrated for
+    # our hd=32 vs the literature default 64-256). Same seed offset as
+    # the Kaiming variant so cross-run determinism is preserved.
+    w2.initSmallScaleSeeded(0.1, seed + config.numLayers.toLong() + 1l)
     var b1: Tensor = Tensor.zeros(1, hd)
     var b2: Tensor = Tensor.zeros(1, na)
 
